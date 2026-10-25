@@ -28,6 +28,10 @@ impl NetworkManager {
         self.socket.recv_from(buffer).await
     }
 
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
     pub async fn send_packet(
         &self,
         addr: SocketAddr,

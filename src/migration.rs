@@ -49,14 +49,17 @@ impl MigrationManager {
                     .as_millis() as u64;
                 
                 // Ищем хоста и проверяем его последний heartbeat
-                for peer in peers {
-                    if peer.is_host {
-                        if now - peer.last_heartbeat > 2000 {
-                            // Хост не отвечает более 2 секунд, запускаем миграцию
-                            self.migrate_host(is_host.clone(), room_id.clone()).await;
-                            break;
-                        }
+                let host_opt = peers.iter().find(|p| p.is_host);
+                if let Some(host) = host_opt {
+                    if now - host.last_heartbeat > 2000 {
+                        // Хост не отвечает более 2 секунд, запускаем миграцию
+                        println!("[МИГРАЦИЯ] Хост ID={} не отвечает более 2 сек (дельта: {}мс). Начинаем выборы!", host.id, now - host.last_heartbeat);
+                        self.migrate_host(is_host.clone(), room_id.clone()).await;
                     }
+                } else if !peers.is_empty() {
+                    // Комната осталась без лидера
+                    println!("[МИГРАЦИЯ] В комнате нет активного хоста. Инициируем выборы!");
+                    self.migrate_host(is_host.clone(), room_id.clone()).await;
                 }
             }
         }
@@ -64,6 +67,10 @@ impl MigrationManager {
 
     async fn migrate_host(&self, is_host: Arc<AtomicBool>, room_id: String) {
         let peers = self.room.get_all_peers();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         
         // Находим ID старого хоста
         let dead_host_id = peers.iter()
@@ -71,11 +78,13 @@ impl MigrationManager {
             .map(|peer| peer.id)
             .unwrap_or(0);
         
-        // Собираем список кандидатов, исключая старого мертвого хоста
+        // Собираем список кандидатов, исключая старого мертвого хоста и тех, кто не выходил на связь более 4 секунд
         let mut peer_ids: Vec<u64> = peers.iter()
-            .filter(|peer| peer.id != dead_host_id)
+            .filter(|peer| peer.id != dead_host_id && (now.saturating_sub(peer.last_heartbeat) < 4000))
             .map(|peer| peer.id)
             .collect();
+        
+        println!("[МИГРАЦИЯ] Кандидаты на роль хоста: {:?}, мой ID: {}", peer_ids, self.my_id);
         
         // Обязательно убедиться, что self.my_id присутствует в списке кандидатов
         if !peer_ids.contains(&self.my_id) {
@@ -112,6 +121,8 @@ impl MigrationManager {
                         let _ = self.network.send_packet(addr, &msg).await;
                     }
                 }
+            } else {
+                println!("[МИГРАЦИЯ] Выбран кандидат с меньшим ID: {}. Ожидаю от него статус хоста...", next_host_id);
             }
         }
     }

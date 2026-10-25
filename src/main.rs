@@ -36,7 +36,7 @@ fn main() {
     let room = Arc::new(RoomManager::new(my_id));
     let mixer = Arc::new(AudioMixer::new());
     let mut audio = UniversalAudioCapture::new().unwrap();
-    let _migration = Arc::new(MigrationManager::new(my_id, room.clone(), network.clone()));
+    let migration = Arc::new(MigrationManager::new(my_id, room.clone(), network.clone()));
     
     let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
     
@@ -65,11 +65,23 @@ fn main() {
             }
         }
     });
+    
+    // Создаем флаг хоста
+    let is_host = Arc::new(AtomicBool::new(true));
+    
+    // Запускаем фоновый цикл миграции и heartbeat
+    let migration_loop = migration.clone();
+    let is_host_loop = is_host.clone();
+    let room_id_str = my_id.to_string();
+    rt.spawn(async move {
+        println!("[МИГРАЦИЯ] Фоновый цикл Heartbeat/Failover запущен.");
+        migration_loop.start_heartbeat_loop(is_host_loop, room_id_str).await;
+    });
 
-    let input_devices = DeviceSelector::get_input_devices();
     let input_devices = DeviceSelector::get_input_devices();
     let output_devices = DeviceSelector::get_output_devices();
 
+    let _guard = rt.enter();
     let _runtime_guard = rt;
     eframe::run_native(
         "Discord-Рация Rust 2026",
@@ -77,7 +89,7 @@ fn main() {
         Box::new(move |_cc| {
             Ok(Box::new(RadioApp::new(
                 mixer, room, None, ptt_flag, selected_input, selected_output,
-                network, my_id, ext_ip, mic_stream, packet_tx, input_devices, output_devices
+                network, my_id, ext_ip, mic_stream, packet_tx, input_devices, output_devices, is_host
             )))
         }),
     ).unwrap();

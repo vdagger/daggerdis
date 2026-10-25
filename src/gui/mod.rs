@@ -12,6 +12,7 @@ pub struct RadioApp {
     mixer: Arc<crate::mixer::AudioMixer>,
     ptt_bind: Option<crate::keybind::PttBind>,
     ptt_flag: Arc<AtomicBool>,
+    room: Arc<crate::room::RoomManager>,
     room_id_input: String,
     connect_ip_input: String,
     connect_port_input: String,
@@ -26,6 +27,7 @@ pub struct RadioApp {
     packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     input_devices: Vec<String>,
     output_devices: Vec<String>,
+    is_host: Arc<AtomicBool>,
 }
 
 impl RadioApp {
@@ -44,11 +46,13 @@ impl RadioApp {
         packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         input_devices: Vec<String>,
         output_devices: Vec<String>,
+        is_host: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mixer,
             ptt_bind,
             ptt_flag,
+            room,
             room_id_input: String::new(),
             connect_ip_input: String::new(),
             connect_port_input: String::new(),
@@ -63,6 +67,7 @@ impl RadioApp {
             packet_tx,
             input_devices,
             output_devices,
+            is_host,
         }
     }
 }
@@ -114,6 +119,8 @@ impl eframe::App for RadioApp {
                 &mut self.connect_port_input,
                 self.network.clone(),
                 self.my_id,
+                self.is_host.clone(),
+                self.room.clone(),
             );
         });
 
