@@ -22,30 +22,59 @@ pub fn draw_room_panel(
         ui.text_edit_singleline(connect_port);
     });
     
-    // Возвращаем кнопку на законное место в интерфейс
-    if ui.button("Подключиться").clicked() {
-        let target_addr = format!("{}:{}", connect_ip.trim(), connect_port.trim());
-        match target_addr.parse::<std::net::SocketAddr>() {
-            Ok(addr) => {
-                let msg = crate::protocol::NetworkMessage {
-                    room_id: room_id.clone(),
-                    sender_id: my_id,
-                    packet: crate::protocol::Packet::JoinRoom,
-                };
-                let net = network.clone();
-                tokio::task::spawn(async move {
-                    let _ = net.send_packet(addr, &msg).await;
-                    println!("[СЕТЬ] Отправлен запрос JoinRoom на адрес: {}", addr);
-                });
-                // Переключаем флаг в false при успешном подключении
-                is_host.store(false, std::sync::atomic::Ordering::SeqCst);
-                println!("[СЕТЬ] Переключился в режим КЛИЕНТА. Подключаемся к хосту: {}", addr);
-            }
-            Err(e) => {
-                eprintln!("[ОШИБКА] Не удалось разобрать адрес {}: {}", target_addr, e);
+    ui.horizontal(|ui| {
+        // Кнопка для хоста: пробивает NAT наружу к участнику, сохраняя статус хоста
+        if is_host.load(std::sync::atomic::Ordering::Relaxed) {
+            if ui.button("🚀 Впустить участника (Пробить NAT)").clicked() {
+                let target_addr = format!("{}:{}", connect_ip.trim(), connect_port.trim());
+                match target_addr.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        let host_addr = match network.local_addr() {
+                            Ok(a) => a,
+                            Err(_) => "0.0.0.0:8080".parse().unwrap(),
+                        };
+                        let update_msg = crate::network::message::NetworkMessage::PeerListUpdate {
+                            peers: vec![(my_id, host_addr)],
+                        };
+                        let serialized = crate::network::message::serialize_msg(&update_msg);
+                        let net = network.clone();
+                        tokio::task::spawn(async move {
+                            let _ = net.send_audio_packet(addr, &serialized).await;
+                            println!("[СЕТЬ] Хост отправил встречный пробив NAT (PeerListUpdate) на адрес: {}", addr);
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[ОШИБКА] Не удалось разобрать адрес {}: {}", target_addr, e);
+                    }
+                }
             }
         }
-    }
+
+        // Кнопка для подключения клиентом к другому серверу
+        if ui.button("Подключиться как клиент").clicked() {
+            let target_addr = format!("{}:{}", connect_ip.trim(), connect_port.trim());
+            match target_addr.parse::<std::net::SocketAddr>() {
+                Ok(addr) => {
+                    let msg = crate::protocol::NetworkMessage {
+                        room_id: room_id.clone(),
+                        sender_id: my_id,
+                        packet: crate::protocol::Packet::JoinRoom,
+                    };
+                    let net = network.clone();
+                    tokio::task::spawn(async move {
+                        let _ = net.send_packet(addr, &msg).await;
+                        println!("[СЕТЬ] Отправлен запрос JoinRoom на адрес: {}", addr);
+                    });
+                    // Переключаем флаг в false при успешном подключении
+                    is_host.store(false, std::sync::atomic::Ordering::SeqCst);
+                    println!("[СЕТЬ] Переключился в режим КЛИЕНТА. Подключаемся к хосту: {}", addr);
+                }
+                Err(e) => {
+                    eprintln!("[ОШИБКА] Не удалось разобрать адрес {}: {}", target_addr, e);
+                }
+            }
+        }
+    });
     
     ui.separator();
     

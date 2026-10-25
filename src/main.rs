@@ -32,13 +32,28 @@ fn main() {
         }
     });
     
-    // Запускаем проброс портов через UPnP в фоне
-    let port = socket_addr.port();
-    rt.spawn_blocking(move || {
-        discordrf::upnp::forward_port(port);
-    });
-    
+    // Используем STUN для определения внешнего адреса ДО запуска сетевого менеджера
+    println!("[STUN] Определение внешнего UDP адреса для P2P...");
+    match std::net::UdpSocket::bind(socket_addr) {
+        Ok(stun_socket) => {
+            if let Some(ext_addr) = discordrf::stun::get_external_addr(&stun_socket) {
+                println!("[STUN] Внешний UDP адрес для P2P: {}", ext_addr);
+                if let Ok(mut lock) = ext_ip.lock() {
+                    *lock = ext_addr.to_string();
+                }
+            } else {
+                println!("[STUN] Не удалось определить адрес через STUN, используется локальный");
+            }
+            drop(stun_socket); // Освобождаем сокет
+        }
+        Err(e) => {
+            eprintln!("[STUN] Не удалось открыть сокет {}: {}", socket_addr, e);
+        }
+    }
+
+    // Запускаем сетевой менеджер
     let network = rt.block_on(async { Arc::new(NetworkManager::new(socket_addr).await.unwrap()) });
+    
     let room = Arc::new(RoomManager::new(my_id));
     let mixer = Arc::new(AudioMixer::new());
     let mut audio = UniversalAudioCapture::new().unwrap();

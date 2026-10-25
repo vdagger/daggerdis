@@ -11,7 +11,7 @@ pub mod gui;
 pub mod keybind;
 pub mod ip_detector;
 pub mod widgets;
-pub mod upnp;
+pub mod stun;
 
 pub use protocol::Packet;
 pub use types::Peer;
