@@ -55,15 +55,13 @@ pub fn draw_room_panel(
             let target_addr = format!("{}:{}", connect_ip.trim(), connect_port.trim());
             match target_addr.parse::<std::net::SocketAddr>() {
                 Ok(addr) => {
-                    let msg = crate::protocol::NetworkMessage {
-                        room_id: room_id.clone(),
+                    let msg = crate::network::NetworkMessage::JoinRequest {
                         sender_id: my_id,
-                        packet: crate::protocol::Packet::JoinRoom,
                     };
                     let net = network.clone();
                     tokio::task::spawn(async move {
                         let _ = net.send_packet(addr, &msg).await;
-                        println!("[СЕТЬ] Отправлен запрос JoinRoom на адрес: {}", addr);
+                        println!("[СЕТЬ] Отправлен запрос JoinRequest на адрес: {}", addr);
                     });
                     // Переключаем флаг в false при успешном подключении
                     is_host.store(false, std::sync::atomic::Ordering::SeqCst);

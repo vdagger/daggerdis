@@ -1,4 +1,3 @@
-pub mod protocol;
 pub mod types;
 pub mod network;
 pub mod audio;
@@ -13,5 +12,4 @@ pub mod ip_detector;
 pub mod widgets;
 pub mod stun;
 
-pub use protocol::Packet;
 pub use types::Peer;

@@ -35,42 +35,9 @@ impl NetworkManager {
     pub async fn send_packet(
         &self,
         addr: SocketAddr,
-        msg: &crate::protocol::NetworkMessage,
+        msg: &crate::network::message::NetworkMessage,
     ) -> Result<usize, Box<dyn std::error::Error + Send>> {
-        let mesh_msg = match &msg.packet {
-            crate::protocol::Packet::JoinRoom => {
-                crate::network::message::NetworkMessage::JoinRequest { 
-                    sender_id: msg.sender_id 
-                }
-            }
-            crate::protocol::Packet::AudioData(bytes) => {
-                crate::network::message::NetworkMessage::AudioFrame { 
-                    sender_id: msg.sender_id, 
-                    opus_data: bytes.clone() 
-                }
-            }
-            crate::protocol::Packet::Heartbeat => {
-                crate::network::message::NetworkMessage::Heartbeat {
-                    sender_id: msg.sender_id,
-                    is_host: true,
-                }
-            }
-            crate::protocol::Packet::MigrateHost(new_host_id) => {
-                crate::network::message::NetworkMessage::HostMigration {
-                    new_host_id: *new_host_id,
-                }
-            }
-            _ => {
-                // Для других типов пакетов также можно создать соответствующие сообщения
-                // Но для текущей задачи реализуем только те, которые указаны
-                crate::network::message::NetworkMessage::AudioFrame { 
-                    sender_id: msg.sender_id, 
-                    opus_data: vec![] 
-                }
-            }
-        };
-        
-        let serialized = serialize_msg(&mesh_msg);
+        let serialized = serialize_msg(msg);
         let bytes_sent = self.socket.send_to(&serialized, addr).await.map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
         Ok(bytes_sent)
     }

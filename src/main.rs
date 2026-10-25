@@ -4,7 +4,8 @@ use std::net::SocketAddr;
 use discordrf::{
     room::RoomManager, mixer::AudioMixer, audio::UniversalAudioCapture, 
     network::NetworkManager, migration::MigrationManager, gui::RadioApp, 
-    protocol::{Packet, NetworkMessage}, devices::DeviceSelector
+    network::NetworkMessage,
+    devices::DeviceSelector
 };
 
 fn main() {
@@ -85,10 +86,9 @@ fn main() {
         while let Some(packet) = packet_rx.recv().await {
             let peers = room_net.get_all_peers(); 
             for peer in peers {
-                let network_message = NetworkMessage {
-                    room_id: my_id.to_string(),
+                let network_message = NetworkMessage::AudioFrame {
                     sender_id: my_id,
-                    packet: Packet::AudioData(packet.clone()),
+                    opus_data: packet.clone(),
                 };
                 if let Ok(addr) = peer.address.parse::<SocketAddr>() {
                     let _ = network_net.send_packet(addr, &network_message).await;

@@ -4,7 +4,7 @@ use std::time::{SystemTime, Duration};
 use tokio::time::{interval};
 use crate::room::RoomManager;
 use crate::network::NetworkManager;
-use crate::protocol::{NetworkMessage, Packet};
+use crate::network::NetworkMessage;
 
 pub struct MigrationManager {
     room: Arc<RoomManager>,
@@ -28,10 +28,9 @@ impl MigrationManager {
             
             if is_host.load(Ordering::Relaxed) {
                 // Хост отправляет heartbeat каждые 500мс
-                let heartbeat_msg = NetworkMessage {
-                    room_id: room_id.clone(),
+                let heartbeat_msg = NetworkMessage::Heartbeat {
                     sender_id: self.my_id,
-                    packet: Packet::Heartbeat,
+                    is_host: true,
                 };
                 
                 let peers = self.room.get_all_peers();
@@ -110,11 +109,9 @@ impl MigrationManager {
                     self.room.remove_peer(dead_host_id);
                 }
                 
-                // 3) Разослать сообщение Packet::MigrateHost(self.my_id) всем оставшимся пирам
-                let msg = NetworkMessage {
-                    room_id: room_id.clone(),
-                    sender_id: self.my_id,
-                    packet: Packet::MigrateHost(self.my_id),
+                // 3) Разослать сообщение NetworkMessage::HostMigration
+                let msg = NetworkMessage::HostMigration {
+                    new_host_id: self.my_id,
                 };
                 for peer in self.room.get_all_peers() {
                     if let Ok(addr) = peer.address.parse() {
