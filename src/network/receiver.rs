@@ -30,13 +30,17 @@ pub fn spawn_network_receiver(
                                 last_heartbeat: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_secs(),
+                                    .as_millis() as u64,
                             };
                             room_net.update_peer(peer);
                         }
                     }
                     crate::network::message::NetworkMessage::AudioFrame { sender_id: _, opus_data } => {
                         let _ = playback_tx_clone.send(opus_data).await;
+                    }
+                    crate::network::message::NetworkMessage::HostMigration { new_host_id } => {
+                        println!("[СЕТЬ] Получено уведомление о смене хоста. Новый хост ID: {}", new_host_id);
+                        room_net.set_host(new_host_id);
                     }
                     _ => {}
                 }

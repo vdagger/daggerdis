@@ -45,6 +45,17 @@ impl NetworkManager {
                     opus_data: bytes.clone() 
                 }
             }
+            crate::protocol::Packet::Heartbeat => {
+                crate::network::message::NetworkMessage::Heartbeat {
+                    sender_id: msg.sender_id,
+                    is_host: true,
+                }
+            }
+            crate::protocol::Packet::MigrateHost(new_host_id) => {
+                crate::network::message::NetworkMessage::HostMigration {
+                    new_host_id: *new_host_id,
+                }
+            }
             _ => {
                 // Для других типов пакетов также можно создать соответствующие сообщения
                 // Но для текущей задачи реализуем только те, которые указаны

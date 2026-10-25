@@ -6,6 +6,7 @@ pub enum NetworkMessage {
     JoinRequest { sender_id: u64 },
     PeerListUpdate { peers: Vec<(u64, SocketAddr)> },
     AudioFrame { sender_id: u64, opus_data: Vec<u8> },
+    HostMigration { new_host_id: u64 },
 }
 
 pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
@@ -20,6 +21,10 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             data.push(3);
             data.extend_from_slice(&sender_id.to_le_bytes());
             data.extend_from_slice(opus_data);
+        }
+        NetworkMessage::HostMigration { new_host_id } => {
+            data.push(4);
+            data.extend_from_slice(&new_host_id.to_le_bytes());
         }
         _ => data.push(99), // Заглушка для остальных типов
     }
@@ -36,6 +41,10 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
         3 if bytes.len() >= 9 => {
             let id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
             Some(NetworkMessage::AudioFrame { sender_id: id, opus_data: bytes[9..].to_vec() })
+        }
+        4 if bytes.len() >= 9 => {
+            let id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            Some(NetworkMessage::HostMigration { new_host_id: id })
         }
         _ => None,
     }
