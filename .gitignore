@@ -1,2 +1,4 @@
+target/
 *.bak
+*.bak2
 *.backup
