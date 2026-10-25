@@ -1,0 +1,124 @@
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::net::SocketAddr;
+use discordrf::{
+    room::RoomManager, mixer::AudioMixer, audio::UniversalAudioCapture, 
+    network::NetworkManager, migration::MigrationManager, gui::RadioApp, protocol::{Packet, NetworkMessage}
+};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let local_addr = if args.len() >= 2 { format!("0.0.0.0:{}", args[1]) } else { "0.0.0.0:8080".to_string() };
+    
+    // Преобразуем строку в SocketAddr
+    let socket_addr: SocketAddr = local_addr.parse().unwrap();
+    
+    let my_id: u64 = rand::random();
+    let ptt_flag = Arc::new(AtomicBool::new(false));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    
+    let selected_input = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let selected_output = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let ext_ip = Arc::new(Mutex::new("Определение...".to_string()));
+    let mic_stream = Arc::new(Mutex::new(None));
+    
+    // Запускаем асинхронную задачу определения IP
+    let ext_ip_clone = ext_ip.clone();
+    rt.spawn(async move {
+        println!("[СЕТЬ] Запуск определения внешнего IP...");
+        // Используем синхронную версию, так как get_external_ip() не асинхронная
+        let ip = discordrf::ip_detector::get_external_ip();
+        println!("[СЕТЬ] IP определен: {}", ip);
+        if let Ok(mut lock) = ext_ip_clone.lock() {
+            *lock = ip;
+        }
+    });
+    
+    let network = rt.block_on(async { Arc::new(NetworkManager::new(socket_addr).await.unwrap()) });
+    let room = Arc::new(RoomManager::new(my_id));
+    let mixer = Arc::new(AudioMixer::new());
+    let mut audio = UniversalAudioCapture::new().unwrap();
+    let _migration = Arc::new(MigrationManager::new(my_id, room.clone(), network.clone()));
+    
+    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    
+    if let Ok(stream) = audio.create_input_stream(ptt_flag.clone(), packet_tx.clone(), mixer.clone()) {
+        *mic_stream.lock().unwrap() = Some(stream);
+    }
+    
+    // Запускаем асинхронную задачу трансляции аудиопакетов в P2P
+    let network_net = network.clone();
+    let room_net = room.clone();
+    rt.spawn(async move {
+        println!("[СЕТЬ] Готов к трансляции аудиопакетов в P2P...");
+        while let Some(packet) = packet_rx.recv().await {
+            // Получаем список адресов всех пиров в текущей комнате рации
+            let peers = room_net.get_all_peers(); 
+            for peer in peers {
+                // Создаем NetworkMessage с аудиоданными
+                let network_message = NetworkMessage {
+                    room_id: my_id.to_string(), // Используем ID пользователя как ID комнаты
+                    sender_id: my_id,
+                    packet: Packet::AudioData(packet.clone()), // Клонируем пакет для использования в цикле
+                };
+                // Преобразуем адрес из String в SocketAddr для отправки
+                if let Ok(addr) = peer.address.parse::<SocketAddr>() {
+                    // Отправляем сжатый Opus-пакет по UDP/P2P через NetworkManager
+                    let _ = network_net.send_packet(addr, &network_message).await;
+                }
+            }
+        }
+    });
+    
+    // Запускаем асинхронную задачу приема входящих аудиопакетов
+    let network_recv = network.clone();
+    let room_net = room.clone();
+    let playback_tx = tokio::sync::mpsc::channel::<Vec<u8>>(100).0;
+    let playback_tx_clone = playback_tx.clone();
+    // Используем spawn для решения проблемы с Send
+    tokio::task::spawn(async move {
+        println!("[СЕТЬ] Запуск асинхронного UDP-приёмника рации...");
+        // Получаем буфер для приема пакетов
+        let mut buffer = [0u8; 65535];
+        
+        while let Ok((bytes_received, sender_addr)) = network_recv.recv_audio_packet(&mut buffer).await {
+            let bytes = &buffer[..bytes_received];
+            if let Some(msg) = discordrf::network::message::deserialize_msg(bytes) {
+                match msg {
+                    discordrf::network::message::NetworkMessage::Heartbeat { sender_id, is_host } => {
+                        if is_host {
+                            // Обновляем время последнего heartbeat от хоста, чтобы предотвратить таймаут
+                            let peer = discordrf::types::Peer {
+                                id: sender_id,
+                                address: sender_addr.to_string(),
+                                is_host,
+                                last_heartbeat: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            };
+                            room_net.update_peer(peer);
+                        }
+                    }
+                    discordrf::network::message::NetworkMessage::AudioFrame { sender_id: _, opus_data } => {
+                        // Пересылаем входящий Opus-пакет напрямую в канал воспроизведения динамиков
+                        let _ = playback_tx_clone.send(opus_data).await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+    
+    let _runtime_guard = rt;
+    eframe::run_native(
+        "Discord-Рация Rust 2026",
+        eframe::NativeOptions::default(),
+        Box::new(move |_cc| {
+            Ok(Box::new(RadioApp::new(
+                mixer, room, None, ptt_flag, selected_input, selected_output,
+                network, my_id, ext_ip, mic_stream
+            )))
+        }),
+    ).unwrap();
+}

@@ -1,0 +1,12 @@
+/home/mcdag/DISCORDRF/target/release/deps/ecolor-e71c7df59463085e.d: /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs
+
+/home/mcdag/DISCORDRF/target/release/deps/libecolor-e71c7df59463085e.rlib: /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs
+
+/home/mcdag/DISCORDRF/target/release/deps/libecolor-e71c7df59463085e.rmeta: /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs /home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs
+
+/home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/lib.rs:
+/home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/color32.rs:
+/home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva_gamma.rs:
+/home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hsva.rs:
+/home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/rgba.rs:
+/home/mcdag/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ecolor-0.28.1/src/hex_color_runtime.rs:

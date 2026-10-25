@@ -1,0 +1,88 @@
+//! Графический интерфейс для Discord-рации
+
+use eframe::egui;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+/// Основное приложение графического интерфейса
+pub struct RadioApp {
+    mixer: Arc<crate::mixer::AudioMixer>,
+    ptt_flag: Arc<AtomicBool>,
+    input_devices: Vec<String>,
+    output_devices: Vec<String>,
+    selected_input: usize,
+    selected_output: usize,
+}
+
+impl RadioApp {
+    /// Создает новое приложение с заданным микшером и флагом PTT
+    pub fn new(
+        mixer: Arc<crate::mixer::AudioMixer>,
+        ptt_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            mixer,
+            ptt_flag,
+            input_devices: crate::devices::DeviceSelector::get_input_devices(),
+            output_devices: crate::devices::DeviceSelector::get_output_devices(),
+            selected_input: 0,
+            selected_output: 0,
+        }
+    }
+}
+
+impl eframe::App for RadioApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Кнопка "НАЖМИ И ГОВОРИ"
+            let ptt_button = ui.button("НАЖМИ И ГОВОРИ");
+            if ptt_button.clicked() {
+                // Переключение по клику
+                let current = self.ptt_flag.load(std::sync::atomic::Ordering::Relaxed);
+                self.ptt_flag.store(!current, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Для проверки зажатия используем состояние мыши
+            if ptt_button.is_pointer_button_down_on() {
+                // Установка true при зажатии
+                self.ptt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                // Установка false при отпускании
+                self.ptt_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Слайдер громкости собеседников (0-400)
+            let mut output_volume = self.mixer.output_volume();
+            ui.add(egui::Slider::new(&mut output_volume, 0..=400).text("Громкость собеседников"));
+            self.mixer.set_output_volume(output_volume);
+
+            // Чекбокс для мьюта микрофона
+            let mut mic_muted = self.mixer.is_mic_muted();
+            ui.checkbox(&mut mic_muted, "Микрофон выключен");
+            self.mixer.set_mic_muted(mic_muted);
+
+            // VU-Meter (прогресс-бар для микрофона)
+            ui.add(egui::ProgressBar::new(self.mixer.get_input_peak()).text("Микрофон"));
+
+            // Выбор входного устройства
+            egui::ComboBox::from_label("Входное устройство")
+                .selected_text(self.input_devices.get(self.selected_input).unwrap_or(&"Не выбрано".to_string()))
+                .show_ui(ui, |ui| {
+                    for (i, device) in self.input_devices.iter().enumerate() {
+                        ui.selectable_value(&mut self.selected_input, i, device);
+                    }
+                });
+
+            // Выбор выходного устройства
+            egui::ComboBox::from_label("Выходное устройство")
+                .selected_text(self.output_devices.get(self.selected_output).unwrap_or(&"Не выбрано".to_string()))
+                .show_ui(ui, |ui| {
+                    for (i, device) in self.output_devices.iter().enumerate() {
+                        ui.selectable_value(&mut self.selected_output, i, device);
+                    }
+                });
+        });
+
+        // Запрос на перерисовку для плавной анимации
+        ctx.request_repaint();
+    }
+}

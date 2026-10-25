@@ -1,0 +1,1 @@
+{"rustc":222933465615791797,"features":"[]","declared_features":"[\"profile\", \"research\"]","target":11755301428904869431,"profile":8283048315245111303,"path":3155928950791840559,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"release\\.fingerprint\\rusty-opus-37cc46fa460bd2a8\\dep-lib-rusty_opus","checksum":false}}],"rustflags":[],"config":9396254390672932401,"compile_kind":0}

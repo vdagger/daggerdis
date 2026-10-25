@@ -1,0 +1,17 @@
+[package]
+name = "discordrf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+cpal = "0.15"
+rusty-opus = "1.0"
+rand = "0.8"
+egui = "0.28"
+eframe = "0.28"
+ureq = "2.9"
+rubato = "0.15"
