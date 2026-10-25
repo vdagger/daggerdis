@@ -17,6 +17,7 @@ pub fn spawn_network_receiver(
         println!("[СЕТЬ] Асинхронный UDP-приемник Mesh-сети запущен.");
         // Выделяем буфер локально внутри таски, чтобы ссылки не пересекали .await точки
         let mut buf = [0u8; 65535];
+        let mut audio_recv_count = 0u64;
         while let Ok((amt, sender_addr)) = network_recv.recv_audio_packet(&mut buf).await {
             let bytes = &buf[..amt];
             if let Some(msg) = crate::network::message::deserialize_msg(bytes) {
@@ -36,8 +37,13 @@ pub fn spawn_network_receiver(
                         }
                         println!("[СЕТЬ] Получен Heartbeat от хоста ID={}", sender_id);
                     }
-                    crate::network::message::NetworkMessage::AudioFrame { sender_id: _, opus_data } => {
-                        let _ = playback_tx_clone.send(opus_data).await;
+                    crate::network::message::NetworkMessage::AudioFrame { sender_id, opus_data } => {
+                        let opus_data_len = opus_data.len();
+                        let _ = playback_tx_clone.try_send(opus_data);
+                        audio_recv_count += 1;
+                        if audio_recv_count % 100 == 1 {
+                            println!("[СЕТЬ] Принят голос от ID={} (пакет #{}, размер: {} байт)", sender_id, audio_recv_count, opus_data_len);
+                        }
                     }
                     crate::network::message::NetworkMessage::HostMigration { new_host_id } => {
                         println!("[СЕТЬ] Получено уведомление о смене хоста. Новый хост ID: {}", new_host_id);

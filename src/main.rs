@@ -32,6 +32,12 @@ fn main() {
         }
     });
     
+    // Запускаем проброс портов через UPnP в фоне
+    let port = socket_addr.port();
+    rt.spawn_blocking(move || {
+        discordrf::upnp::forward_port(port);
+    });
+    
     let network = rt.block_on(async { Arc::new(NetworkManager::new(socket_addr).await.unwrap()) });
     let room = Arc::new(RoomManager::new(my_id));
     let mixer = Arc::new(AudioMixer::new());
@@ -40,10 +46,19 @@ fn main() {
     
     let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
     
-    let playback_tx = audio.start_playback(mixer.clone());
+    // Инициализация потока воспроизведения
+    let (playback_tx, playback_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+    let playback_rx = Arc::new(std::sync::Mutex::new(playback_rx));
+    let playback_stream = Arc::new(Mutex::new(None));
+    
+    // Запускаем стартовый поток воспроизведения
+    if let Ok(stream) = discordrf::audio::UniversalAudioCapture::create_playback_stream(None, playback_rx.clone()) {
+        *playback_stream.lock().unwrap() = Some(stream);
+    }
+    
     discordrf::network::receiver::spawn_network_receiver(&rt, network.clone(), room.clone(), playback_tx);
     
-    if let Ok(stream) = audio.create_input_stream(ptt_flag.clone(), packet_tx.clone(), mixer.clone()) {
+    if let Ok(stream) = audio.create_input_stream(None, ptt_flag.clone(), packet_tx.clone(), mixer.clone()) {
         *mic_stream.lock().unwrap() = Some(stream);
     }
     
@@ -51,6 +66,7 @@ fn main() {
     let room_net = room.clone();
     rt.spawn(async move {
         println!("[СЕТЬ] Готов к трансляции аудиопакетов in P2P...");
+        let mut send_count = 0u64;
         while let Some(packet) = packet_rx.recv().await {
             let peers = room_net.get_all_peers(); 
             for peer in peers {
@@ -62,6 +78,10 @@ fn main() {
                 if let Ok(addr) = peer.address.parse::<SocketAddr>() {
                     let _ = network_net.send_packet(addr, &network_message).await;
                 }
+            }
+            send_count += 1;
+            if send_count % 100 == 1 {
+                println!("[АУДИО] Отправка голоса в P2P (пакет #{}, размер: {} байт)", send_count, packet.len());
             }
         }
     });
@@ -89,7 +109,8 @@ fn main() {
         Box::new(move |_cc| {
             Ok(Box::new(RadioApp::new(
                 mixer, room, None, ptt_flag, selected_input, selected_output,
-                network, my_id, ext_ip, mic_stream, packet_tx, input_devices, output_devices, is_host
+                network, my_id, ext_ip, mic_stream, packet_tx, input_devices, output_devices, is_host,
+                playback_stream, playback_rx
             )))
         }),
     ).unwrap();

@@ -51,9 +51,14 @@ pub fn draw_room_panel(
     
     // Отображаем текущую роль пользователя
     if is_host.load(std::sync::atomic::Ordering::Relaxed) {
-        ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "👑 Ваш статус: ХОСТ КОМНАТЫ");
+        ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "👑 Ваш статус: ХОСТ (Ждём подключений на порту 8080)");
     } else {
-        ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "🎧 Ваш статус: ПОДКЛЮЧЕН (Клиент)");
+        let peers = room.get_all_peers();
+        if peers.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "⏳ Подключение к хосту (ожидание ответа сети)...");
+        } else {
+            ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "🎧 Ваш статус: В СЕТИ (Подключен к комнате)");
+        }
     }
 
     let peers = room.get_all_peers();

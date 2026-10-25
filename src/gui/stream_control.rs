@@ -36,11 +36,35 @@ pub fn restart_audio_stream(
     // Но в текущей сигнатуре нет параметра selected_input, поэтому оставим как есть
     // Однако, если мы хотим использовать правильный индекс, нужно изменить сигнатуру функции
     
-    match audio.create_input_stream(ptt_flag, packet_tx, mixer) {
+    match audio.create_input_stream(Some(device), ptt_flag, packet_tx, mixer) {
         Ok(new_stream) => {
             *stream_lock = Some(new_stream);
             println!("[GUI] Аудиопоток успешно перезапущен.");
         }
         Err(e) => eprintln!("[ОШИБКА] Не удалось перезапустить поток: {}", e),
+    }
+}
+
+/// Перезапускает аудиопоток воспроизведения
+pub fn restart_playback_stream(
+    playback_stream: &std::sync::Arc<std::sync::Mutex<Option<cpal::Stream>>>,
+    rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    device_name: String,
+) {
+    let mut stream_lock = playback_stream.lock().unwrap();
+    *stream_lock = None; // Останавливаем старый поток
+
+    let host = cpal::default_host();
+    if let Some(device) = host.output_devices().ok().and_then(|mut devs| {
+        use cpal::traits::DeviceTrait;
+        devs.find(|d| d.name().unwrap_or_default() == device_name)
+    }) {
+        match crate::audio::UniversalAudioCapture::create_playback_stream(Some(device), rx) {
+            Ok(new_stream) => {
+                *stream_lock = Some(new_stream);
+                println!("[GUI] Поток воспроизведения переключен на: {}", device_name);
+            }
+            Err(e) => eprintln!("[ОШИБКА] Не удалось переключить динамики: {}", e),
+        }
     }
 }

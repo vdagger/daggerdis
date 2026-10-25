@@ -28,6 +28,9 @@ pub struct RadioApp {
     input_devices: Vec<String>,
     output_devices: Vec<String>,
     is_host: Arc<AtomicBool>,
+    playback_stream: Arc<Mutex<Option<cpal::Stream>>>,
+    playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    prev_output_index: std::sync::atomic::AtomicU32,
 }
 
 impl RadioApp {
@@ -47,6 +50,8 @@ impl RadioApp {
         input_devices: Vec<String>,
         output_devices: Vec<String>,
         is_host: Arc<AtomicBool>,
+        playback_stream: Arc<Mutex<Option<cpal::Stream>>>,
+        playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
     ) -> Self {
         Self {
             mixer,
@@ -55,7 +60,7 @@ impl RadioApp {
             room,
             room_id_input: String::new(),
             connect_ip_input: String::new(),
-            connect_port_input: String::new(),
+            connect_port_input: "8080".to_string(),
             my_external_ip: String::new(),
             selected_input,
             selected_output,
@@ -68,6 +73,9 @@ impl RadioApp {
             input_devices,
             output_devices,
             is_host,
+            playback_stream,
+            playback_rx,
+            prev_output_index: std::sync::atomic::AtomicU32::new(0),
         }
     }
 }
@@ -95,6 +103,20 @@ impl eframe::App for RadioApp {
                 device_name,
             );
             self.prev_input_index.store(current_input_index, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Проверяем изменение индекса выходного устройства и перезапускаем поток воспроизведения при необходимости
+        let current_output_index = self.selected_output.load(std::sync::atomic::Ordering::Relaxed);
+        let prev_output_index = self.prev_output_index.load(std::sync::atomic::Ordering::Relaxed);
+        if current_output_index != prev_output_index {
+            if let Some(device_name) = self.output_devices.get(current_output_index as usize) {
+                stream_control::restart_playback_stream(
+                    &self.playback_stream,
+                    self.playback_rx.clone(),
+                    device_name.clone(),
+                );
+            }
+            self.prev_output_index.store(current_output_index, std::sync::atomic::Ordering::Relaxed);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
