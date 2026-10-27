@@ -18,31 +18,46 @@ pub fn spawn_network_receiver(
         // Выделяем буфер локально внутри таски, чтобы ссылки не пересекали .await точки
         let mut buf = [0u8; 65535];
         let mut audio_recv_count = 0u64;
-        while let Ok((amt, sender_addr)) = network_recv.recv_audio_packet(&mut buf).await {
+        loop {
+            let (amt, sender_addr) = match network_recv.recv_audio_packet(&mut buf).await {
+                Ok(res) => res,
+                Err(_) => {
+                    // Игнорируем ошибку Windows 11054 при выходе соседа, чтобы приемник не умирал
+                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+                    continue;
+                }
+            };
+            println!("[СЕТЬ] 🔥 ВХОДЯЩИЙ UDP ПАКЕТ! Размер: {} байт от {}", amt, sender_addr);
             let bytes = &buf[..amt];
             if let Some(msg) = crate::network::message::deserialize_msg(bytes) {
                 match msg {
                     crate::network::message::NetworkMessage::Heartbeat { sender_id, is_host } => {
-                        if is_host {
-                            let peer = crate::Peer {
-                                id: sender_id,
-                                address: sender_addr.to_string(),
-                                is_host,
-                                last_heartbeat: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64,
-                            };
-                            room_net.update_peer(peer);
-                        }
-                        println!("[СЕТЬ] Получен Heartbeat от хоста ID={}", sender_id);
+                        println!("[СЕТЬ] Получен Heartbeat от ID={} (хост: {}) с адреса {}", sender_id, is_host, sender_addr);
+                        let peer = crate::types::Peer {
+                            id: sender_id,
+                            address: sender_addr.to_string(),
+                            is_host,
+                            last_heartbeat: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64,
+                        };
+                        room_net.update_peer(peer);
                     }
                     crate::network::message::NetworkMessage::AudioFrame { sender_id, opus_data } => {
-                        let opus_data_len = opus_data.len();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        if let Some(existing_peer) = room_net.get_all_peers().iter().find(|p| p.id == sender_id) {
+                            let mut p = existing_peer.clone();
+                            p.last_heartbeat = now;
+                            room_net.update_peer(p);
+                        }
                         let _ = playback_tx_clone.try_send(opus_data);
                         audio_recv_count += 1;
                         if audio_recv_count % 100 == 1 {
-                            println!("[СЕТЬ] Принят голос от ID={} (пакет #{}, размер: {} байт)", sender_id, audio_recv_count, opus_data_len);
+                            println!("[СЕТЬ] Принят голос от ID={} (пакет #{})", sender_id, audio_recv_count);
                         }
                     }
                     crate::network::message::NetworkMessage::HostMigration { new_host_id } => {
@@ -109,27 +124,17 @@ pub fn spawn_network_receiver(
                                 continue;
                             }
                             // Если адрес пришел как 0.0.0.0, подставляем IP отправителя
+                            let is_sender = peer_addr.ip().is_unspecified() || peer_addr == sender_addr;
                             if peer_addr.ip().is_unspecified() {
-                                peer_addr.set_ip(sender_addr.ip());
+                                peer_addr = sender_addr;
                             }
                             let peer = crate::types::Peer {
                                 id: peer_id,
                                 address: peer_addr.to_string(),
-                                is_host: false, // статус хоста уточнится первым же Heartbeat
+                                is_host: is_sender,
                                 last_heartbeat: now,
                             };
                             room_net.update_peer(peer);
-                        }
-                        
-                        // Устанавливаем текущего хоста на основе адреса отправителя
-                        for peer in room_net.get_all_peers() {
-                            if peer.address.contains(&sender_addr.to_string()) || 
-                               peer.address.contains(&format!(":{}", sender_addr.port())) {
-                                let mut updated_peer = peer.clone();
-                                updated_peer.is_host = true;
-                                room_net.update_peer(updated_peer);
-                                break;
-                            }
                         }
                     }
                     _ => {}

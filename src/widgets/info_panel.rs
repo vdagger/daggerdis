@@ -8,7 +8,7 @@ pub fn draw_info_panel(ui: &mut eframe::egui::Ui, my_id: u64, my_external_ip: &s
     ui.label(format!("Внешний IP: {}", my_external_ip));
     ui.colored_label(
         eframe::egui::Color32::from_rgb(0, 200, 255),
-        format!("📢 Адрес для подключения к вам: {}:8080", my_external_ip)
+        format!("📢 Адрес для подключения к вам: {}", my_external_ip)
     );
     ui.separator();
 }

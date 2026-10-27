@@ -87,28 +87,53 @@ fn parse_stun_response(data: &[u8]) -> Option<SocketAddr> {
     None
 }
 
-/// Выполняет STUN-запрос через переданный сокет
+/// Выполняет STUN-запрос и определяет тип NAT (Cone vs Symmetric)
 pub fn get_external_addr(socket: &UdpSocket) -> Option<SocketAddr> {
-    let mut transaction_id = [0u8; 12];
-    for b in &mut transaction_id {
-        *b = rand::random::<u8>();
-    }
-    let request = create_stun_request(&transaction_id);
+    let mut resolved_addrs = Vec::new();
 
     for server in STUN_SERVERS {
         if let Ok(mut addrs) = server.to_socket_addrs() {
             if let Some(target) = addrs.next() {
+                let mut transaction_id = [0u8; 12];
+                for b in &mut transaction_id {
+                    *b = rand::random::<u8>();
+                }
+                let request = create_stun_request(&transaction_id);
+
                 let _ = socket.set_read_timeout(Some(Duration::from_millis(1500)));
                 if socket.send_to(&request, target).is_ok() {
                     let mut buf = [0u8; 1024];
                     if let Ok((len, _)) = socket.recv_from(&mut buf) {
                         if let Some(ext_addr) = parse_stun_response(&buf[..len]) {
-                            return Some(ext_addr);
+                            resolved_addrs.push((server, ext_addr));
+                            if resolved_addrs.len() >= 2 {
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
     }
-    None
+
+    if resolved_addrs.is_empty() {
+        return None;
+    }
+
+    let primary_addr = resolved_addrs[0].1;
+
+    if resolved_addrs.len() >= 2 {
+        let (srv1, addr1) = resolved_addrs[0];
+        let (srv2, addr2) = resolved_addrs[1];
+        if addr1.port() == addr2.port() {
+            println!("[STUN] ✅ Тип NAT: Cone NAT (порты совпадают: {}). Прямой P2P возможен!", addr1.port());
+        } else {
+            println!("[STUN] ⚠️ Тип NAT: Symmetric NAT! (Сервер {} дал порт {}, а {} дал порт {}). Роутер меняет порты для разных адресатов!", 
+                srv1, addr1.port(), srv2, addr2.port());
+        }
+    } else {
+        println!("[STUN] Ответил только один STUN-сервер: {}", primary_addr);
+    }
+
+    Some(primary_addr)
 }

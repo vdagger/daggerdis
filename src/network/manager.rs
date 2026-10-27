@@ -12,6 +12,12 @@ impl NetworkManager {
         Ok(NetworkManager { socket })
     }
 
+    pub fn from_std(socket: std::net::UdpSocket) -> Result<Self, Box<dyn std::error::Error + Send>> {
+        socket.set_nonblocking(true).map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
+        let socket = UdpSocket::from_std(socket).map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
+        Ok(NetworkManager { socket })
+    }
+
     pub async fn send_audio_packet(
         &self,
         addr: SocketAddr,

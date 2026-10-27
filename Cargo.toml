@@ -15,3 +15,7 @@ egui = "0.28"
 eframe = "0.28"
 ureq = "2.9"
 rubato = "0.15"
+igd = "0.12"
+
+[build-dependencies]
+winres = "0.1"

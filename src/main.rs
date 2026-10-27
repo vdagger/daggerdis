@@ -9,8 +9,15 @@ use discordrf::{
 };
 
 fn main() {
+    // Настройка правил фаервола Windows
+    discordrf::firewall::setup_firewall_rules();
+    
     let args: Vec<String> = std::env::args().collect();
-    let local_addr = if args.len() >= 2 { format!("0.0.0.0:{}", args[1]) } else { "0.0.0.0:8080".to_string() };
+    let local_addr = if args.len() >= 2 { 
+        format!("0.0.0.0:{}", args[1]) 
+    } else { 
+        "0.0.0.0:0".to_string() 
+    };
     
     let socket_addr: SocketAddr = local_addr.parse().unwrap();
     let my_id: u64 = rand::random();
@@ -21,39 +28,50 @@ fn main() {
     let selected_output = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let ext_ip = Arc::new(Mutex::new("Определение...".to_string()));
     let mic_stream = Arc::new(Mutex::new(None));
-    let prev_input_index = Arc::new(std::sync::atomic::AtomicU32::new(0));
     
-    let ext_ip_clone = ext_ip.clone();
-    rt.spawn(async move {
-        println!("[СЕТЬ] Запуск определения внешнего IP...");
-        let ip = discordrf::ip_detector::get_external_ip();
-        println!("[СЕТЬ] IP определен: {}", ip);
-        if let Ok(mut lock) = ext_ip_clone.lock() {
-            *lock = ip;
-        }
+    // Связываем стандартный UDP-сокет один раз
+    let std_socket = std::net::UdpSocket::bind(socket_addr).unwrap_or_else(|e| {
+        panic!("Не удалось привязать сокет к {}: {}", socket_addr, e);
     });
     
-    // Используем STUN для определения внешнего адреса ДО запуска сетевого менеджера
-    println!("[STUN] Определение внешнего UDP адреса для P2P...");
-    match std::net::UdpSocket::bind(socket_addr) {
-        Ok(stun_socket) => {
-            if let Some(ext_addr) = discordrf::stun::get_external_addr(&stun_socket) {
-                println!("[STUN] Внешний UDP адрес для P2P: {}", ext_addr);
-                if let Ok(mut lock) = ext_ip.lock() {
-                    *lock = ext_addr.to_string();
-                }
-            } else {
-                println!("[STUN] Не удалось определить адрес через STUN, используется локальный");
-            }
-            drop(stun_socket); // Освобождаем сокет
-        }
-        Err(e) => {
-            eprintln!("[STUN] Не удалось открыть сокет {}: {}", socket_addr, e);
-        }
+    // Получаем локальный порт и пробрасываем его через UPnP
+    if let Ok(local_addr) = std_socket.local_addr() {
+        discordrf::upnp::auto_forward_port(local_addr.port());
     }
-
-    // Запускаем сетевой менеджер
-    let network = rt.block_on(async { Arc::new(NetworkManager::new(socket_addr).await.unwrap()) });
+    
+    // Выполняем STUN-запрос через этот же сокет ДО перевода в nonblocking
+    println!("[STUN] Определение внешнего UDP адреса для P2P...");
+    let stun_addr = discordrf::stun::get_external_addr(&std_socket);
+    let stun_resolved = stun_addr.is_some();
+    if let Some(ext_addr) = stun_addr {
+        println!("[STUN] Внешний UDP адрес для P2P: {}", ext_addr);
+        if let Ok(mut lock) = ext_ip.lock() {
+            *lock = ext_addr.to_string();
+        }
+    } else {
+        println!("[STUN] Не удалось определить адрес через STUN, используется локальный");
+    }
+    
+    // Запускаем сетевой менеджер с уже привязанным и сконфигурированным сокетом
+    let network = rt.block_on(async {
+        Arc::new(
+            NetworkManager::from_std(std_socket)
+                .expect("Не удалось инициализировать NetworkManager из сокета")
+        )
+    });
+    
+    // Запускаем определение внешнего IP только если STUN не дал результата
+    if !stun_resolved {
+        let ext_ip_clone = ext_ip.clone();
+        rt.spawn(async move {
+            println!("[СЕТЬ] Запуск определения внешнего IP...");
+            let ip = discordrf::ip_detector::get_external_ip();
+            println!("[СЕТЬ] IP определен: {}", ip);
+            if let Ok(mut lock) = ext_ip_clone.lock() {
+                *lock = ip;
+            }
+        });
+    }
     
     let room = Arc::new(RoomManager::new(my_id));
     let mixer = Arc::new(AudioMixer::new());

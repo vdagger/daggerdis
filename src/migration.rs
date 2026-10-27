@@ -22,41 +22,61 @@ impl MigrationManager {
     }
 
     pub async fn start_heartbeat_loop(&self, is_host: Arc<AtomicBool>, room_id: String) {
-        let mut interval = interval(Duration::from_millis(500));
+        let mut interval = interval(Duration::from_millis(1000));
         loop {
             interval.tick().await;
             
-            if is_host.load(Ordering::Relaxed) {
-                // Хост отправляет heartbeat каждые 500мс
-                let heartbeat_msg = NetworkMessage::Heartbeat {
-                    sender_id: self.my_id,
-                    is_host: true,
-                };
-                
-                let peers = self.room.get_all_peers();
-                for peer in peers {
-                    if let Ok(addr) = peer.address.parse() {
-                        let _ = self.network.send_packet(addr, &heartbeat_msg).await;
+            let my_is_host = is_host.load(Ordering::Relaxed);
+            let heartbeat_msg = NetworkMessage::Heartbeat {
+                sender_id: self.my_id,
+                is_host: my_is_host,
+            };
+            
+            // Автоматическая очистка оффлайн-участников
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let dead_peers: Vec<u64> = self.room.get_all_peers().iter()
+                .filter(|p| !p.is_host && now.saturating_sub(p.last_heartbeat) > 12000)
+                .map(|p| p.id)
+                .collect();
+            for dead_id in dead_peers {
+                println!("[СЕТЬ] Участник ID={} отключен по таймауту (12 сек молчания).", dead_id);
+                self.room.remove_peer(dead_id);
+            }
+            
+            let peers = self.room.get_all_peers();
+            for peer in &peers {
+                match peer.address.parse::<std::net::SocketAddr>() {
+                    Ok(addr) => {
+                        if let Err(e) = self.network.send_packet(addr, &heartbeat_msg).await {
+                            eprintln!("[ОШИБКА] Не удалось отправить Heartbeat на {} (ID={}): {}", addr, peer.id, e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[ОШИБКА] Некорректный адрес пира '{}' (ID={}): {}", peer.address, peer.id, e);
                     }
                 }
-            } else {
-                // Клиент проверяет последний полученный heartbeat от хоста
-                let peers = self.room.get_all_peers();
+            }
+            
+            // Если узел НЕ является хостом (!my_is_host), он дополнительно проверяет доступность текущего хоста
+            if !my_is_host {
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
                 
-                // Ищем хоста и проверяем его последний heartbeat
-                let host_opt = peers.iter().find(|p| p.is_host);
+                // Получаем свежий список пиров перед проверкой доступности хоста
+                let current_peers = self.room.get_all_peers();
+                let host_opt = current_peers.iter().find(|p| p.is_host);
                 if let Some(host) = host_opt {
-                    if now - host.last_heartbeat > 2000 {
-                        // Хост не отвечает более 2 секунд, запускаем миграцию
-                        println!("[МИГРАЦИЯ] Хост ID={} не отвечает более 2 сек (дельта: {}мс). Начинаем выборы!", host.id, now - host.last_heartbeat);
+                    // Если хост не отвечал более 3500мс, запускаем миграцию
+                    if now.saturating_sub(host.last_heartbeat) > 3500 {
+                        println!("[МИГРАЦИЯ] Хост ID={} не отвечает (дельта: {}мс). Начинаем выборы!", host.id, now.saturating_sub(host.last_heartbeat));
                         self.migrate_host(is_host.clone(), room_id.clone()).await;
                     }
-                } else if !peers.is_empty() {
-                    // Комната осталась без лидера
+                } else if !current_peers.is_empty() {
                     println!("[МИГРАЦИЯ] В комнате нет активного хоста. Инициируем выборы!");
                     self.migrate_host(is_host.clone(), room_id.clone()).await;
                 }
@@ -71,45 +91,36 @@ impl MigrationManager {
             .unwrap()
             .as_millis() as u64;
         
-        // Находим ID старого хоста
+        // Находим ID старого мертвого хоста
         let dead_host_id = peers.iter()
             .find(|peer| peer.is_host)
             .map(|peer| peer.id)
             .unwrap_or(0);
         
-        // Собираем список кандидатов, исключая старого мертвого хоста и тех, кто не выходил на связь более 4 секунд
-        let mut peer_ids: Vec<u64> = peers.iter()
-            .filter(|peer| peer.id != dead_host_id && (now.saturating_sub(peer.last_heartbeat) < 4000))
+        // Немедленно удаляем мертвого хоста из комнаты, чтобы не плодить зомби
+        if dead_host_id != 0 {
+            println!("[МИГРАЦИЯ] Удаление отключившегося хоста ID={}", dead_host_id);
+            self.room.remove_peer(dead_host_id);
+        }
+
+        // Собираем оставшихся живых кандидатов (не старше 8 секунд)
+        let mut peer_ids: Vec<u64> = self.room.get_all_peers().iter()
+            .filter(|peer| peer.id != dead_host_id && (now.saturating_sub(peer.last_heartbeat) < 8000))
             .map(|peer| peer.id)
             .collect();
         
-        println!("[МИГРАЦИЯ] Кандидаты на роль хоста: {:?}, мой ID: {}", peer_ids, self.my_id);
-        
-        // Обязательно убедиться, что self.my_id присутствует в списке кандидатов
         if !peer_ids.contains(&self.my_id) {
             peer_ids.push(self.my_id);
         }
-        
-        // Сортируем список оставшихся ID по возрастанию
         peer_ids.sort();
         
-        // Находим следующий по приоритету ID (минимальный)
-        if let Some(next_host_id) = peer_ids.first() {
-            if *next_host_id == self.my_id {
-                // Становимся новым хостом
+        if let Some(&next_host_id) = peer_ids.first() {
+            if next_host_id == self.my_id {
+                // Я победил на выборах и стал новым хостом
                 is_host.store(true, Ordering::SeqCst);
-                println!("[СЕТЬ] Старый хост (ID: {}) отключен. Я стал НОВЫМ ХОСТОМ!", dead_host_id);
-                
-                // Если победили на выборах и стали хостом:
-                // 1) Вызвать self.room.set_host(self.my_id);
                 self.room.set_host(self.my_id);
+                println!("[МИГРАЦИЯ] 👑 Я стал НОВЫМ ХОСТОМ (ID: {})!", self.my_id);
                 
-                // 2) Если был определен dead_host_id, удалить старого мертвого хоста
-                if dead_host_id != 0 {
-                    self.room.remove_peer(dead_host_id);
-                }
-                
-                // 3) Разослать сообщение NetworkMessage::HostMigration
                 let msg = NetworkMessage::HostMigration {
                     new_host_id: self.my_id,
                 };
@@ -119,7 +130,10 @@ impl MigrationManager {
                     }
                 }
             } else {
-                println!("[МИГРАЦИЯ] Выбран кандидат с меньшим ID: {}. Ожидаю от него статус хоста...", next_host_id);
+                // Победил сосед с меньшим ID, признаем его новым хостом
+                println!("[МИГРАЦИЯ] Признан новый лидер ID: {}. Переключаю статус хоста.", next_host_id);
+                self.room.set_host(next_host_id);
+                is_host.store(false, Ordering::SeqCst);
             }
         }
     }
