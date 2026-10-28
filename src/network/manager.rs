@@ -1,21 +1,27 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use crate::network::message::{serialize_msg, deserialize_msg};
+use crate::network::p2p_iroh::IrohP2pManager;
 
 pub struct NetworkManager {
     socket: UdpSocket,
+    pub iroh: Option<Arc<IrohP2pManager>>,
 }
 
 impl NetworkManager {
     pub async fn new(addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error + Send>> {
         let socket = UdpSocket::bind(addr).await.map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
-        Ok(NetworkManager { socket })
+        Ok(NetworkManager { socket, iroh: None })
     }
 
-    pub fn from_std(socket: std::net::UdpSocket) -> Result<Self, Box<dyn std::error::Error + Send>> {
+    pub fn from_std(
+        socket: std::net::UdpSocket, 
+        iroh: Option<Arc<IrohP2pManager>>
+    ) -> Result<Self, Box<dyn std::error::Error + Send>> {
         socket.set_nonblocking(true).map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
         let socket = UdpSocket::from_std(socket).map_err(|e| -> Box<dyn std::error::Error + Send> { Box::new(e) })?;
-        Ok(NetworkManager { socket })
+        Ok(NetworkManager { socket, iroh })
     }
 
     pub async fn send_audio_packet(

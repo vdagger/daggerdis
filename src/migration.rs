@@ -48,6 +48,10 @@ impl MigrationManager {
             
             let peers = self.room.get_all_peers();
             for peer in &peers {
+                // Пропускаем Iroh-пиры для отправки по сырому UDP
+                if peer.address.starts_with("Iroh:") {
+                    continue;
+                }
                 match peer.address.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
                         if let Err(e) = self.network.send_packet(addr, &heartbeat_msg).await {
@@ -58,6 +62,12 @@ impl MigrationManager {
                         eprintln!("[ОШИБКА] Некорректный адрес пира '{}' (ID={}): {}", peer.address, peer.id, e);
                     }
                 }
+            }
+            
+            // Рассылаем Heartbeat через Iroh P2P, удерживая сессию при тишине
+            if let Some(ref p2p) = self.network.iroh {
+                let serialized = crate::network::message::serialize_msg(&heartbeat_msg);
+                p2p.broadcast_bytes(&serialized).await;
             }
             
             // Если узел НЕ является хостом (!my_is_host), он дополнительно проверяет доступность текущего хоста

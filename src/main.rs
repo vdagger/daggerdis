@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::net::SocketAddr;
 use discordrf::{
     room::RoomManager, mixer::AudioMixer, audio::UniversalAudioCapture, 
@@ -22,14 +22,36 @@ fn main() {
     let socket_addr: SocketAddr = local_addr.parse().unwrap();
     let my_id: u64 = rand::random();
     let ptt_flag = Arc::new(AtomicBool::new(false));
+    let is_host = Arc::new(AtomicBool::new(true)); // Объявлен в самом начале!
     let rt = tokio::runtime::Runtime::new().unwrap();
     
-    let selected_input = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let selected_output = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let selected_input = Arc::new(AtomicU32::new(0));
+    let selected_output = Arc::new(AtomicU32::new(0));
     let ext_ip = Arc::new(Mutex::new("Определение...".to_string()));
     let mic_stream = Arc::new(Mutex::new(None));
+
+    // 1. Инициализация Iroh P2P через рантайм Tokio
+    let iroh_p2p = rt.block_on(async {
+        match discordrf::network::p2p_iroh::IrohP2pManager::new().await {
+            Ok(p2p) => {
+                println!("[IROH] Эндпоинт готов. NodeID: {}", p2p.my_node_id);
+                Some(Arc::new(p2p))
+            }
+            Err(e) => {
+                eprintln!("[IROH] Ошибка инициализации P2P: {}", e);
+                None
+            }
+        }
+    });
+
+    // Если Iroh запустился, устанавливаем NodeID как основной адрес комнаты
+    if let Some(ref p2p) = iroh_p2p {
+        if let Ok(mut lock) = ext_ip.lock() {
+            *lock = p2p.my_node_id.clone();
+        }
+    }
     
-    // Связываем стандартный UDP-сокет один раз
+    // 2. Связываем стандартный UDP-сокет один раз
     let std_socket = std::net::UdpSocket::bind(socket_addr).unwrap_or_else(|e| {
         panic!("Не удалось привязать сокет к {}: {}", socket_addr, e);
     });
@@ -45,23 +67,25 @@ fn main() {
     let stun_resolved = stun_addr.is_some();
     if let Some(ext_addr) = stun_addr {
         println!("[STUN] Внешний UDP адрес для P2P: {}", ext_addr);
-        if let Ok(mut lock) = ext_ip.lock() {
-            *lock = ext_addr.to_string();
+        if iroh_p2p.is_none() {
+            if let Ok(mut lock) = ext_ip.lock() {
+                *lock = ext_addr.to_string();
+            }
         }
     } else {
         println!("[STUN] Не удалось определить адрес через STUN, используется локальный");
     }
-    
-    // Запускаем сетевой менеджер с уже привязанным и сконфигурированным сокетом
+
+    // Запускаем сетевой менеджер (передаем сокет и Iroh)
     let network = rt.block_on(async {
         Arc::new(
-            NetworkManager::from_std(std_socket)
+            NetworkManager::from_std(std_socket, iroh_p2p.clone())
                 .expect("Не удалось инициализировать NetworkManager из сокета")
         )
     });
     
-    // Запускаем определение внешнего IP только если STUN не дал результата
-    if !stun_resolved {
+    // Запускаем определение внешнего IP только если STUN не дал результата и Iroh нет
+    if !stun_resolved && iroh_p2p.is_none() {
         let ext_ip_clone = ext_ip.clone();
         rt.spawn(async move {
             println!("[СЕТЬ] Запуск определения внешнего IP...");
@@ -77,7 +101,7 @@ fn main() {
     let mixer = Arc::new(AudioMixer::new());
     let mut audio = UniversalAudioCapture::new().unwrap();
     let migration = Arc::new(MigrationManager::new(my_id, room.clone(), network.clone()));
-    
+
     let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
     
     // Инициализация потока воспроизведения
@@ -90,20 +114,99 @@ fn main() {
         *playback_stream.lock().unwrap() = Some(stream);
     }
     
-    discordrf::network::receiver::spawn_network_receiver(&rt, network.clone(), room.clone(), playback_tx);
-    
+    // UDP-приемник
+    discordrf::network::receiver::spawn_network_receiver(&rt, network.clone(), room.clone(), playback_tx.clone());
+
+    // 3. Приемник входящих P2P пакетов через Iroh + Ретранслятор (Relay) для Хоста
+    if let Some(ref p2p) = iroh_p2p {
+        let p2p_recv = p2p.clone();
+        let playback_tx_iroh = playback_tx.clone();
+        let room_iroh = room.clone();
+        let is_host_iroh = is_host.clone(); // Клонируем ДО rt.spawn!
+
+        rt.spawn(async move {
+            println!("[IROH] Слушатель входящих P2P пакетов активен.");
+            while let Some(pkt) = p2p_recv.recv_packet().await {
+                if let Some(msg) = discordrf::network::message::deserialize_msg(&pkt.data) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    let short_id = if pkt.sender_id.len() > 10 {
+                        &pkt.sender_id[..10]
+                    } else {
+                        &pkt.sender_id
+                    };
+
+                    match msg {
+                        NetworkMessage::AudioFrame { sender_id, opus_data } => {
+                            let is_peer_host = room_iroh.get_all_peers().iter()
+                                .find(|p| p.id == sender_id)
+                                .map(|p| p.is_host)
+                                .unwrap_or(false);
+
+                            room_iroh.update_peer(discordrf::types::Peer {
+                                id: sender_id,
+                                address: format!("Iroh: {}..", short_id),
+                                is_host: is_peer_host,
+                                last_heartbeat: now,
+                            });
+
+                            let _ = playback_tx_iroh.try_send(opus_data);
+
+                            // Ретрансляция голоса: если мы Хост, пересылаем всем остальным
+                            if is_host_iroh.load(Ordering::Relaxed) {
+                                p2p_recv.broadcast_bytes_except(&pkt.sender_id, &pkt.data).await;
+                            }
+                        }
+                        NetworkMessage::Heartbeat { sender_id, is_host: peer_is_host } => {
+                            room_iroh.update_peer(discordrf::types::Peer {
+                                id: sender_id,
+                                address: format!("Iroh: {}..", short_id),
+                                is_host: peer_is_host,
+                                last_heartbeat: now,
+                            });
+
+                            // Ретрансляция Heartbeat: чтобы клиенты видели друг друга
+                            if is_host_iroh.load(Ordering::Relaxed) {
+                                p2p_recv.broadcast_bytes_except(&pkt.sender_id, &pkt.data).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+    }
+
     if let Ok(stream) = audio.create_input_stream(None, ptt_flag.clone(), packet_tx.clone(), mixer.clone()) {
         *mic_stream.lock().unwrap() = Some(stream);
     }
     
+    // 4. Отправка голоса с микрофона
     let network_net = network.clone();
     let room_net = room.clone();
     rt.spawn(async move {
         println!("[СЕТЬ] Готов к трансляции аудиопакетов in P2P...");
         let mut send_count = 0u64;
         while let Some(packet) = packet_rx.recv().await {
+            // Трансляция через Iroh P2P
+            if let Some(ref p2p) = network_net.iroh {
+                let network_message = NetworkMessage::AudioFrame {
+                    sender_id: my_id,
+                    opus_data: packet.clone(),
+                };
+                let serialized = discordrf::network::message::serialize_msg(&network_message);
+                p2p.broadcast_bytes(&serialized).await;
+            }
+
+            // Трансляция через сырой UDP (пропуская Iroh-пиров)
             let peers = room_net.get_all_peers(); 
             for peer in peers {
+                if peer.address.starts_with("Iroh:") {
+                    continue;
+                }
                 let network_message = NetworkMessage::AudioFrame {
                     sender_id: my_id,
                     opus_data: packet.clone(),
@@ -118,11 +221,8 @@ fn main() {
             }
         }
     });
-    
-    // Создаем флаг хоста
-    let is_host = Arc::new(AtomicBool::new(true));
-    
-    // Запускаем фоновый цикл миграции и heartbeat
+
+    // 5. Фоновый цикл миграции и heartbeat
     let migration_loop = migration.clone();
     let is_host_loop = is_host.clone();
     let room_id_str = my_id.to_string();

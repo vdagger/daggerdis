@@ -12,8 +12,7 @@ pub fn draw_room_panel(
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
     room: std::sync::Arc<crate::room::RoomManager>,
 ) {
-    ui.label("Подключение к комнате:");
-    ui.text_edit_singleline(room_id);
+    ui.label("Подключение к комнате (введите NodeID или IP:PORT):");
     
     ui.label("Подключение к хосту (введите IP:PORT):");
     ui.horizontal(|ui| {
@@ -91,36 +90,81 @@ pub fn draw_room_panel(
         // Кнопка для подключения клиентом к другому серверу
         if ui.button("🔗 Подключиться как клиент").clicked() {
             let raw_addr = connect_ip.trim();
-            let target_addr: Result<std::net::SocketAddr, _> = if raw_addr.contains(':') {
-                raw_addr.parse()
-            } else {
-                format!("{}:8080", raw_addr).parse()
-            };
-
-            match target_addr {
-                Ok(addr) => {
-                    let net = network.clone();
-                    let room_clone = room.clone();
+            
+            // Проверяем, является ли введенный адрес NodeID Iroh (длинной 64 символа)
+            if raw_addr.len() == 64 && raw_addr.chars().all(|c| c.is_ascii_hexdigit()) {
+                // Это NodeID - подключаемся через Iroh P2P
+                if let Some(ref p2p) = network.iroh {
+                    let p2p_clone = p2p.clone();
+                    let target_node_id = raw_addr.to_string();
                     let my_peer_id = my_id;
+                    
+                    // Переключаем статус клиента
+                    is_host.store(false, std::sync::atomic::Ordering::SeqCst);
+                    println!("[СЕТЬ] Переключился в режим КЛИЕНТА (Iroh P2P). Цель: {}", target_node_id);
+
                     tokio::task::spawn(async move {
-                        println!("[СЕТЬ] Запуск серии запросов на подключение к {}", addr);
-                        for attempt in 1..=6 {
-                            let msg = crate::network::NetworkMessage::JoinRequest {
-                                sender_id: my_peer_id,
-                            };
-                            let _ = net.send_packet(addr, &msg).await;
-                            tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
-                            if !room_clone.get_all_peers().is_empty() {
-                                println!("[СЕТЬ] Соединение установлено с попытки #{}!", attempt);
-                                break;
+                        println!("[IROH] Попытка P2P-подключения к NodeID: {}", target_node_id);
+                        match p2p_clone.connect_to_peer(&target_node_id).await {
+                            Ok(()) => {
+                                println!("[IROH] 🚀 Успешное прямое P2P-подключение к комнате!");
+                                // Отправляем приветственный Heartbeat для мгновенного появления в списке
+                                let hello_msg = crate::network::NetworkMessage::Heartbeat {
+                                    sender_id: my_peer_id,
+                                    is_host: false,
+                                };
+                                let bytes = crate::network::message::serialize_msg(&hello_msg);
+                                p2p_clone.broadcast_bytes(&bytes).await;
                             }
+                            Err(e) => eprintln!("[IROH] Ошибка P2P-подключения по NodeID: {}", e),
                         }
                     });
-                    is_host.store(false, std::sync::atomic::Ordering::SeqCst);
-                    println!("[СЕТЬ] Переключился в режим КЛИЕНТА. Цель: {}", addr);
+                } else {
+                    eprintln!("[ОШИБКА] Iroh не инициализирован, невозможно подключиться по NodeID");
                 }
-                Err(e) => {
-                    eprintln!("[ОШИБКА] Неверный адрес \"{}\": {}", raw_addr, e);
+            } else {
+                // Это IP:PORT - обычное подключение
+                let target_addr: Result<std::net::SocketAddr, _> = if raw_addr.contains(':') {
+                    raw_addr.parse()
+                } else {
+                    format!("{}:8080", raw_addr).parse()
+                };
+
+                match target_addr {
+                    Ok(addr) => {
+                        let net = network.clone();
+                        let room_clone = room.clone();
+                        let my_peer_id = my_id;
+                        tokio::task::spawn(async move {
+                            println!("[СЕТЬ] Запуск серии запросов на подключение к {}", addr);
+                            for attempt in 1..=6 {
+                                let msg = crate::network::NetworkMessage::JoinRequest {
+                                    sender_id: my_peer_id,
+                                };
+                                let _ = net.send_packet(addr, &msg).await;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
+                                if !room_clone.get_all_peers().is_empty() {
+                                    println!("[СЕТЬ] Соединение установлено с попытки #{}!", attempt);
+                                    break;
+                                }
+                            }
+                            
+                            // Отправляем приветственный Heartbeat для мгновенного появления в списке
+                            let hello_msg = crate::network::NetworkMessage::Heartbeat {
+                                sender_id: my_peer_id,
+                                is_host: false,
+                            };
+                            let bytes = crate::network::message::serialize_msg(&hello_msg);
+                            // Отправляем через UDP
+                            let _ = net.send_audio_packet(addr, &bytes).await;
+                        });
+                        // Переключаем статус клиента
+                        is_host.store(false, std::sync::atomic::Ordering::SeqCst);
+                        println!("[СЕТЬ] Переключился в режим КЛИЕНТА. Цель: {}", addr);
+                    }
+                    Err(e) => {
+                        eprintln!("[ОШИБКА] Неверный адрес \"{}\": {}", raw_addr, e);
+                    }
                 }
             }
         }

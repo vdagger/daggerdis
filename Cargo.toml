@@ -16,6 +16,8 @@ eframe = "0.28"
 ureq = "2.9"
 rubato = "0.15"
 igd = "0.12"
+iroh = "1"
+bytes = "1"
 
 [build-dependencies]
 winres = "0.1"
