@@ -1,31 +1,54 @@
-use std::sync::Arc;
-use tokio::sync::mpsc::Receiver;
+//! Фоновый сервис трансляции аудиопакетов с микрофона в P2P-сеть
 
+use std::sync::Arc;
+use std::net::SocketAddr;
+use tokio::sync::mpsc::Receiver;
+use crate::network::NetworkMessage;
+use crate::room::RoomManager;
+use crate::network::NetworkManager;
+
+/// Запускает фоновую таску чтения пакетов микрофона и их отправки в Iroh и UDP
 pub fn spawn_audio_broadcast(
     rt: &tokio::runtime::Runtime,
     mut packet_rx: Receiver<Vec<u8>>,
-    room: Arc<crate::room::RoomManager>,
-    network: Arc<crate::network::NetworkManager>,
+    room: Arc<RoomManager>,
+    network: Arc<NetworkManager>,
+    my_id: u64,
 ) {
+    let network_net = network.clone();
     let room_net = room.clone();
+    
     rt.spawn(async move {
-        println!("[СЕТЬ] Готов к трансляции аудиопакетов в P2P...");
+        println!("[СЕТЬ] Готов к трансляции аудиопакетов in P2P...");
+        let mut send_count = 0u64;
         while let Some(packet) = packet_rx.recv().await {
-            let network_sender = network.clone();
-            let my_id = room_net.get_my_id();
-            let msg = crate::network::message::NetworkMessage::AudioFrame {
-                sender_id: my_id,
-                opus_data: packet,
-            };
-            let serialized_bytes = crate::network::message::serialize_msg(&msg);
-            let peers = room_net.get_all_peers();
+            // 1. Трансляция через Iroh P2P
+            if let Some(ref p2p) = network_net.iroh {
+                let network_message = NetworkMessage::AudioFrame {
+                    sender_id: my_id,
+                    opus_data: packet.clone(),
+                };
+                let serialized = crate::network::message::serialize_msg(&network_message);
+                p2p.broadcast_bytes(&serialized).await;
+            }
+
+            // 2. Трансляция через сырой UDP (пропуская Iroh-пиров)
+            let peers = room_net.get_all_peers(); 
             for peer in peers {
-                if peer.id == my_id {
+                if peer.address.starts_with("Iroh:") {
                     continue;
                 }
-                if let Ok(addr) = peer.address.parse::<std::net::SocketAddr>() {
-                    let _ = network_sender.send_audio_packet(addr, &serialized_bytes).await;
+                let network_message = NetworkMessage::AudioFrame {
+                    sender_id: my_id,
+                    opus_data: packet.clone(),
+                };
+                if let Ok(addr) = peer.address.parse::<SocketAddr>() {
+                    let _ = network_net.send_packet(addr, &network_message).await;
                 }
+            }
+            send_count += 1;
+            if send_count % 100 == 1 {
+                println!("[АУДИО] Отправка голоса в P2P (пакет #{}, размер: {} байт)", send_count, packet.len());
             }
         }
     });

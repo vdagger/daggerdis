@@ -14,7 +14,6 @@ pub fn draw_room_panel(
 ) {
     ui.label("Подключение к комнате (введите NodeID или IP:PORT):");
     
-    ui.label("Подключение к хосту (введите IP:PORT):");
     ui.horizontal(|ui| {
         ui.text_edit_singleline(connect_ip);
     });
@@ -88,7 +87,7 @@ pub fn draw_room_panel(
         }
 
         // Кнопка для подключения клиентом к другому серверу
-        if ui.button("🔗 Подключиться как клиент").clicked() {
+        if ui.button("🔗 Войти в комнату").clicked() {
             let raw_addr = connect_ip.trim();
             
             // Проверяем, является ли введенный адрес NodeID Iroh (длинной 64 символа)
