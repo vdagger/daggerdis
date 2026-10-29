@@ -7,6 +7,7 @@ pub enum NetworkMessage {
     PeerListUpdate { peers: Vec<(u64, SocketAddr)> },
     AudioFrame { sender_id: u64, opus_data: Vec<u8> },
     HostMigration { new_host_id: u64 },
+    IrohSync { sender_id: u64, node_id: String, is_host: bool },
 }
 
 pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
@@ -50,6 +51,14 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
         NetworkMessage::HostMigration { new_host_id } => {
             data.push(4);
             data.extend_from_slice(&new_host_id.to_le_bytes());
+        }
+        NetworkMessage::IrohSync { sender_id, node_id, is_host } => {
+            data.push(5);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.push(if *is_host { 1 } else { 0 });
+            let node_bytes = node_id.as_bytes();
+            data.extend_from_slice(&(node_bytes.len() as u16).to_le_bytes());
+            data.extend_from_slice(node_bytes);
         }
         _ => data.push(99), // Заглушка для остальных типов
     }
@@ -129,6 +138,17 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
         4 if bytes.len() >= 9 => {
             let id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
             Some(NetworkMessage::HostMigration { new_host_id: id })
+        }
+        5 if bytes.len() >= 12 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let is_host = bytes[9] == 1;
+            let len = u16::from_le_bytes([bytes[10], bytes[11]]) as usize;
+            if bytes.len() >= 12 + len {
+                let node_id = String::from_utf8(bytes[12..12+len].to_vec()).ok()?;
+                Some(NetworkMessage::IrohSync { sender_id, node_id, is_host })
+            } else {
+                None
+            }
         }
         _ => None,
     }

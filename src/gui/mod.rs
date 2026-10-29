@@ -31,6 +31,7 @@ pub struct RadioApp {
     playback_stream: Arc<Mutex<Option<cpal::Stream>>>,
     playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
     prev_output_index: std::sync::atomic::AtomicU32,
+    continuous_mode: bool,
 }
 
 impl RadioApp {
@@ -76,6 +77,7 @@ impl RadioApp {
             playback_stream,
             playback_rx,
             prev_output_index: std::sync::atomic::AtomicU32::new(0),
+            continuous_mode: false,
         }
     }
 }
@@ -132,8 +134,8 @@ impl eframe::App for RadioApp {
             );
             
             crate::keybind::handle_keybind_ui(ui, &mut self.ptt_bind);
-            crate::keybind::check_ptt_status(ui, &self.ptt_flag, self.ptt_bind);
-            crate::widgets::ptt_button::draw_ptt_button(ui, &self.ptt_flag);
+            crate::keybind::check_ptt_status(ui, &self.ptt_flag, self.ptt_bind, self.continuous_mode);
+            crate::widgets::ptt_button::draw_ptt_button(ui, &self.ptt_flag, &mut self.continuous_mode);
             crate::widgets::room_panel::draw_room_panel(
                 ui,
                 &mut self.room_id_input,

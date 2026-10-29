@@ -27,10 +27,16 @@ impl MigrationManager {
             interval.tick().await;
             
             let my_is_host = is_host.load(Ordering::Relaxed);
-            let heartbeat_msg = NetworkMessage::Heartbeat {
-                sender_id: self.my_id,
-                is_host: my_is_host,
-            };
+            // Рассылаем IrohSync через Iroh P2P для Full-Mesh связности
+            if let Some(ref p2p) = self.network.iroh {
+                let sync_msg = NetworkMessage::IrohSync {
+                    sender_id: self.my_id,
+                    node_id: p2p.my_node_id.clone(),
+                    is_host: my_is_host,
+                };
+                let serialized = crate::network::message::serialize_msg(&sync_msg);
+                p2p.broadcast_bytes(&serialized).await;
+            }
             
             // Автоматическая очистка оффлайн-участников
             let now = SystemTime::now()
@@ -54,6 +60,10 @@ impl MigrationManager {
                 }
                 match peer.address.parse::<std::net::SocketAddr>() {
                     Ok(addr) => {
+                        let heartbeat_msg = NetworkMessage::Heartbeat {
+                            sender_id: self.my_id,
+                            is_host: my_is_host,
+                        };
                         if let Err(e) = self.network.send_packet(addr, &heartbeat_msg).await {
                             eprintln!("[ОШИБКА] Не удалось отправить Heartbeat на {} (ID={}): {}", addr, peer.id, e);
                         }
@@ -62,12 +72,6 @@ impl MigrationManager {
                         eprintln!("[ОШИБКА] Некорректный адрес пира '{}' (ID={}): {}", peer.address, peer.id, e);
                     }
                 }
-            }
-            
-            // Рассылаем Heartbeat через Iroh P2P, удерживая сессию при тишине
-            if let Some(ref p2p) = self.network.iroh {
-                let serialized = crate::network::message::serialize_msg(&heartbeat_msg);
-                p2p.broadcast_bytes(&serialized).await;
             }
             
             // Если узел НЕ является хостом (!my_is_host), он дополнительно проверяет доступность текущего хоста
@@ -134,10 +138,9 @@ impl MigrationManager {
                 let msg = NetworkMessage::HostMigration {
                     new_host_id: self.my_id,
                 };
-                for peer in self.room.get_all_peers() {
-                    if let Ok(addr) = peer.address.parse() {
-                        let _ = self.network.send_packet(addr, &msg).await;
-                    }
+                let serialized = crate::network::message::serialize_msg(&msg);
+                if let Some(ref p2p) = self.network.iroh {
+                    p2p.broadcast_bytes(&serialized).await;
                 }
             } else {
                 // Победил сосед с меньшим ID, признаем его новым хостом

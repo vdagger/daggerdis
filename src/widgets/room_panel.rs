@@ -209,7 +209,15 @@ pub fn draw_room_panel(
                 (egui::Color32::from_rgb(255, 140, 0), "○")
             };
             ui.colored_label(dot_color, dot_char);
-            ui.label(format!("ID: {} ({})", peer.id, peer.address));
+            
+            // Аккуратное отображение адреса (первые 14 символов, если это длинный NodeID)
+            let display_addr = if peer.address.starts_with("Iroh:") && peer.address.len() > 16 {
+                format!("{}..", &peer.address[..14])
+            } else {
+                peer.address.clone()
+            };
+            
+            ui.label(format!("ID: {} ({})", peer.id, display_addr));
             if peer.is_host {
                 ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "[ХОСТ]");
             }

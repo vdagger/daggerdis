@@ -119,6 +119,12 @@ impl UniversalAudioCapture {
                     }
                 }
 
+                // Защита от накопления задержки: сбрасываем хвост, если буфер превышает 120 мс (6 пакетов по 960)
+                if pcm_buffer.len() > 960 * 6 {
+                    let excess = pcm_buffer.len() - (960 * 2);
+                    pcm_buffer.drain(..excess);
+                }
+
                 let num_frames = data.len() / output_channels;
 
                 // Джиттер-буфер: ждем накопления хотя бы 2 пакетов (40 мс) для плавного старта
