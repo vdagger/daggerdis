@@ -7,11 +7,7 @@ pub fn draw_ptt_button(ui: &mut egui::Ui, ptt_flag: &Arc<AtomicBool>, continuous
     ui.horizontal(|ui| {
         // Интерактивный тумблер постоянной передачи
         if ui.checkbox(continuous_mode, "🎙️ Микрофон активен (Постоянная передача)").changed() {
-            if *continuous_mode {
-                ptt_flag.store(true, Ordering::Relaxed);
-            } else {
-                ptt_flag.store(false, Ordering::Relaxed);
-            }
+            ptt_flag.store(*continuous_mode, Ordering::Relaxed);
         }
 
         // Кнопка PTT доступна, только если постоянная передача не включена
@@ -19,7 +15,8 @@ pub fn draw_ptt_button(ui: &mut egui::Ui, ptt_flag: &Arc<AtomicBool>, continuous
             let hold_btn = ui.button("Зажать для разговора (PTT)");
             if hold_btn.is_pointer_button_down_on() {
                 ptt_flag.store(true, Ordering::Relaxed);
-            } else if !ui.ctx().input(|i| i.pointer.any_down()) {
+            } else if hold_btn.hovered() && !ui.ctx().input(|i| i.pointer.any_down()) {
+                // Сбрасываем флаг ТОЛЬКО если пользователь отпустил саму экранную кнопку
                 ptt_flag.store(false, Ordering::Relaxed);
             }
         }

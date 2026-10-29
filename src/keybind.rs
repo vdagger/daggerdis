@@ -1,147 +1,128 @@
-//! Управление биндами PTT (Push-to-Talk) с поддержкой глобального перехвата в играх
+//! Универсальный модуль глобального перехвата PTT через Win32 API
 
 use eframe::egui;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
-
-/// Универсальное перечисление для бинда PTT
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PttBind {
-    Keyboard(eframe::egui::Key),
-    Mouse(eframe::egui::PointerButton),
-}
+use std::time::Duration;
 
 #[cfg(windows)]
 extern "system" {
     fn GetAsyncKeyState(vKey: i32) -> i16;
 }
 
-/// Преобразует бинд egui в системный виртуальный код клавиши Windows (Virtual Key Code)
-fn ptt_bind_to_vk(bind: PttBind) -> Option<i32> {
-    match bind {
-        PttBind::Mouse(eframe::egui::PointerButton::Primary) => Some(0x01),   // ЛКМ
-        PttBind::Mouse(eframe::egui::PointerButton::Secondary) => Some(0x02), // ПКМ
-        PttBind::Mouse(eframe::egui::PointerButton::Middle) => Some(0x04),    // Колесико
-        PttBind::Mouse(eframe::egui::PointerButton::Extra1) => Some(0x05),    // Боковая мышь 1 (Mouse 4)
-        PttBind::Mouse(eframe::egui::PointerButton::Extra2) => Some(0x06),    // Боковая мышь 2 (Mouse 5)
-        PttBind::Keyboard(k) => match k {
-            eframe::egui::Key::Space => Some(0x20),
-            eframe::egui::Key::Tab => Some(0x09),
-            eframe::egui::Key::Enter => Some(0x0D),
-            eframe::egui::Key::Escape => Some(0x1B),
-            eframe::egui::Key::Backspace => Some(0x08),
-            // Буквы A-Z (0x41 .. 0x5A)
-            eframe::egui::Key::A => Some(0x41),
-            eframe::egui::Key::B => Some(0x42),
-            eframe::egui::Key::C => Some(0x43),
-            eframe::egui::Key::D => Some(0x44),
-            eframe::egui::Key::E => Some(0x45),
-            eframe::egui::Key::F => Some(0x46),
-            eframe::egui::Key::G => Some(0x47),
-            eframe::egui::Key::H => Some(0x48),
-            eframe::egui::Key::I => Some(0x49),
-            eframe::egui::Key::J => Some(0x4A),
-            eframe::egui::Key::K => Some(0x4B),
-            eframe::egui::Key::L => Some(0x4C),
-            eframe::egui::Key::M => Some(0x4D),
-            eframe::egui::Key::N => Some(0x4E),
-            eframe::egui::Key::O => Some(0x4F),
-            eframe::egui::Key::P => Some(0x50),
-            eframe::egui::Key::Q => Some(0x51),
-            eframe::egui::Key::R => Some(0x52),
-            eframe::egui::Key::S => Some(0x53),
-            eframe::egui::Key::T => Some(0x54),
-            eframe::egui::Key::U => Some(0x55),
-            eframe::egui::Key::V => Some(0x56),
-            eframe::egui::Key::W => Some(0x57),
-            eframe::egui::Key::X => Some(0x58),
-            eframe::egui::Key::Y => Some(0x59),
-            eframe::egui::Key::Z => Some(0x5A),
-            // Цифры 0-9 (0x30 .. 0x39)
-            eframe::egui::Key::Num0 => Some(0x30),
-            eframe::egui::Key::Num1 => Some(0x31),
-            eframe::egui::Key::Num2 => Some(0x32),
-            eframe::egui::Key::Num3 => Some(0x33),
-            eframe::egui::Key::Num4 => Some(0x34),
-            eframe::egui::Key::Num5 => Some(0x35),
-            eframe::egui::Key::Num6 => Some(0x36),
-            eframe::egui::Key::Num7 => Some(0x37),
-            eframe::egui::Key::Num8 => Some(0x38),
-            eframe::egui::Key::Num9 => Some(0x39),
-            // Функциональные клавиши F1-F12
-            eframe::egui::Key::F1 => Some(0x70),
-            eframe::egui::Key::F2 => Some(0x71),
-            eframe::egui::Key::F3 => Some(0x72),
-            eframe::egui::Key::F4 => Some(0x73),
-            eframe::egui::Key::F5 => Some(0x74),
-            eframe::egui::Key::F6 => Some(0x75),
-            eframe::egui::Key::F7 => Some(0x76),
-            eframe::egui::Key::F8 => Some(0x77),
-            eframe::egui::Key::F9 => Some(0x78),
-            eframe::egui::Key::F10 => Some(0x79),
-            eframe::egui::Key::F11 => Some(0x7A),
-            eframe::egui::Key::F12 => Some(0x7B),
-            _ => None,
-        },
-    }
-}
+/// Системный код клавиши Windows (VK)
+pub type PttBind = i32;
 
-/// Обновляет UI для выбора бинда PTT
-pub fn handle_keybind_ui(ui: &mut eframe::egui::Ui, current_bind: &mut Option<PttBind>) {
-    let text = match current_bind {
-        Some(PttBind::Keyboard(k)) => format!("PTT: Клавиша {:?}", k),
-        Some(PttBind::Mouse(b)) => format!("PTT: Мышь {:?}", b),
-        None => "Нажмите любую клавишу или кнопку мыши...".to_string(),
-    };
-    if ui.button(text).clicked() { 
-        *current_bind = None; 
-    }
+// По умолчанию Mouse 4 (боковая кнопка мыши 0x05)
+pub static CURRENT_VK: AtomicI32 = AtomicI32::new(0x05); 
+static LISTENER_SPAWNED: AtomicBool = AtomicBool::new(false);
+static IS_LISTENING: AtomicBool = AtomicBool::new(false);
+static CONTINUOUS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    if current_bind.is_none() {
-        // Опрос клавиатуры egui
-        if let Some(k) = ui.ctx().input(|i| i.keys_down.iter().next().cloned()) {
-            *current_bind = Some(PttBind::Keyboard(k));
-        }
-        // Опрос мыши (ЛКМ, ПКМ, Колесико, Боковые кнопки)
-        for button in [
-            eframe::egui::PointerButton::Primary,
-            eframe::egui::PointerButton::Secondary,
-            eframe::egui::PointerButton::Middle,
-            eframe::egui::PointerButton::Extra1,
-            eframe::egui::PointerButton::Extra2,
-        ] {
-            if ui.ctx().input(|i| i.pointer.button_down(button)) {
-                *current_bind = Some(PttBind::Mouse(button));
-            }
-        }
-    }
-}
+/// Запускает независимый фоновый системный поток перехвата PTT в Windows
+fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
+    if LISTENER_SPAWNED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        std::thread::spawn(move || {
+            println!("[ХОТКЕЙ] 🚀 Фоновый системный перехватчик PTT в играх запущен!");
+            let mut last_state = false;
 
-/// Проверяет статус нажатия PTT глобально во всей системе (даже если окно не в фокусе)
-pub fn check_ptt_status(ui: &eframe::egui::Ui, ptt_flag: &Arc<AtomicBool>, bind: Option<PttBind>, continuous_mode: bool) {
-    if continuous_mode {
-        ptt_flag.store(true, Ordering::Relaxed);
-        return;
-    }
+            loop {
+                std::thread::sleep(Duration::from_millis(10));
 
-    // 1. Глобальная проверка состояния клавиши через Windows API (работает в свернутом виде и в играх)
-    #[cfg(windows)]
-    if let Some(b) = bind {
-        if let Some(vk) = ptt_bind_to_vk(b) {
-            unsafe {
-                if (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 {
+                if CONTINUOUS_ACTIVE.load(Ordering::Relaxed) {
                     ptt_flag.store(true, Ordering::Relaxed);
-                    return;
+                    continue;
+                }
+
+                #[cfg(windows)]
+                {
+                    let vk = CURRENT_VK.load(Ordering::Relaxed);
+                    if vk > 0 {
+                        unsafe {
+                            // Проверяем старший бит (физически зажата ли клавиша)
+                            let is_down = (GetAsyncKeyState(vk) as u16 & 0x8000) != 0;
+                            if is_down != last_state {
+                                last_state = is_down;
+                                ptt_flag.store(is_down, Ordering::Relaxed);
+                                if is_down {
+                                    println!("[ХОТКЕЙ] 🎙️ PTT НАЖАТ (VK: {:#X})", vk);
+                                } else {
+                                    println!("[ХОТКЕЙ] 🔇 PTT ОТПУЩЕН (VK: {:#X})", vk);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Возвращает понятное человеческое имя для кода клавиши Windows
+fn vk_to_name(vk: i32) -> String {
+    match vk {
+        0x01 => "Мышь: ЛКМ".to_string(),
+        0x02 => "Мышь: ПКМ".to_string(),
+        0x04 => "Мышь: Колесико".to_string(),
+        0x05 => "Мышь: Боковая 1 (Mouse 4)".to_string(),
+        0x06 => "Мышь: Боковая 2 (Mouse 5)".to_string(),
+        0x14 => "Клавиша: CapsLock".to_string(),
+        0x20 => "Клавиша: Пробел".to_string(),
+        0x10 | 0xA0 | 0xA1 => "Клавиша: Shift".to_string(),
+        0x11 | 0xA2 | 0xA3 => "Клавиша: Ctrl".to_string(),
+        0x12 | 0xA4 | 0xA5 => "Клавиша: Alt".to_string(),
+        0x09 => "Клавиша: Tab".to_string(),
+        0xC0 => "Клавиша: Тильда (~)".to_string(),
+        0x41..=0x5A => format!("Клавиша: {}", (vk as u8 as char)),
+        0x70..=0x7B => format!("Клавиша: F{}", vk - 0x70 + 1),
+        0 => "Не назначено".to_string(),
+        _ => format!("Кнопка (Код {:#X})", vk),
+    }
+}
+
+/// Отрисовка кнопки назначения хоткея
+pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>) {
+    let is_listening = IS_LISTENING.load(Ordering::Relaxed);
+    let vk = current_bind.unwrap_or_else(|| CURRENT_VK.load(Ordering::Relaxed));
+
+    let text = if is_listening {
+        "🔴 НАЖМИТЕ ЛЮБУЮ КНОПКУ МЫШИ ИЛИ КЛАВИАТУРЫ...".to_string()
+    } else {
+        format!("PTT: {}", vk_to_name(vk))
+    };
+
+    if ui.button(text).clicked() {
+        IS_LISTENING.store(true, Ordering::Relaxed);
+    }
+
+    if is_listening {
+        #[cfg(windows)]
+        {
+            unsafe {
+                for code in 1..=254 {
+                    // Игнорируем ЛКМ чтобы не биндить сам клик
+                    if code == 0x01 {
+                        continue;
+                    }
+                    if (GetAsyncKeyState(code) as u16 & 0x8000) != 0 {
+                        *current_bind = Some(code);
+                        CURRENT_VK.store(code, Ordering::Relaxed);
+                        IS_LISTENING.store(false, Ordering::Relaxed);
+                        println!("[ХОТКЕЙ] Назначена новая кнопка PTT: {} (код {:#X})", vk_to_name(code), code);
+                        break;
+                    }
                 }
             }
         }
     }
+}
 
-    // 2. Резервная проверка через egui (когда окно активно)
-    let is_down = match bind {
-        Some(PttBind::Keyboard(k)) => ui.ctx().input(|i| i.key_down(k)),
-        Some(PttBind::Mouse(b)) => ui.ctx().input(|i| i.pointer.button_down(b)),
-        None => false,
-    };
-    ptt_flag.store(is_down, Ordering::Relaxed);
+/// Поддерживает работу слушателя и передает флаг
+pub fn check_ptt_status(_ui: &egui::Ui, ptt_flag: &Arc<AtomicBool>, bind: Option<PttBind>, continuous_mode: bool) {
+    ensure_global_listener_spawned(ptt_flag.clone());
+    CONTINUOUS_ACTIVE.store(continuous_mode, Ordering::Relaxed);
+
+    if let Some(vk) = bind {
+        CURRENT_VK.store(vk, Ordering::Relaxed);
+    }
 }
