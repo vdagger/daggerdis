@@ -1,4 +1,4 @@
-# DiscordRF — Serverless P2P Mesh Рация на Rust (2026)
+# Albus — Serverless P2P Mesh Рация на Rust (2026)
 
 Бессерверная голосовая рация на базе direct UDP P2P (STUN RFC 5389), кодека Opus и отказоустойчивой миграции хоста.
 
