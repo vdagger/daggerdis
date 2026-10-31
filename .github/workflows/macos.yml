@@ -1,0 +1,44 @@
+name: Build macOS Universal
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # Позволяет запускать сборку вручную кнопкой в GitHub
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Клонирование репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Rust и целевых платформ Mac
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Сборка под Apple Silicon (M1/M2/M3/M4)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Сборка под процессоры Intel Mac
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Создание универсального бинарника (Universal 2 Binary)
+        run: |
+          mkdir -p dist
+          # Автоматически находим имя скомпилированного бинарника
+          BIN_NAME=$(find target/aarch64-apple-darwin/release -maxdepth 1 -type f ! -name "*.*" -exec basename {} \;)
+          echo "Обнаружен бинарник: $BIN_NAME"
+
+          # Объединяем оба процессора в один файл с помощью lipo
+          lipo -create -output dist/${BIN_NAME}-macos-universal \
+            target/aarch64-apple-darwin/release/${BIN_NAME} \
+            target/x86_64-apple-darwin/release/${BIN_NAME}
+
+          chmod +x dist/${BIN_NAME}-macos-universal
+
+      - name: Загрузка готового файла в артефакты GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: Albus-macOS-Universal
+          path: dist/*
