@@ -27,7 +27,7 @@ pub fn draw_info_panel(ui: &mut egui::Ui, my_id: u64, my_external_ip: &str) {
         ui.add(egui::Image::new(&texture).max_height(32.0));
         
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(6.0); // Защитный отступ от правого края
+            ui.add_space(14.0); // Отступ от правого края, чтобы ID не срезался
             ui.label(
                 egui::RichText::new(format!("ID: {}", my_id))
                     .color(egui::Color32::from_rgb(160, 166, 178))

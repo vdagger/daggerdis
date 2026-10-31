@@ -18,15 +18,17 @@ pub fn draw_room_panel(
     
     // Адаптивная строка подключения во всю ширину
     ui.horizontal(|ui| {
-        let btn_width = 90.0;
+        let btn_width = 84.0;
         let spacing = ui.spacing().item_spacing.x;
-        let input_width = (ui.available_width() - btn_width - spacing - 6.0).max(100.0);
+        // Запас 16px справа, чтобы кнопка не прилипала к границе рамки
+        let input_width = (ui.available_width() - btn_width - spacing - 16.0).max(80.0);
 
         ui.add(
             egui::TextEdit::singleline(connect_ip)
-                .hint_text("Вставьте NodeID")
+                .hint_text("Вставьте NodeID...")
                 .desired_width(input_width)
         );
+        ui.add_space(4.0);
 
         let btn = egui::Button::new(egui::RichText::new("🔗 Войти").strong().color(egui::Color32::WHITE))
             .fill(egui::Color32::from_rgb(14, 165, 233)); // Стильный Electric Sky Blue

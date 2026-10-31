@@ -4,6 +4,29 @@ use std::sync::Arc;
 
 pub struct UniversalAudioCapture;
 
+/// Программный ресэмплер методом линейной интерполяции
+/// Преобразует аудиопоток из одной частоты дискретизации в другую без изменения тональности (питча)
+fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32, position: &mut f64) -> Vec<f32> {
+    if from_rate == to_rate || input.is_empty() {
+        return input.to_vec();
+    }
+
+    let ratio = from_rate as f64 / to_rate as f64;
+    let mut output = Vec::with_capacity((input.len() as f64 / ratio).ceil() as usize + 2);
+
+    while *position < input.len() as f64 - 1.0 {
+        let idx = *position as usize;
+        let frac = (*position - idx as f64) as f32;
+        let s0 = input[idx];
+        let s1 = input[idx + 1];
+        output.push(s0 + frac * (s1 - s0));
+        *position += ratio;
+    }
+
+    *position -= (input.len().saturating_sub(1)) as f64;
+    output
+}
+
 impl UniversalAudioCapture {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(UniversalAudioCapture)
@@ -22,30 +45,38 @@ impl UniversalAudioCapture {
             None => host.default_input_device().ok_or("No default input device")?,
         };
 
-        let config = input_device.default_input_config()?;
-        let total_channels = config.channels() as usize;
-        let stream_config = config.config();
+        // Ищем конфигурацию, поддерживающую 48000 Гц, либо берем дефолтную
+        let supported_configs = input_device.supported_input_configs().ok();
+        let best_config = supported_configs.and_then(|mut configs| {
+            configs.find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
+                .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
+        }).or_else(|| input_device.default_input_config().ok().map(|c| c.config()))
+          .ok_or("Не удалось получить поддерживаемый формат микрофона")?;
+
+        let sample_rate = best_config.sample_rate.0;
+        let total_channels = best_config.channels as usize;
 
         println!(
             "[АУДИО] Открыт микрофон: '{}', частота: {} Гц, каналов: {}",
             input_device.name().unwrap_or_default(),
-            stream_config.sample_rate.0,
+            sample_rate,
             total_channels
         );
 
-        // Создаем Opus-энкодер (48 кГц, моно, студийный битрейт 64 kbps)
+        // Создаем Opus-энкодер строго на 48000 Гц, 64 kbps
         let mut encoder = rusty_opus::OpusEncoder::new(48000, 1, rusty_opus::Application::Voip)?;
         encoder.bitrate_bps = 64_000;
 
         let mut sample_acc: Vec<f32> = Vec::with_capacity(1920);
         let mut mono_chunk: Vec<f32> = Vec::with_capacity(960);
+        let mut resample_pos: f64 = 0.0;
         let mut gate_gain: f32 = 0.0;
 
         let stream = input_device.build_input_stream(
-            &stream_config,
+            &best_config,
             move |data: &[f32], _| {
                 mono_chunk.clear();
-                // Усредняем входные каналы в чистый монофонический поток
+                // Усредняем входные каналы в чистый монопоток
                 for chunk in data.chunks_exact(total_channels) {
                     let sample = if total_channels > 1 {
                         (chunk[0] + chunk[1]) * 0.5
@@ -55,26 +86,33 @@ impl UniversalAudioCapture {
                     mono_chunk.push(sample);
                 }
 
-                // Обработка громкости и VU-метра через микшер
+                // Обработка громкости микрофона
                 mixer.process_input(&mut mono_chunk);
 
-                // --- Noise Gate (Шумовой затвор) ---
-                // Порог: ~ -44 dBFS (0.006). Комнатный шум ниже порога отсекается в ноль
-                let chunk_peak = mono_chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                // Если микрофон работает не на 48 кГц, ресэмплируем строго в 48 000 Гц
+                let normalized_chunk = if sample_rate != 48000 {
+                    resample_linear(&mono_chunk, sample_rate, 48000, &mut resample_pos)
+                } else {
+                    mono_chunk.clone()
+                };
+
+                // Noise Gate (Шумовой затвор): порог ~ -44 dBFS (0.006)
+                let mut processed_chunk = normalized_chunk;
+                let chunk_peak = processed_chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                 let target_gain = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
 
-                for sample in mono_chunk.iter_mut() {
+                for sample in processed_chunk.iter_mut() {
                     if target_gain > gate_gain {
-                        gate_gain += (target_gain - gate_gain) * 0.1;  // Быстрая атака (0.6 мс)
+                        gate_gain += (target_gain - gate_gain) * 0.1;
                     } else {
-                        gate_gain += (target_gain - gate_gain) * 0.002; // Мягкий релиз (~20 мс)
+                        gate_gain += (target_gain - gate_gain) * 0.002;
                     }
                     *sample *= gate_gain;
                 }
 
-                // Нарезаем сэмплы ровно по 960 (20 мс — стандарт Opus)
+                // Нарезаем ровно по 960 сэмплов (20 мс при 48 кГц) для Opus
                 if ptt_flag.load(Ordering::Relaxed) {
-                    sample_acc.extend_from_slice(&mono_chunk);
+                    sample_acc.extend_from_slice(&processed_chunk);
                     while sample_acc.len() >= 960 {
                         let frame: Vec<f32> = sample_acc.drain(..960).collect();
                         let mut packet_buf = vec![0u8; 1024];
@@ -110,44 +148,64 @@ impl UniversalAudioCapture {
             None => host.default_output_device().ok_or("No default output device")?,
         };
 
-        let config = output_device.default_output_config()?.config();
-        let output_channels = config.channels as usize;
+        // Запрашиваем 48000 Гц у динамиков, либо берем их дефолтный формат
+        let supported_configs = output_device.supported_output_configs().ok();
+        let best_config = supported_configs.and_then(|mut configs| {
+            configs.find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
+                .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
+        }).or_else(|| output_device.default_output_config().ok().map(|c| c.config()))
+          .ok_or("Не удалось получить поддерживаемый формат динамиков")?;
+
+        let sample_rate = best_config.sample_rate.0;
+        let output_channels = best_config.channels as usize;
 
         println!(
             "[АУДИО] Открыты динамики: '{}', частота: {} Гц, каналов: {}",
             output_device.name().unwrap_or_default(),
-            config.sample_rate.0,
+            sample_rate,
             output_channels
         );
 
         let mut decoder = rusty_opus::OpusDecoder::new(48000, 1)?;
         let mut mono_decoded = [0.0f32; 960];
         let mut pcm_buffer: Vec<f32> = Vec::with_capacity(3840);
+        let mut resample_pos: f64 = 0.0;
         let mut prebuffered = false;
 
         let stream = output_device.build_output_stream(
-            &config,
+            &best_config,
             move |data: &mut [f32], _| {
-                // Принимаем входящие голосовые пакеты и передаем в микшер
+                // Принимаем входящие пакеты и декодируем (всегда 48 кГц от Opus)
                 if let Ok(mut rx_lock) = rx.try_lock() {
                     while let Ok((sender_id, packet)) = rx_lock.try_recv() {
                         if let Ok(len) = decoder.decode(&packet, 960, &mut mono_decoded) {
                             mixer.process_output(sender_id, &mut mono_decoded[..len]);
-                            pcm_buffer.extend_from_slice(&mono_decoded[..len]);
+                            
+                            // Если звуковая карта работает не на 48 кГц (например 44.1 или 96 кГц),
+                            // ресэмплируем декодированный звук строго под частоту звуковой карты!
+                            if sample_rate != 48000 {
+                                let resampled = resample_linear(&mono_decoded[..len], 48000, sample_rate, &mut resample_pos);
+                                pcm_buffer.extend_from_slice(&resampled);
+                            } else {
+                                pcm_buffer.extend_from_slice(&mono_decoded[..len]);
+                            }
                         }
                     }
                 }
 
-                // Джиттер-буфер: сбрасываем задержку, если буфер превышает 120 мс
-                if pcm_buffer.len() > 960 * 6 {
-                    let excess = pcm_buffer.len() - (960 * 2);
+                // Сброс хвоста джиттер-буфера при лагах сети
+                let max_buffer = (sample_rate as usize * 12) / 100; // 120 мс
+                if pcm_buffer.len() > max_buffer {
+                    let keep = (sample_rate as usize * 4) / 100; // 40 мс
+                    let excess = pcm_buffer.len().saturating_sub(keep);
                     pcm_buffer.drain(..excess);
                 }
 
                 let num_frames = data.len() / output_channels;
+                let min_prebuffer = (sample_rate as usize * 4) / 100; // 40 мс
 
                 if !prebuffered {
-                    if pcm_buffer.len() >= 960 * 2 {
+                    if pcm_buffer.len() >= min_prebuffer {
                         prebuffered = true;
                     } else {
                         data.fill(0.0);
