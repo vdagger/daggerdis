@@ -121,15 +121,28 @@ fn main() {
         migration_loop.start_heartbeat_loop(is_host_loop, room_id_str).await;
     });
 
-    // 6. Запуск графического интерфейса
+    // 6. Настройка окна, размера и иконки приложения
     let input_devices = DeviceSelector::get_input_devices();
     let output_devices = DeviceSelector::get_output_devices();
+
+    // Загрузка иконки из assets/icon.png для панели задач и заголовка окна
+    let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
+    
+    let mut native_options = eframe::NativeOptions::default();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([460.0, 700.0])
+        .with_min_inner_size([420.0, 520.0]);
+        
+    if let Some(icon) = icon_data {
+        viewport = viewport.with_icon(icon);
+    }
+    native_options.viewport = viewport;
 
     let _guard = rt.enter();
     let _runtime_guard = rt;
     eframe::run_native(
         "Albus Audio",
-        eframe::NativeOptions::default(),
+        native_options,
         Box::new(move |_cc| {
             Ok(Box::new(RadioApp::new(
                 mixer, room, None, ptt_flag, selected_input, selected_output,

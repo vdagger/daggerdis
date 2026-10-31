@@ -20,7 +20,7 @@ pub fn draw_room_panel(
     ui.horizontal(|ui| {
         let btn_width = 90.0;
         let spacing = ui.spacing().item_spacing.x;
-        let input_width = (ui.available_width() - btn_width - spacing).max(120.0);
+        let input_width = (ui.available_width() - btn_width - spacing - 6.0).max(100.0);
 
         ui.add(
             egui::TextEdit::singleline(connect_ip)
