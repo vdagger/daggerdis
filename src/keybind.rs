@@ -29,27 +29,27 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
             loop {
                 std::thread::sleep(Duration::from_millis(10));
 
-                if CONTINUOUS_ACTIVE.load(Ordering::Relaxed) {
-                    ptt_flag.store(true, Ordering::Relaxed);
-                    continue;
-                }
+                let is_active = CONTINUOUS_ACTIVE.load(Ordering::Relaxed);
 
                 #[cfg(windows)]
                 {
                     let vk = CURRENT_VK.load(Ordering::Relaxed);
-                    if vk > 0 {
-                        unsafe {
-                            // Проверяем старший бит (физически зажата ли клавиша)
-                            let is_down = (GetAsyncKeyState(vk) as u16 & 0x8000) != 0;
-                            if is_down != last_state {
-                                last_state = is_down;
-                                ptt_flag.store(is_down, Ordering::Relaxed);
-                                if is_down {
-                                    println!("[ХОТКЕЙ] 🎙️ PTT НАЖАТ (VK: {:#X})", vk);
-                                } else {
-                                    println!("[ХОТКЕЙ] 🔇 PTT ОТПУЩЕН (VK: {:#X})", vk);
-                                }
-                            }
+                    let key_down = if vk > 0 {
+                        unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+                    } else {
+                        false
+                    };
+
+                    // Передача активна, если включен тумблер ИЛИ физически зажата клавиша PTT
+                    let should_transmit = is_active || key_down;
+
+                    if should_transmit != last_state {
+                        last_state = should_transmit;
+                        ptt_flag.store(should_transmit, Ordering::Relaxed);
+                        if should_transmit {
+                            println!("[ХОТКЕЙ] 🎙️ ЭФИР ВКЛЮЧЕН (VK: {:#X}, Hands-Free: {})", vk, is_active);
+                        } else {
+                            println!("[ХОТКЕЙ] 🔇 ЭФИР ВЫКЛЮЧЕН");
                         }
                     }
                 }
@@ -80,18 +80,23 @@ fn vk_to_name(vk: i32) -> String {
     }
 }
 
-/// Отрисовка кнопки назначения хоткея
-pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>) {
+/// Отрисовка кнопки назначения хоткея с фиксированной шириной
+pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>, width: f32) {
     let is_listening = IS_LISTENING.load(Ordering::Relaxed);
     let vk = current_bind.unwrap_or_else(|| CURRENT_VK.load(Ordering::Relaxed));
 
     let text = if is_listening {
-        "🔴 НАЖМИТЕ ЛЮБУЮ КНОПКУ МЫШИ ИЛИ КЛАВИАТУРЫ...".to_string()
+        "🔴 НАЖМИТЕ КЛАВИШУ...".to_string()
     } else {
         format!("PTT: {}", vk_to_name(vk))
     };
 
-    if ui.button(text).clicked() {
+    let btn = ui.add_sized(
+        [width, 22.0],
+        egui::Button::new(egui::RichText::new(text).size(12.0))
+    );
+
+    if btn.clicked() {
         IS_LISTENING.store(true, Ordering::Relaxed);
     }
 
@@ -100,7 +105,7 @@ pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>) 
         {
             unsafe {
                 for code in 1..=254 {
-                    // Игнорируем ЛКМ чтобы не биндить сам клик
+                    // Игнорируем обычный клик ЛКМ при открытии меню
                     if code == 0x01 {
                         continue;
                     }
@@ -117,7 +122,7 @@ pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>) 
     }
 }
 
-/// Поддерживает работу слушателя и передает флаг
+/// Поддерживает работу слушателя и синхронизирует флаги
 pub fn check_ptt_status(_ui: &egui::Ui, ptt_flag: &Arc<AtomicBool>, bind: Option<PttBind>, continuous_mode: bool) {
     ensure_global_listener_spawned(ptt_flag.clone());
     CONTINUOUS_ACTIVE.store(continuous_mode, Ordering::Relaxed);

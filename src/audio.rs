@@ -33,16 +33,19 @@ impl UniversalAudioCapture {
             total_channels
         );
 
-        // Создаем Opus-энкодер ОДИН РАЗ перед запуском потока (стандарт VoIP: 48кГц, моно)
+        // Создаем Opus-энкодер (48 кГц, моно, студийный битрейт 64 kbps)
         let mut encoder = rusty_opus::OpusEncoder::new(48000, 1, rusty_opus::Application::Voip)?;
+        encoder.bitrate_bps = 64_000;
+
         let mut sample_acc: Vec<f32> = Vec::with_capacity(1920);
         let mut mono_chunk: Vec<f32> = Vec::with_capacity(960);
+        let mut gate_gain: f32 = 0.0;
 
         let stream = input_device.build_input_stream(
             &stream_config,
             move |data: &[f32], _| {
                 mono_chunk.clear();
-                // Настоящая звуковая волна: усредняем каналы без искажения фазы и знака
+                // Усредняем входные каналы в чистый монофонический поток
                 for chunk in data.chunks_exact(total_channels) {
                     let sample = if total_channels > 1 {
                         (chunk[0] + chunk[1]) * 0.5
@@ -55,7 +58,21 @@ impl UniversalAudioCapture {
                 // Обработка громкости и VU-метра через микшер
                 mixer.process_input(&mut mono_chunk);
 
-                // Нарезаем сэмплы ровно по 960 (20 мс — золотой стандарт Opus VoIP)
+                // --- Noise Gate (Шумовой затвор) ---
+                // Порог: ~ -44 dBFS (0.006). Комнатный шум ниже порога отсекается в ноль
+                let chunk_peak = mono_chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                let target_gain = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
+
+                for sample in mono_chunk.iter_mut() {
+                    if target_gain > gate_gain {
+                        gate_gain += (target_gain - gate_gain) * 0.1;  // Быстрая атака (0.6 мс)
+                    } else {
+                        gate_gain += (target_gain - gate_gain) * 0.002; // Мягкий релиз (~20 мс)
+                    }
+                    *sample *= gate_gain;
+                }
+
+                // Нарезаем сэмплы ровно по 960 (20 мс — стандарт Opus)
                 if ptt_flag.load(Ordering::Relaxed) {
                     sample_acc.extend_from_slice(&mono_chunk);
                     while sample_acc.len() >= 960 {
@@ -66,7 +83,7 @@ impl UniversalAudioCapture {
                         }
                     }
                     if sample_acc.len() > 4800 {
-                        sample_acc.clear(); // Защита от накопления сетевой задержки
+                        sample_acc.clear();
                     }
                 } else {
                     sample_acc.clear();
@@ -84,7 +101,8 @@ impl UniversalAudioCapture {
 
     pub fn create_playback_stream(
         device: Option<cpal::Device>,
-        rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+        rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>>>,
+        mixer: std::sync::Arc<crate::mixer::AudioMixer>,
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
         let output_device = match device {
@@ -110,16 +128,17 @@ impl UniversalAudioCapture {
         let stream = output_device.build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                // Выбираем все пришедшие пакеты из сетевой очереди
+                // Принимаем входящие голосовые пакеты и передаем в микшер
                 if let Ok(mut rx_lock) = rx.try_lock() {
-                    while let Ok(packet) = rx_lock.try_recv() {
+                    while let Ok((sender_id, packet)) = rx_lock.try_recv() {
                         if let Ok(len) = decoder.decode(&packet, 960, &mut mono_decoded) {
+                            mixer.process_output(sender_id, &mut mono_decoded[..len]);
                             pcm_buffer.extend_from_slice(&mono_decoded[..len]);
                         }
                     }
                 }
 
-                // Защита от накопления задержки: сбрасываем хвост, если буфер превышает 120 мс (6 пакетов по 960)
+                // Джиттер-буфер: сбрасываем задержку, если буфер превышает 120 мс
                 if pcm_buffer.len() > 960 * 6 {
                     let excess = pcm_buffer.len() - (960 * 2);
                     pcm_buffer.drain(..excess);
@@ -127,7 +146,6 @@ impl UniversalAudioCapture {
 
                 let num_frames = data.len() / output_channels;
 
-                // Джиттер-буфер: ждем накопления хотя бы 2 пакетов (40 мс) для плавного старта
                 if !prebuffered {
                     if pcm_buffer.len() >= 960 * 2 {
                         prebuffered = true;
@@ -138,7 +156,7 @@ impl UniversalAudioCapture {
                 }
 
                 if pcm_buffer.is_empty() {
-                    prebuffered = false; // Буфер иссяк — мягко ждем следующий пакет
+                    prebuffered = false;
                     data.fill(0.0);
                     return;
                 }

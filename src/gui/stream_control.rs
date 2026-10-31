@@ -48,8 +48,9 @@ pub fn restart_audio_stream(
 /// Перезапускает аудиопоток воспроизведения
 pub fn restart_playback_stream(
     playback_stream: &std::sync::Arc<std::sync::Mutex<Option<cpal::Stream>>>,
-    rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>>>,
     device_name: String,
+    mixer: std::sync::Arc<crate::mixer::AudioMixer>,
 ) {
     let mut stream_lock = playback_stream.lock().unwrap();
     *stream_lock = None; // Останавливаем старый поток
@@ -59,7 +60,7 @@ pub fn restart_playback_stream(
         use cpal::traits::DeviceTrait;
         devs.find(|d| d.name().unwrap_or_default() == device_name)
     }) {
-        match crate::audio::UniversalAudioCapture::create_playback_stream(Some(device), rx) {
+        match crate::audio::UniversalAudioCapture::create_playback_stream(Some(device), rx, mixer) {
             Ok(new_stream) => {
                 *stream_lock = Some(new_stream);
                 println!("[GUI] Поток воспроизведения переключен на: {}", device_name);

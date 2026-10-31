@@ -153,6 +153,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "albus"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "cpal",
+ "eframe",
+ "egui",
+ "igd",
+ "iroh",
+ "rand 0.8.8",
+ "rubato",
+ "rusty-opus",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ureq",
+ "winres",
+]
+
+[[package]]
 name = "alsa"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1341,27 +1362,6 @@ checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
-]
-
-[[package]]
-name = "discordrf"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "bytes",
- "cpal",
- "eframe",
- "egui",
- "igd",
- "iroh",
- "rand 0.8.8",
- "rubato",
- "rusty-opus",
- "serde",
- "serde_json",
- "tokio",
- "ureq",
- "winres",
 ]
 
 [[package]]

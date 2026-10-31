@@ -12,7 +12,7 @@ pub fn spawn_iroh_receiver(
     rt: &tokio::runtime::Runtime,
     iroh_p2p: Option<Arc<IrohP2pManager>>,
     room: Arc<RoomManager>,
-    playback_tx: Sender<Vec<u8>>,
+    playback_tx: Sender<(u64, Vec<u8>)>,
     is_host: Arc<AtomicBool>,
 ) {
     if let Some(p2p) = iroh_p2p {
@@ -80,7 +80,7 @@ pub fn spawn_iroh_receiver(
                                 last_heartbeat: now,
                             });
 
-                            let _ = playback_tx_iroh.try_send(opus_data);
+                            let _ = playback_tx_iroh.try_send((sender_id, opus_data));
                             // Ретрансляция голоса удалена, чтобы исключить задвоение сэмплов и замедление звука
                         }
                         NetworkMessage::Heartbeat { sender_id, is_host: peer_is_host } => {

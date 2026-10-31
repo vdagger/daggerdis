@@ -7,7 +7,7 @@ pub fn spawn_network_receiver(
     rt: &tokio::runtime::Runtime,
     network: Arc<NetworkManager>,
     room: Arc<RoomManager>,
-    playback_tx: Sender<Vec<u8>>,
+    playback_tx: Sender<(u64, Vec<u8>)>,
 ) {
     let network_recv = network.clone();
     let room_net = room.clone();
@@ -54,7 +54,7 @@ pub fn spawn_network_receiver(
                             p.last_heartbeat = now;
                             room_net.update_peer(p);
                         }
-                        let _ = playback_tx_clone.try_send(opus_data);
+                        let _ = playback_tx_clone.try_send((sender_id, opus_data));
                         audio_recv_count += 1;
                         if audio_recv_count % 100 == 1 {
                             println!("[СЕТЬ] Принят голос от ID={} (пакет #{})", sender_id, audio_recv_count);
