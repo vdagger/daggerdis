@@ -18,6 +18,13 @@ pub static CURRENT_VK: AtomicI32 = AtomicI32::new(0x05);
 static LISTENER_SPAWNED: AtomicBool = AtomicBool::new(false);
 static IS_LISTENING: AtomicBool = AtomicBool::new(false);
 static CONTINUOUS_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Экранная PTT-зона: суммируется с хоткеем, а не перетирает его
+static SCREEN_PTT: AtomicBool = AtomicBool::new(false);
+
+/// Вызывается из GUI: пользователь зажал/отпустил PTT-зону мышью
+pub fn set_screen_ptt(active: bool) {
+    SCREEN_PTT.store(active, Ordering::Relaxed);
+}
 
 /// Запускает независимый фоновый системный поток перехвата PTT в Windows
 fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
@@ -43,8 +50,9 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
                         false
                     };
 
-                    // Передача активна, если включен тумблер ИЛИ физически зажата клавиша PTT
-                    let should_transmit = is_active || key_down;
+                    // Передача активна: тумблер, физическая клавиша или зажатая экранная зона
+                    let should_transmit =
+                        is_active || key_down || SCREEN_PTT.load(Ordering::Relaxed);
 
                     if should_transmit != last_state {
                         last_state = should_transmit;
@@ -134,7 +142,7 @@ pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>, 
 
 /// Поддерживает работу слушателя и синхронизирует флаги
 pub fn check_ptt_status(
-    _ui: &egui::Ui,
+    _ctx: &egui::Context,
     ptt_flag: &Arc<AtomicBool>,
     bind: Option<PttBind>,
     continuous_mode: bool,

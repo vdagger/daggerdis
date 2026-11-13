@@ -16,6 +16,20 @@ fn slider_to_gain(val: u32) -> f32 {
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Свежие данные о голосе собеседника: когда последний раз звучал и насколько громко
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PeerMeter {
+    pub last_audio_ms: u64,
+    pub peak: f32,
+}
+
 /// Аудио-микшер для управления громкостью и мьютом
 #[derive(Debug)]
 pub struct AudioMixer {
@@ -28,6 +42,7 @@ pub struct AudioMixer {
     input1_peak: AtomicU32,
     input2_peak: AtomicU32,
     peer_volumes: Mutex<HashMap<u64, u32>>,
+    peer_meters: Mutex<HashMap<u64, PeerMeter>>,
 }
 
 impl AudioMixer {
@@ -43,6 +58,7 @@ impl AudioMixer {
             input1_peak: AtomicU32::new(0),
             input2_peak: AtomicU32::new(0),
             peer_volumes: Mutex::new(HashMap::new()),
+            peer_meters: Mutex::new(HashMap::new()),
         }
     }
 
@@ -63,6 +79,7 @@ impl AudioMixer {
         // Порог лимитера: -1.0 dBFS = 0.891
         const THRESHOLD: f32 = 0.891;
 
+        let mut peak = 0.0f32;
         for sample in buffer.iter_mut() {
             let boosted = *sample * combined_gain;
             let abs_val = boosted.abs();
@@ -76,7 +93,34 @@ impl AudioMixer {
                 let compressed = THRESHOLD + (1.0 - THRESHOLD) * (excess / (1.0 + excess));
                 *sample = boosted.signum() * compressed.min(0.99);
             }
+            peak = peak.max(sample.abs());
         }
+
+        // Отмечаем, когда собеседник реально звучал: тишина в пакетах не считается речью
+        if let Ok(mut meters) = self.peer_meters.lock() {
+            let meter = meters.entry(peer_id).or_default();
+            if peak > 0.02 {
+                meter.last_audio_ms = now_ms();
+                meter.peak = peak.min(1.0);
+            } else {
+                meter.peak *= 0.35;
+            }
+        }
+    }
+
+    /// Пиковый уровень собеседника для мини-индикатора (0..=1)
+    pub fn peer_meter(&self, peer_id: u64) -> PeerMeter {
+        self.peer_meters
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&peer_id).copied())
+            .unwrap_or_default()
+    }
+
+    /// Говорит ли собеседник прямо сейчас (звук был меньше 400 мс назад)
+    pub fn is_peer_speaking(&self, peer_id: u64) -> bool {
+        let meter = self.peer_meter(peer_id);
+        meter.last_audio_ms > 0 && now_ms().saturating_sub(meter.last_audio_ms) < 400
     }
 
     /// Устанавливает громкость конкретного участника (0-300)

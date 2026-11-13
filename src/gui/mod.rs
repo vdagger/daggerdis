@@ -1,18 +1,23 @@
-//! Графический интерфейс в монолитном стиле Cyber Slate
+//! Графический интерфейс: тёмная тема с акцентом на эфир
+
+pub mod theme;
 
 mod stream_control;
 
 use eframe::egui;
+use egui::{FontFamily, FontId, Rounding, Stroke, TextStyle};
+use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex;
+
+use theme as t;
 
 pub struct RadioApp {
     mixer: Arc<crate::mixer::AudioMixer>,
     ptt_bind: Option<crate::keybind::PttBind>,
     ptt_flag: Arc<AtomicBool>,
     room: Arc<crate::room::RoomManager>,
-    room_id_input: String,
     connect_ip_input: String,
     connect_port_input: String,
     my_external_ip: String,
@@ -33,6 +38,8 @@ pub struct RadioApp {
     prev_output_index: std::sync::atomic::AtomicU32,
     continuous_mode: bool,
     theme_configured: bool,
+    settings_open: bool,
+    wave: VecDeque<f32>,
 }
 
 impl RadioApp {
@@ -60,7 +67,6 @@ impl RadioApp {
             ptt_bind,
             ptt_flag,
             room,
-            room_id_input: String::new(),
             connect_ip_input: String::new(),
             connect_port_input: "8080".to_string(),
             my_external_ip: String::new(),
@@ -81,6 +87,8 @@ impl RadioApp {
             prev_output_index: std::sync::atomic::AtomicU32::new(0),
             continuous_mode: false,
             theme_configured: false,
+            settings_open: false,
+            wave: VecDeque::new(),
         }
     }
 
@@ -90,34 +98,57 @@ impl RadioApp {
         }
 
         let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = t::BG;
+        visuals.window_fill = t::SURFACE;
+        visuals.extreme_bg_color = egui::Color32::from_rgb(12, 14, 18);
+        visuals.faint_bg_color = t::SURFACE_HI;
+        visuals.window_stroke = Stroke::new(1.0_f32, t::STROKE);
+        visuals.window_rounding = Rounding::same(14.0);
+        visuals.menu_rounding = Rounding::same(10.0);
+        visuals.window_shadow = egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 10.0),
+            blur: 28.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(140),
+        };
+        visuals.popup_shadow = visuals.window_shadow;
 
-        // Глубокий, контрастный темный фон
-        visuals.panel_fill = egui::Color32::from_rgb(26, 28, 32); // #1A1C20
-        visuals.window_fill = egui::Color32::from_rgb(38, 41, 47); // #26292F
-        visuals.extreme_bg_color = egui::Color32::from_rgb(18, 19, 22); // #121316
+        visuals.widgets.inactive.bg_fill = t::SURFACE_HI;
+        visuals.widgets.inactive.weak_bg_fill = t::SURFACE;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, t::STROKE);
+        visuals.widgets.inactive.rounding = Rounding::same(9.0);
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, t::TEXT_DIM);
 
-        // Кнопки и акценты: стильный Electric Cyan / Deep Sky Blue (в цвет NodeID)
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(50, 54, 62);
-        visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.inactive.fg_stroke.color = egui::Color32::WHITE;
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 40, 48);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, t::with_alpha(t::BRAND, 0.45));
+        visuals.widgets.hovered.rounding = Rounding::same(9.0);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, t::TEXT);
 
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(14, 165, 233); // #0EA5E9
-        visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+        visuals.widgets.active.bg_fill = t::with_alpha(t::BRAND, 0.22);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, t::BRAND);
+        visuals.widgets.active.rounding = Rounding::same(9.0);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, t::TEXT);
 
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(2, 132, 199); // #0284C7
-        visuals.widgets.active.rounding = egui::Rounding::same(6.0);
-        visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
-
-        // Полосы прогресса и выделение в цвет NodeID
-        visuals.selection.bg_fill = egui::Color32::from_rgb(14, 165, 233);
-        visuals.selection.stroke.color = egui::Color32::WHITE;
+        visuals.selection.bg_fill = t::with_alpha(t::BRAND, 0.35);
+        visuals.selection.stroke = Stroke::new(1.0_f32, t::TEXT);
+        visuals.override_text_color = Some(t::TEXT);
+        visuals.hyperlink_color = t::BRAND;
 
         ctx.set_visuals(visuals);
 
         let mut style = (*ctx.style()).clone();
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(18.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(12.5, FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(10.5, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(11.5, FontFamily::Monospace)),
+        ]
+        .into();
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.window_margin = egui::Margin::same(12.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.slider_width = 140.0;
+        style.spacing.window_margin = egui::Margin::same(14.0);
         ctx.set_style(style);
 
         self.theme_configured = true;
@@ -171,89 +202,179 @@ impl eframe::App for RadioApp {
                 .store(current_output_index, std::sync::atomic::Ordering::Relaxed);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    let full_width = ui.available_width();
-                    let card_stroke =
-                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 56, 64));
+        crate::keybind::check_ptt_status(
+            ctx,
+            &self.ptt_flag,
+            self.ptt_bind,
+            self.continuous_mode,
+        );
 
-                    // 1. Шапка
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(38, 41, 47))
-                        .stroke(card_stroke)
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            ui.set_width(full_width);
-                            crate::widgets::info_panel::draw_info_panel(
-                                ui,
-                                self.my_id,
-                                &self.my_external_ip,
-                            );
-                        });
+        let transmitting = self.ptt_flag.load(std::sync::atomic::Ordering::Relaxed);
+        let level = self
+            .mixer
+            .input1_peak()
+            .max(self.mixer.input2_peak())
+            .clamp(0.0, 1.0);
 
-                    ui.add_space(4.0);
+        self.wave.push_back(level);
+        while self.wave.len() > 56 {
+            self.wave.pop_front();
+        }
+        let wave: Vec<f32> = self.wave.iter().copied().collect();
 
-                    // 2. Настройки звука и PTT
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(38, 41, 47))
-                        .stroke(card_stroke)
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            ui.set_width(full_width);
-                            crate::widgets::audio_settings::draw_audio_settings(
-                                ui,
-                                &self.input_devices,
-                                &self.input_channel_counts,
-                                &self.output_devices,
-                                &self.selected_input,
-                                &self.selected_output,
-                                &self.mixer,
-                                &mut self.ptt_bind,
-                            );
+        egui::TopBottomPanel::top("top_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(t::BG)
+                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+            )
+            .show(ctx, |ui| {
+                crate::widgets::info_panel::draw_top_bar(
+                    ui,
+                    self.my_id,
+                    &mut self.settings_open,
+                );
+            });
 
-                            crate::keybind::check_ptt_status(
-                                ui,
-                                &self.ptt_flag,
-                                self.ptt_bind,
-                                self.continuous_mode,
-                            );
-                            crate::widgets::ptt_button::draw_ptt_button(
-                                ui,
-                                &self.ptt_flag,
-                                &mut self.continuous_mode,
-                            );
-                        });
-
-                    ui.add_space(4.0);
-
-                    // 3. Список участников и комната
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(38, 41, 47))
-                        .stroke(card_stroke)
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            ui.set_width(full_width);
-                            crate::widgets::room_panel::draw_room_panel(
-                                ui,
-                                &mut self.room_id_input,
-                                &mut self.connect_ip_input,
-                                &mut self.connect_port_input,
-                                self.network.clone(),
-                                self.my_id,
-                                self.is_host.clone(),
-                                self.room.clone(),
-                                &self.mixer,
-                                self.ptt_flag.load(std::sync::atomic::Ordering::Relaxed),
-                            );
-                        });
-                });
-        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(t::BG)
+                    .inner_margin(egui::Margin::symmetric(16.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                if self.settings_open {
+                    self.draw_settings(ui);
+                } else {
+                    self.draw_main(ui, level, transmitting, &wave);
+                }
+            });
 
         ctx.request_repaint();
     }
+}
+
+impl RadioApp {
+    fn draw_main(&mut self, ui: &mut egui::Ui, level: f32, transmitting: bool, wave: &[f32]) {
+        // Мягкий градиент и брендовое свечение вместо плоской заливки
+        let full = ui.max_rect();
+        let mut mesh = egui::Mesh::default();
+        let top = egui::Color32::from_rgb(17, 19, 25);
+        mesh.colored_vertex(full.left_top(), top);
+        mesh.colored_vertex(full.right_top(), top);
+        mesh.colored_vertex(full.right_bottom(), t::BG);
+        mesh.colored_vertex(full.left_bottom(), t::BG);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        ui.painter().add(egui::Shape::mesh(mesh));
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let peer_count = self.room.get_all_peers().len();
+                let is_host = self.is_host.load(std::sync::atomic::Ordering::Relaxed);
+
+                crate::widgets::hero::draw_hero(ui, level, transmitting, is_host, wave, peer_count);
+
+                ui.add_space(12.0);
+
+                crate::widgets::ptt_button::draw_ptt_button(
+                    ui,
+                    &self.ptt_flag,
+                    &mut self.continuous_mode,
+                    &self.mixer,
+                );
+
+                ui.add_space(16.0);
+
+                crate::widgets::room_panel::draw_participants(
+                    ui,
+                    self.room.clone(),
+                    &self.mixer,
+                    self.my_id,
+                    self.is_host.clone(),
+                    transmitting,
+                );
+
+                ui.add_space(10.0);
+
+                egui::Frame::none()
+                    .fill(t::SURFACE)
+                    .rounding(Rounding::same(12.0))
+                    .stroke(Stroke::new(1.0_f32, t::STROKE))
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        crate::widgets::room_panel::draw_room_panel(
+                            ui,
+                            &mut self.connect_ip_input,
+                            &mut self.connect_port_input,
+                            self.network.clone(),
+                            self.my_id,
+                            self.is_host.clone(),
+                            self.room.clone(),
+                            &self.my_external_ip,
+                        );
+                    });
+
+                ui.add_space(10.0);
+            });
+    }
+
+    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if back_button(ui).clicked() {
+                self.settings_open = false;
+            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Настройки")
+                    .size(15.0)
+                    .strong()
+                    .color(t::TEXT),
+            );
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                crate::widgets::audio_settings::draw_audio_settings(
+                    ui,
+                    &self.input_devices,
+                    &self.input_channel_counts,
+                    &self.output_devices,
+                    &self.selected_input,
+                    &self.selected_output,
+                    &self.mixer,
+                    &mut self.ptt_bind,
+                );
+            });
+    }
+}
+
+/// Стрелка «назад», нарисованная линиями (в шрифте нет надёжного глифа)
+fn back_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let painter = ui.painter_at(rect);
+    let color = if response.hovered() {
+        t::TEXT
+    } else {
+        t::TEXT_DIM
+    };
+    let center = rect.center();
+    let stroke = Stroke::new(1.6_f32, color);
+    painter.line_segment(
+        [egui::pos2(center.x + 3.0, center.y - 6.0), egui::pos2(center.x - 3.0, center.y)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(center.x - 3.0, center.y), egui::pos2(center.x + 3.0, center.y + 6.0)],
+        stroke,
+    );
+    response
 }
