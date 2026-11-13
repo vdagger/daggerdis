@@ -22,19 +22,6 @@ pub fn draw_audio_settings(
     mixer: &crate::mixer::AudioMixer,
     ptt_bind: &mut Option<crate::keybind::PttBind>,
 ) {
-    // 1. VU-Meter на всю ширину блока
-    ui.add(
-        egui::ProgressBar::new(mixer.get_input_peak())
-            .text(
-                egui::RichText::new("Микрофон (VU-Meter)")
-                    .size(11.0)
-                    .color(egui::Color32::WHITE),
-            )
-            .desired_width(ui.available_width()),
-    );
-
-    ui.add_space(8.0);
-
     const CONTROL_WIDTH: f32 = 210.0;
     let label_color = egui::Color32::from_rgb(205, 210, 220); // Четкий читаемый цвет подписей
 
@@ -42,6 +29,18 @@ pub fn draw_audio_settings(
         .num_columns(2)
         .spacing([14.0, 8.0])
         .show(ui, |ui| {
+            // Вход 1: VU-метр
+            ui.add_sized(
+                [CONTROL_WIDTH, 16.0],
+                egui::ProgressBar::new(mixer.input1_peak()).text(
+                    egui::RichText::new("Вход 1 (Микрофон)")
+                        .size(10.0)
+                        .color(egui::Color32::WHITE),
+                ),
+            );
+            ui.label(egui::RichText::new("Уровень").color(label_color));
+            ui.end_row();
+
             // Ряд 1: Микрофон (Канал 1)
             let mut ch1_vol = mixer.ch1_volume();
             if ui
@@ -54,6 +53,18 @@ pub fn draw_audio_settings(
                 mixer.set_ch1_volume(ch1_vol);
             }
             ui.label(egui::RichText::new("Громкость Входа 1 (Микрофон)").color(label_color));
+            ui.end_row();
+
+            // Вход 2: VU-метр
+            ui.add_sized(
+                [CONTROL_WIDTH, 16.0],
+                egui::ProgressBar::new(mixer.input2_peak()).text(
+                    egui::RichText::new("Вход 2 (Гитара)")
+                        .size(10.0)
+                        .color(egui::Color32::WHITE),
+                ),
+            );
+            ui.label(egui::RichText::new("Уровень").color(label_color));
             ui.end_row();
 
             // Ряд 2: Гитара (Канал 2)

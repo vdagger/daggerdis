@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
 use std::sync::Mutex;
 
 /// Преобразует значение ползунка 0..=300 в логарифмический коэффициент усиления
@@ -26,7 +25,8 @@ pub struct AudioMixer {
     input1_channel: AtomicU32,
     input2_channel: AtomicU32,
     output_volume: AtomicU32,
-    input_peak: Arc<std::sync::atomic::AtomicU32>,
+    input1_peak: AtomicU32,
+    input2_peak: AtomicU32,
     peer_volumes: Mutex<HashMap<u64, u32>>,
 }
 
@@ -40,22 +40,18 @@ impl AudioMixer {
             input1_channel: AtomicU32::new(0),
             input2_channel: AtomicU32::new(1),
             output_volume: AtomicU32::new(100),
-            input_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            input1_peak: AtomicU32::new(0),
+            input2_peak: AtomicU32::new(0),
             peer_volumes: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Применяет общий мьют и обновляет пиковую амплитуду для VU-метра
-    /// (поканальное усиление применяется в аудио-колбэке при сведении входов)
+    /// Применяет общий мьют к сведённому входному буферу
+    /// (поканальное усиление и VU-пики считаются в аудио-колбэке)
     pub fn process_input(&self, buffer: &mut [f32]) {
         if self.mic_muted.load(Ordering::Relaxed) {
             buffer.fill(0.0);
         }
-
-        // Обновляем пиковую амплитуду для VU-метра
-        let max_sample = buffer.iter().map(|&x| x.abs()).fold(0.0, f32::max);
-        let peak = (max_sample * 100.0) as u32;
-        self.input_peak.store(peak, Ordering::Relaxed);
     }
 
     /// Обрабатывает выходной аудио-буфер с логарифмическим бустом и студийным лимитером (-1 dBFS)
@@ -145,12 +141,22 @@ impl AudioMixer {
         self.output_volume.store(volume.min(300), Ordering::Relaxed);
     }
 
-    pub fn get_input_peak(&self) -> f32 {
-        self.input_peak.load(Ordering::Relaxed) as f32 / 100.0
+    /// Пиковый уровень Входа 1 (0..=1) для VU-метра
+    pub fn input1_peak(&self) -> f32 {
+        self.input1_peak.load(Ordering::Relaxed) as f32 / 100.0
     }
 
-    pub fn set_input_peak_raw(&self, peak: u32) {
-        self.input_peak.store(peak, Ordering::Relaxed);
+    pub fn set_input1_peak_raw(&self, peak: u32) {
+        self.input1_peak.store(peak, Ordering::Relaxed);
+    }
+
+    /// Пиковый уровень Входа 2 (0..=1) для VU-метра
+    pub fn input2_peak(&self) -> f32 {
+        self.input2_peak.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    pub fn set_input2_peak_raw(&self, peak: u32) {
+        self.input2_peak.store(peak, Ordering::Relaxed);
     }
 }
 

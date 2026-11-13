@@ -86,19 +86,29 @@ impl UniversalAudioCapture {
                 let gain1 = mixer.ch1_volume() as f32 / 100.0;
                 let gain2 = mixer.ch2_volume() as f32 / 100.0;
 
+                let mut peak1 = 0.0f32;
+                let mut peak2 = 0.0f32;
+
                 // Сводим выбранные входы в моно с независимым усилением
                 for chunk in data.chunks_exact(total_channels) {
                     let mut sample = 0.0f32;
                     if (ch1 as usize) < total_channels {
-                        sample += chunk[ch1 as usize] * gain1;
+                        let v1 = chunk[ch1 as usize];
+                        peak1 = peak1.max(v1.abs());
+                        sample += v1 * gain1;
                     }
                     if (ch2 as usize) < total_channels {
-                        sample += chunk[ch2 as usize] * gain2;
+                        let v2 = chunk[ch2 as usize];
+                        peak2 = peak2.max(v2.abs());
+                        sample += v2 * gain2;
                     }
                     mono_chunk.push(sample.clamp(-1.0, 1.0));
                 }
 
-                // Общий мьют + VU-метр
+                mixer.set_input1_peak_raw((peak1 * 100.0) as u32);
+                mixer.set_input2_peak_raw((peak2 * 100.0) as u32);
+
+                // Общий мьют
                 mixer.process_input(&mut mono_chunk);
 
                 // Если микрофон работает не на 48 кГц, ресэмплируем строго в 48 000 Гц
