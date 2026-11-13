@@ -147,6 +147,7 @@ fn main() {
 
     // 6. Настройка окна, размера и иконки приложения
     let input_devices = DeviceSelector::get_input_devices();
+    let input_channel_counts = DeviceSelector::get_input_channel_counts();
     let output_devices = DeviceSelector::get_output_devices();
 
     // Загрузка иконки из assets/icon.png для панели задач и заголовка окна
@@ -181,6 +182,7 @@ fn main() {
                 mic_stream,
                 packet_tx,
                 input_devices,
+                input_channel_counts,
                 output_devices,
                 is_host,
                 playback_stream,

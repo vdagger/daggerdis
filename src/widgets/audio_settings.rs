@@ -15,6 +15,7 @@ fn truncate_name(name: &str, max_chars: usize) -> String {
 pub fn draw_audio_settings(
     ui: &mut eframe::egui::Ui,
     input_devices: &[String],
+    input_channel_counts: &[u32],
     output_devices: &[String],
     selected_input: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     selected_output: &std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -111,6 +112,63 @@ pub fn draw_audio_settings(
                 });
             in_combo.response.on_hover_text(&full_in_name);
             ui.label(egui::RichText::new("Входное устройство").color(label_color));
+            ui.end_row();
+
+            // Канал Входа 1
+            let in_count = input_channel_counts.get(in_idx).copied().unwrap_or(0) as usize;
+            let ch1 = mixer.input1_channel();
+            let ch1_text = if (ch1 as usize) < in_count {
+                format!("Канал {}", ch1 + 1)
+            } else {
+                "Выключен".to_string()
+            };
+            egui::ComboBox::from_id_source("input1_channel_combo")
+                .width(CONTROL_WIDTH)
+                .selected_text(ch1_text)
+                .show_ui(ui, |ui| {
+                    for c in 0..in_count {
+                        let mut cur = mixer.input1_channel();
+                        if ui
+                            .selectable_value(&mut cur, c as u32, format!("Канал {}", c + 1))
+                            .changed()
+                        {
+                            mixer.set_input1_channel(cur);
+                        }
+                    }
+                    let mut off = mixer.input1_channel();
+                    if ui.selectable_value(&mut off, u32::MAX, "Выключен").changed() {
+                        mixer.set_input1_channel(off);
+                    }
+                });
+            ui.label(egui::RichText::new("Канал Входа 1 (Микрофон)").color(label_color));
+            ui.end_row();
+
+            // Канал Входа 2
+            let ch2 = mixer.input2_channel();
+            let ch2_text = if (ch2 as usize) < in_count {
+                format!("Канал {}", ch2 + 1)
+            } else {
+                "Выключен".to_string()
+            };
+            egui::ComboBox::from_id_source("input2_channel_combo")
+                .width(CONTROL_WIDTH)
+                .selected_text(ch2_text)
+                .show_ui(ui, |ui| {
+                    for c in 0..in_count {
+                        let mut cur = mixer.input2_channel();
+                        if ui
+                            .selectable_value(&mut cur, c as u32, format!("Канал {}", c + 1))
+                            .changed()
+                        {
+                            mixer.set_input2_channel(cur);
+                        }
+                    }
+                    let mut off = mixer.input2_channel();
+                    if ui.selectable_value(&mut off, u32::MAX, "Выключен").changed() {
+                        mixer.set_input2_channel(off);
+                    }
+                });
+            ui.label(egui::RichText::new("Канал Входа 2 (Гитара)").color(label_color));
             ui.end_row();
 
             // Ряд 5: Выходное устройство

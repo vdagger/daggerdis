@@ -81,17 +81,24 @@ impl UniversalAudioCapture {
             &best_config,
             move |data: &[f32], _| {
                 mono_chunk.clear();
-                // Усредняем входные каналы в чистый монопоток
+                let ch1 = mixer.input1_channel();
+                let ch2 = mixer.input2_channel();
+                let gain1 = mixer.ch1_volume() as f32 / 100.0;
+                let gain2 = mixer.ch2_volume() as f32 / 100.0;
+
+                // Сводим выбранные входы в моно с независимым усилением
                 for chunk in data.chunks_exact(total_channels) {
-                    let sample = if total_channels > 1 {
-                        (chunk[0] + chunk[1]) * 0.5
-                    } else {
-                        chunk[0]
-                    };
-                    mono_chunk.push(sample);
+                    let mut sample = 0.0f32;
+                    if (ch1 as usize) < total_channels {
+                        sample += chunk[ch1 as usize] * gain1;
+                    }
+                    if (ch2 as usize) < total_channels {
+                        sample += chunk[ch2 as usize] * gain2;
+                    }
+                    mono_chunk.push(sample.clamp(-1.0, 1.0));
                 }
 
-                // Обработка громкости микрофона
+                // Общий мьют + VU-метр
                 mixer.process_input(&mut mono_chunk);
 
                 // Если микрофон работает не на 48 кГц, ресэмплируем строго в 48 000 Гц

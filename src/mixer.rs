@@ -23,6 +23,8 @@ pub struct AudioMixer {
     mic_muted: AtomicBool,
     ch1_volume: AtomicU32, // Микрофон (Левый)
     ch2_volume: AtomicU32, // Гитара (Правый)
+    input1_channel: AtomicU32,
+    input2_channel: AtomicU32,
     output_volume: AtomicU32,
     input_peak: Arc<std::sync::atomic::AtomicU32>,
     peer_volumes: Mutex<HashMap<u64, u32>>,
@@ -35,27 +37,25 @@ impl AudioMixer {
             mic_muted: AtomicBool::new(false),
             ch1_volume: AtomicU32::new(100),
             ch2_volume: AtomicU32::new(100),
+            input1_channel: AtomicU32::new(0),
+            input2_channel: AtomicU32::new(1),
             output_volume: AtomicU32::new(100),
             input_peak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             peer_volumes: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Обрабатывает входной аудио-буфер (свой микрофон)
+    /// Применяет общий мьют и обновляет пиковую амплитуду для VU-метра
+    /// (поканальное усиление применяется в аудио-колбэке при сведении входов)
     pub fn process_input(&self, buffer: &mut [f32]) {
         if self.mic_muted.load(Ordering::Relaxed) {
             buffer.fill(0.0);
-        } else {
-            let volume = self.ch1_volume.load(Ordering::Relaxed) as f32 / 100.0;
-            for sample in buffer.iter_mut() {
-                *sample *= volume;
-            }
-
-            // Обновляем пиковую амплитуду для VU-метра
-            let max_sample = buffer.iter().map(|&x| x.abs()).fold(0.0, f32::max);
-            let peak = (max_sample * 100.0) as u32;
-            self.input_peak.store(peak, Ordering::Relaxed);
         }
+
+        // Обновляем пиковую амплитуду для VU-метра
+        let max_sample = buffer.iter().map(|&x| x.abs()).fold(0.0, f32::max);
+        let peak = (max_sample * 100.0) as u32;
+        self.input_peak.store(peak, Ordering::Relaxed);
     }
 
     /// Обрабатывает выходной аудио-буфер с логарифмическим бустом и студийным лимитером (-1 dBFS)
@@ -117,6 +117,24 @@ impl AudioMixer {
 
     pub fn set_ch2_volume(&self, volume: u32) {
         self.ch2_volume.store(volume.min(100), Ordering::Relaxed);
+    }
+
+    /// Канал устройства для Входа 1 (u32::MAX = выключен)
+    pub fn input1_channel(&self) -> u32 {
+        self.input1_channel.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input1_channel(&self, channel: u32) {
+        self.input1_channel.store(channel, Ordering::Relaxed);
+    }
+
+    /// Канал устройства для Входа 2 (u32::MAX = выключен)
+    pub fn input2_channel(&self) -> u32 {
+        self.input2_channel.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input2_channel(&self, channel: u32) {
+        self.input2_channel.store(channel, Ordering::Relaxed);
     }
 
     pub fn output_volume(&self) -> u32 {
