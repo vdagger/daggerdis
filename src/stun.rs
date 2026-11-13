@@ -46,34 +46,36 @@ fn parse_stun_response(data: &[u8]) -> Option<SocketAddr> {
             break;
         }
 
-        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS || attr_type == STUN_ATTR_MAPPED_ADDRESS {
-            if attr_length >= 8 {
-                let family = data[attr_data_start + 1]; // family is byte 1 (byte 0 is reserved)
-                if family == 0x01 { // IPv4
-                    let raw_port = u16::from_be_bytes([data[attr_data_start + 2], data[attr_data_start + 3]]);
-                    let raw_ip = [
-                        data[attr_data_start + 4],
-                        data[attr_data_start + 5],
-                        data[attr_data_start + 6],
-                        data[attr_data_start + 7],
+        if (attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS || attr_type == STUN_ATTR_MAPPED_ADDRESS)
+            && attr_length >= 8
+        {
+            let family = data[attr_data_start + 1]; // family is byte 1 (byte 0 is reserved)
+            if family == 0x01 {
+                // IPv4
+                let raw_port =
+                    u16::from_be_bytes([data[attr_data_start + 2], data[attr_data_start + 3]]);
+                let raw_ip = [
+                    data[attr_data_start + 4],
+                    data[attr_data_start + 5],
+                    data[attr_data_start + 6],
+                    data[attr_data_start + 7],
+                ];
+
+                let (port, ip) = if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
+                    let port = raw_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+                    let cookie_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
+                    let ip_bytes = [
+                        raw_ip[0] ^ cookie_bytes[0],
+                        raw_ip[1] ^ cookie_bytes[1],
+                        raw_ip[2] ^ cookie_bytes[2],
+                        raw_ip[3] ^ cookie_bytes[3],
                     ];
+                    (port, std::net::Ipv4Addr::from(ip_bytes))
+                } else {
+                    (raw_port, std::net::Ipv4Addr::from(raw_ip))
+                };
 
-                    let (port, ip) = if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS {
-                        let port = raw_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-                        let cookie_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
-                        let ip_bytes = [
-                            raw_ip[0] ^ cookie_bytes[0],
-                            raw_ip[1] ^ cookie_bytes[1],
-                            raw_ip[2] ^ cookie_bytes[2],
-                            raw_ip[3] ^ cookie_bytes[3],
-                        ];
-                        (port, std::net::Ipv4Addr::from(ip_bytes))
-                    } else {
-                        (raw_port, std::net::Ipv4Addr::from(raw_ip))
-                    };
-
-                    return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
-                }
+                return Some(SocketAddr::new(std::net::IpAddr::V4(ip), port));
             }
         }
 
@@ -126,7 +128,10 @@ pub fn get_external_addr(socket: &UdpSocket) -> Option<SocketAddr> {
         let (srv1, addr1) = resolved_addrs[0];
         let (srv2, addr2) = resolved_addrs[1];
         if addr1.port() == addr2.port() {
-            println!("[STUN] ✅ Тип NAT: Cone NAT (порты совпадают: {}). Прямой P2P возможен!", addr1.port());
+            println!(
+                "[STUN] ✅ Тип NAT: Cone NAT (порты совпадают: {}). Прямой P2P возможен!",
+                addr1.port()
+            );
         } else {
             println!("[STUN] ⚠️ Тип NAT: Symmetric NAT! (Сервер {} дал порт {}, а {} дал порт {}). Роутер меняет порты для разных адресатов!", 
                 srv1, addr1.port(), srv2, addr2.port());

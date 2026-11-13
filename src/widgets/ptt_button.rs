@@ -8,7 +8,7 @@ pub fn draw_ptt_button(ui: &mut egui::Ui, ptt_flag: &Arc<AtomicBool>, continuous
         // Чекбокс постоянной передачи (чистый белый читаемый текст без битых эмодзи)
         let cb_text = egui::RichText::new("Постоянная передача (Hands-Free)")
             .color(egui::Color32::from_rgb(230, 235, 245));
-            
+
         if ui.checkbox(continuous_mode, cb_text).changed() {
             ptt_flag.store(*continuous_mode, Ordering::Relaxed);
         }
@@ -19,7 +19,7 @@ pub fn draw_ptt_button(ui: &mut egui::Ui, ptt_flag: &Arc<AtomicBool>, continuous
                 .strong()
                 .color(egui::Color32::WHITE);
             let hold_btn = ui.add(egui::Button::new(btn_text));
-            
+
             if hold_btn.is_pointer_button_down_on() {
                 ptt_flag.store(true, Ordering::Relaxed);
             } else if hold_btn.hovered() && !ui.ctx().input(|i| i.pointer.any_down()) {

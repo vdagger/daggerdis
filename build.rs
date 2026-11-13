@@ -1,7 +1,8 @@
 #[cfg(windows)]
 fn main() {
     let mut res = winres::WindowsResource::new();
-    res.set_manifest(r#"
+    res.set_manifest(
+        r#"
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
@@ -11,7 +12,8 @@ fn main() {
     </security>
   </trustInfo>
 </assembly>
-"#);
+"#,
+    );
     if let Err(e) = res.compile() {
         eprintln!("Не удалось скомпилировать манифест Windows: {}", e);
     }

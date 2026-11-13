@@ -24,8 +24,12 @@ pub fn draw_audio_settings(
     // 1. VU-Meter на всю ширину блока
     ui.add(
         egui::ProgressBar::new(mixer.get_input_peak())
-            .text(egui::RichText::new("Микрофон (VU-Meter)").size(11.0).color(egui::Color32::WHITE))
-            .desired_width(ui.available_width())
+            .text(
+                egui::RichText::new("Микрофон (VU-Meter)")
+                    .size(11.0)
+                    .color(egui::Color32::WHITE),
+            )
+            .desired_width(ui.available_width()),
     );
 
     ui.add_space(8.0);
@@ -39,10 +43,13 @@ pub fn draw_audio_settings(
         .show(ui, |ui| {
             // Ряд 1: Микрофон (Канал 1)
             let mut ch1_vol = mixer.ch1_volume();
-            if ui.add_sized(
-                [CONTROL_WIDTH, 20.0],
-                egui::Slider::new(&mut ch1_vol, 0..=100).show_value(true)
-            ).changed() {
+            if ui
+                .add_sized(
+                    [CONTROL_WIDTH, 20.0],
+                    egui::Slider::new(&mut ch1_vol, 0..=100).show_value(true),
+                )
+                .changed()
+            {
                 mixer.set_ch1_volume(ch1_vol);
             }
             ui.label(egui::RichText::new("Громкость Входа 1 (Микрофон)").color(label_color));
@@ -50,10 +57,13 @@ pub fn draw_audio_settings(
 
             // Ряд 2: Гитара (Канал 2)
             let mut ch2_vol = mixer.ch2_volume();
-            if ui.add_sized(
-                [CONTROL_WIDTH, 20.0],
-                egui::Slider::new(&mut ch2_vol, 0..=100).show_value(true)
-            ).changed() {
+            if ui
+                .add_sized(
+                    [CONTROL_WIDTH, 20.0],
+                    egui::Slider::new(&mut ch2_vol, 0..=100).show_value(true),
+                )
+                .changed()
+            {
                 mixer.set_ch2_volume(ch2_vol);
             }
             ui.label(egui::RichText::new("Громкость Входа 2 (Гитара)").color(label_color));
@@ -61,10 +71,15 @@ pub fn draw_audio_settings(
 
             // Ряд 3: Громкость собеседников (Выход до 300%)
             let mut out_vol = mixer.output_volume();
-            if ui.add_sized(
-                [CONTROL_WIDTH, 20.0],
-                egui::Slider::new(&mut out_vol, 0..=300).suffix("%").show_value(true)
-            ).changed() {
+            if ui
+                .add_sized(
+                    [CONTROL_WIDTH, 20.0],
+                    egui::Slider::new(&mut out_vol, 0..=300)
+                        .suffix("%")
+                        .show_value(true),
+                )
+                .changed()
+            {
                 mixer.set_output_volume(out_vol);
             }
             ui.label(egui::RichText::new("🔊 Громкость собеседников (Выход)").color(label_color));
@@ -72,7 +87,10 @@ pub fn draw_audio_settings(
 
             // Ряд 4: Входное устройство
             let in_idx = selected_input.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            let full_in_name = input_devices.get(in_idx).cloned().unwrap_or_else(|| "Не выбрано".to_string());
+            let full_in_name = input_devices
+                .get(in_idx)
+                .cloned()
+                .unwrap_or_else(|| "Не выбрано".to_string());
             let short_in_name = truncate_name(&full_in_name, 22);
 
             let in_combo = egui::ComboBox::from_id_source("input_device_combo")
@@ -80,8 +98,12 @@ pub fn draw_audio_settings(
                 .selected_text(short_in_name)
                 .show_ui(ui, |ui| {
                     for (i, device) in input_devices.iter().enumerate() {
-                        let mut current_idx = selected_input.load(std::sync::atomic::Ordering::Relaxed);
-                        if ui.selectable_value(&mut current_idx, i as u32, device).changed() {
+                        let mut current_idx =
+                            selected_input.load(std::sync::atomic::Ordering::Relaxed);
+                        if ui
+                            .selectable_value(&mut current_idx, i as u32, device)
+                            .changed()
+                        {
                             selected_input.store(current_idx, std::sync::atomic::Ordering::Relaxed);
                             println!("[АУДИО] Выбран микрофон: {}", device);
                         }
@@ -93,7 +115,10 @@ pub fn draw_audio_settings(
 
             // Ряд 5: Выходное устройство
             let out_idx = selected_output.load(std::sync::atomic::Ordering::Relaxed) as usize;
-            let full_out_name = output_devices.get(out_idx).cloned().unwrap_or_else(|| "Не выбрано".to_string());
+            let full_out_name = output_devices
+                .get(out_idx)
+                .cloned()
+                .unwrap_or_else(|| "Не выбрано".to_string());
             let short_out_name = truncate_name(&full_out_name, 22);
 
             let out_combo = egui::ComboBox::from_id_source("output_device_combo")
@@ -101,9 +126,14 @@ pub fn draw_audio_settings(
                 .selected_text(short_out_name)
                 .show_ui(ui, |ui| {
                     for (i, device) in output_devices.iter().enumerate() {
-                        let mut current_idx = selected_output.load(std::sync::atomic::Ordering::Relaxed);
-                        if ui.selectable_value(&mut current_idx, i as u32, device).changed() {
-                            selected_output.store(current_idx, std::sync::atomic::Ordering::Relaxed);
+                        let mut current_idx =
+                            selected_output.load(std::sync::atomic::Ordering::Relaxed);
+                        if ui
+                            .selectable_value(&mut current_idx, i as u32, device)
+                            .changed()
+                        {
+                            selected_output
+                                .store(current_idx, std::sync::atomic::Ordering::Relaxed);
                             println!("[АУДИО] Выбраны динамики: {}", device);
                         }
                     }

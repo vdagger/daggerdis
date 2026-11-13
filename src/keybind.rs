@@ -14,14 +14,17 @@ extern "system" {
 pub type PttBind = i32;
 
 // По умолчанию Mouse 4 (боковая кнопка мыши 0x05)
-pub static CURRENT_VK: AtomicI32 = AtomicI32::new(0x05); 
+pub static CURRENT_VK: AtomicI32 = AtomicI32::new(0x05);
 static LISTENER_SPAWNED: AtomicBool = AtomicBool::new(false);
 static IS_LISTENING: AtomicBool = AtomicBool::new(false);
 static CONTINUOUS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Запускает независимый фоновый системный поток перехвата PTT в Windows
 fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
-    if LISTENER_SPAWNED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    if LISTENER_SPAWNED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
         std::thread::spawn(move || {
             println!("[ХОТКЕЙ] 🚀 Фоновый системный перехватчик PTT в играх запущен!");
             let mut last_state = false;
@@ -47,7 +50,10 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
                         last_state = should_transmit;
                         ptt_flag.store(should_transmit, Ordering::Relaxed);
                         if should_transmit {
-                            println!("[ХОТКЕЙ] 🎙️ ЭФИР ВКЛЮЧЕН (VK: {:#X}, Hands-Free: {})", vk, is_active);
+                            println!(
+                                "[ХОТКЕЙ] 🎙️ ЭФИР ВКЛЮЧЕН (VK: {:#X}, Hands-Free: {})",
+                                vk, is_active
+                            );
                         } else {
                             println!("[ХОТКЕЙ] 🔇 ЭФИР ВЫКЛЮЧЕН");
                         }
@@ -93,7 +99,7 @@ pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>, 
 
     let btn = ui.add_sized(
         [width, 22.0],
-        egui::Button::new(egui::RichText::new(text).size(12.0))
+        egui::Button::new(egui::RichText::new(text).size(12.0)),
     );
 
     if btn.clicked() {
@@ -113,7 +119,11 @@ pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>, 
                         *current_bind = Some(code);
                         CURRENT_VK.store(code, Ordering::Relaxed);
                         IS_LISTENING.store(false, Ordering::Relaxed);
-                        println!("[ХОТКЕЙ] Назначена новая кнопка PTT: {} (код {:#X})", vk_to_name(code), code);
+                        println!(
+                            "[ХОТКЕЙ] Назначена новая кнопка PTT: {} (код {:#X})",
+                            vk_to_name(code),
+                            code
+                        );
                         break;
                     }
                 }
@@ -123,7 +133,12 @@ pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>, 
 }
 
 /// Поддерживает работу слушателя и синхронизирует флаги
-pub fn check_ptt_status(_ui: &egui::Ui, ptt_flag: &Arc<AtomicBool>, bind: Option<PttBind>, continuous_mode: bool) {
+pub fn check_ptt_status(
+    _ui: &egui::Ui,
+    ptt_flag: &Arc<AtomicBool>,
+    bind: Option<PttBind>,
+    continuous_mode: bool,
+) {
     ensure_global_listener_spawned(ptt_flag.clone());
     CONTINUOUS_ACTIVE.store(continuous_mode, Ordering::Relaxed);
 

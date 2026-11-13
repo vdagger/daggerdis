@@ -13,10 +13,12 @@ impl DeviceSelector {
             Ok(devices) => devices,
             Err(_) => return Vec::new(),
         };
-        
+
         devices
             .map(|device| {
-                device.name().unwrap_or_else(|_| "Unknown Input".to_string())
+                device
+                    .name()
+                    .unwrap_or_else(|_| "Unknown Input".to_string())
             })
             .collect()
     }
@@ -28,10 +30,12 @@ impl DeviceSelector {
             Ok(devices) => devices,
             Err(_) => return Vec::new(),
         };
-        
+
         devices
             .map(|device| {
-                device.name().unwrap_or_else(|_| "Unknown Output".to_string())
+                device
+                    .name()
+                    .unwrap_or_else(|_| "Unknown Output".to_string())
             })
             .collect()
     }
@@ -43,7 +47,7 @@ impl DeviceSelector {
             Ok(devices) => devices,
             Err(_) => return None,
         };
-        
+
         // Преобразуем в вектор, чтобы можно было использовать nth()
         let device_vec: Vec<_> = devices.collect();
         device_vec.get(index).cloned()
@@ -56,7 +60,7 @@ impl DeviceSelector {
             Ok(devices) => devices,
             Err(_) => return None,
         };
-        
+
         // Преобразуем в вектор, чтобы можно было использовать nth()
         let device_vec: Vec<_> = devices.collect();
         device_vec.get(index).cloned()

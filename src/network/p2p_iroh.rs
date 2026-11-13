@@ -1,10 +1,10 @@
 //! Модуль P2P-транспорта на базе Iroh (QUIC Datagrams + NAT Traversal + Relay)
 
+use bytes::Bytes;
+use iroh::{endpoint::presets, endpoint::Connection, Endpoint, EndpointId};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use iroh::{Endpoint, EndpointId, endpoint::presets, endpoint::Connection};
-use bytes::Bytes;
+use tokio::sync::{mpsc, Mutex};
 
 pub const IROH_ALPN: &[u8] = b"discordrf/1";
 
@@ -49,9 +49,15 @@ impl IrohP2pManager {
                 match incoming.await {
                     Ok(conn) => {
                         let remote_id = conn.remote_id().to_string();
-                        println!("[IROH] Принято входящее P2P-подключение от NodeID: {}", remote_id);
-                        
-                        conns_accept.lock().await.insert(remote_id.clone(), conn.clone());
+                        println!(
+                            "[IROH] Принято входящее P2P-подключение от NodeID: {}",
+                            remote_id
+                        );
+
+                        conns_accept
+                            .lock()
+                            .await
+                            .insert(remote_id.clone(), conn.clone());
                         Self::spawn_datagram_receiver(conn, remote_id, tx_accept.clone());
                     }
                     Err(e) => {
@@ -71,7 +77,10 @@ impl IrohP2pManager {
     }
 
     /// Подключается к другому узлу по его строковому NodeID
-    pub async fn connect_to_peer(&self, target_id_str: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn connect_to_peer(
+        &self,
+        target_id_str: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let trimmed = target_id_str.trim();
         let target_id: EndpointId = trimmed.parse()?;
 
@@ -79,13 +88,20 @@ impl IrohP2pManager {
         let conn = self.endpoint.connect(target_id, IROH_ALPN).await?;
         println!("[IROH] ✅ P2P-соединение установлено с: {}", trimmed);
 
-        self.connections.lock().await.insert(trimmed.to_string(), conn.clone());
+        self.connections
+            .lock()
+            .await
+            .insert(trimmed.to_string(), conn.clone());
         Self::spawn_datagram_receiver(conn, trimmed.to_string(), self.incoming_tx.clone());
         Ok(())
     }
 
     /// Запускает фоновое чтение датаграмм (голосовых пакетов) из QUIC-соединения
-    fn spawn_datagram_receiver(conn: Connection, remote_id: String, tx: mpsc::Sender<IncomingPacket>) {
+    fn spawn_datagram_receiver(
+        conn: Connection,
+        remote_id: String,
+        tx: mpsc::Sender<IncomingPacket>,
+    ) {
         tokio::spawn(async move {
             loop {
                 match conn.read_datagram().await {
@@ -133,7 +149,11 @@ impl IrohP2pManager {
     }
 
     /// Отправляет сырые байты (Opus / NetworkMessage) указанному NodeID
-    pub async fn send_bytes(&self, target_id_str: &str, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn send_bytes(
+        &self,
+        target_id_str: &str,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conns = self.connections.lock().await;
         if let Some(conn) = conns.get(target_id_str) {
             let bytes = Bytes::copy_from_slice(data);

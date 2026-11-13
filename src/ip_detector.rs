@@ -9,34 +9,31 @@ pub fn get_external_ip() -> String {
     let response = ureq::get("http://api.ipify.org")
         .timeout(Duration::from_secs(5))
         .call();
-    
+
     match response {
-        Ok(response) => {
-            let ip = response.into_string().unwrap_or_else(|_| String::from("Не удалось определить IP"));
-            ip
-        }
+        Ok(response) => response
+            .into_string()
+            .unwrap_or_else(|_| String::from("Не удалось определить IP")),
         Err(_) => {
             // Пытаемся использовать резервный URL, если первый не работает
             let response = ureq::get("http://icanhazip.com")
                 .timeout(Duration::from_secs(5))
                 .call();
-            
+
             match response {
-                Ok(response) => {
-                    let ip = response.into_string().unwrap_or_else(|_| String::from("Не удалось определить IP"));
-                    ip
-                }
+                Ok(response) => response
+                    .into_string()
+                    .unwrap_or_else(|_| String::from("Не удалось определить IP")),
                 Err(_) => {
                     // Пытаемся использовать третий резервный URL
                     let response = ureq::get("http://ident.me")
                         .timeout(Duration::from_secs(5))
                         .call();
-                    
+
                     match response {
-                        Ok(response) => {
-                            let ip = response.into_string().unwrap_or_else(|_| String::from("Не удалось определить IP"));
-                            ip
-                        }
+                        Ok(response) => response
+                            .into_string()
+                            .unwrap_or_else(|_| String::from("Не удалось определить IP")),
                         Err(_) => String::from("Не удалось определить IP"),
                     }
                 }
@@ -53,6 +50,6 @@ mod tests {
     fn test_get_external_ip_returns_string() {
         // Тест на возврат строки (даже если не удастся получить IP)
         let result = get_external_ip();
-        assert!(result.len() > 0);
+        assert!(!result.is_empty());
     }
 }

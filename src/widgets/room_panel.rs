@@ -14,8 +14,12 @@ pub fn draw_room_panel(
     mixer: &crate::mixer::AudioMixer,
     is_transmitting: bool,
 ) {
-    ui.label(egui::RichText::new("ПОДКЛЮЧЕНИЕ К КОМНАТЕ").strong().color(egui::Color32::from_rgb(180, 185, 195)));
-    
+    ui.label(
+        egui::RichText::new("ПОДКЛЮЧЕНИЕ К КОМНАТЕ")
+            .strong()
+            .color(egui::Color32::from_rgb(180, 185, 195)),
+    );
+
     // Адаптивная строка подключения во всю ширину
     ui.horizontal(|ui| {
         let btn_width = 84.0;
@@ -26,26 +30,36 @@ pub fn draw_room_panel(
         ui.add(
             egui::TextEdit::singleline(connect_ip)
                 .hint_text("Вставьте NodeID...")
-                .desired_width(input_width)
+                .desired_width(input_width),
         );
         ui.add_space(4.0);
 
-        let btn = egui::Button::new(egui::RichText::new("🔗 Войти").strong().color(egui::Color32::WHITE))
-            .fill(egui::Color32::from_rgb(14, 165, 233)); // Стильный Electric Sky Blue
+        let btn = egui::Button::new(
+            egui::RichText::new("🔗 Войти")
+                .strong()
+                .color(egui::Color32::WHITE),
+        )
+        .fill(egui::Color32::from_rgb(14, 165, 233)); // Стильный Electric Sky Blue
         if ui.add_sized([btn_width, 24.0], btn).clicked() {
             let raw_addr = connect_ip.trim();
-            
+
             if raw_addr.len() == 64 && raw_addr.chars().all(|c| c.is_ascii_hexdigit()) {
                 if let Some(ref p2p) = network.iroh {
                     let p2p_clone = p2p.clone();
                     let target_node_id = raw_addr.to_string();
                     let my_peer_id = my_id;
-                    
+
                     is_host.store(false, std::sync::atomic::Ordering::SeqCst);
-                    println!("[СЕТЬ] Переключился в режим КЛИЕНТА (Iroh P2P). Цель: {}", target_node_id);
+                    println!(
+                        "[СЕТЬ] Переключился в режим КЛИЕНТА (Iroh P2P). Цель: {}",
+                        target_node_id
+                    );
 
                     tokio::task::spawn(async move {
-                        println!("[IROH] Попытка P2P-подключения к NodeID: {}", target_node_id);
+                        println!(
+                            "[IROH] Попытка P2P-подключения к NodeID: {}",
+                            target_node_id
+                        );
                         match p2p_clone.connect_to_peer(&target_node_id).await {
                             Ok(()) => {
                                 println!("[IROH] 🚀 Успешное прямое P2P-подключение к комнате!");
@@ -74,7 +88,9 @@ pub fn draw_room_panel(
                         let my_peer_id = my_id;
                         tokio::task::spawn(async move {
                             for _ in 1..=6 {
-                                let msg = crate::network::NetworkMessage::JoinRequest { sender_id: my_peer_id };
+                                let msg = crate::network::NetworkMessage::JoinRequest {
+                                    sender_id: my_peer_id,
+                                };
                                 let _ = net.send_packet(addr, &msg).await;
                                 tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
                                 if !room_clone.get_all_peers().is_empty() {
@@ -104,8 +120,11 @@ pub fn draw_room_panel(
             let host_addr_str = host_peer_opt
                 .map(|p| p.address.clone())
                 .unwrap_or_else(|| "Ожидание хоста...".to_string());
-            
-            ui.label(egui::RichText::new(format!("👑 Хост: {}", host_addr_str)).color(egui::Color32::from_rgb(200, 205, 215)));
+
+            ui.label(
+                egui::RichText::new(format!("👑 Хост: {}", host_addr_str))
+                    .color(egui::Color32::from_rgb(200, 205, 215)),
+            );
             if ui.button("📋 Скопировать").clicked() {
                 ui.output_mut(|o| o.copied_text = host_addr_str);
             }
@@ -113,19 +132,32 @@ pub fn draw_room_panel(
     }
 
     ui.add_space(6.0);
-    
+
     // Статус пользователя
     let my_is_host = is_host.load(std::sync::atomic::Ordering::Relaxed);
     if my_is_host {
-        ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "👑 Ваш статус: ХОСТ КОМНАТЫ");
+        ui.colored_label(
+            egui::Color32::from_rgb(255, 215, 0),
+            "👑 Ваш статус: ХОСТ КОМНАТЫ",
+        );
     } else if peers.is_empty() {
-        ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "⏳ Подключение к комнате...");
+        ui.colored_label(
+            egui::Color32::from_rgb(255, 165, 0),
+            "⏳ Подключение к комнате...",
+        );
     } else {
-        ui.colored_label(egui::Color32::from_rgb(34, 197, 94), "🎧 Ваш статус: В ГОЛОСОВОМ КАНАЛЕ");
+        ui.colored_label(
+            egui::Color32::from_rgb(34, 197, 94),
+            "🎧 Ваш статус: В ГОЛОСОВОМ КАНАЛЕ",
+        );
     }
 
     ui.add_space(8.0);
-    ui.label(egui::RichText::new(format!("УЧАСТНИКИ В ЭФИРЕ ({})", peers.len() + 1)).strong().color(egui::Color32::from_rgb(180, 185, 195)));
+    ui.label(
+        egui::RichText::new(format!("УЧАСТНИКИ В ЭФИРЕ ({})", peers.len() + 1))
+            .strong()
+            .color(egui::Color32::from_rgb(180, 185, 195)),
+    );
 
     let card_width = ui.available_width();
 
@@ -139,7 +171,10 @@ pub fn draw_room_panel(
     egui::Frame::none()
         .fill(egui::Color32::from_rgb(32, 34, 39))
         .rounding(egui::Rounding::same(8.0))
-        .stroke(egui::Stroke::new(if is_transmitting { 2.0 } else { 1.0 }, self_border_color))
+        .stroke(egui::Stroke::new(
+            if is_transmitting { 2.0 } else { 1.0_f32 },
+            self_border_color,
+        ))
         .inner_margin(egui::Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             ui.set_width(card_width);
@@ -147,13 +182,20 @@ pub fn draw_room_panel(
                 ui.label(egui::RichText::new("👤").size(22.0));
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("Вы (ID: {})", my_id)).strong().color(egui::Color32::WHITE));
+                        ui.label(
+                            egui::RichText::new(format!("Вы (ID: {})", my_id))
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
                         if my_is_host {
                             ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "👑 [ХОСТ]");
                         }
                     });
                     if is_transmitting {
-                        ui.colored_label(egui::Color32::from_rgb(34, 197, 94), "● МИКРОФОН В ЭФИРЕ");
+                        ui.colored_label(
+                            egui::Color32::from_rgb(34, 197, 94),
+                            "● МИКРОФОН В ЭФИРЕ",
+                        );
                     } else {
                         ui.colored_label(egui::Color32::from_rgb(160, 166, 178), "○ Ожидание...");
                     }
@@ -180,13 +222,13 @@ pub fn draw_room_panel(
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(32, 34, 39))
             .rounding(egui::Rounding::same(8.0))
-            .stroke(egui::Stroke::new(1.0, card_border))
+            .stroke(egui::Stroke::new(1.0_f32, card_border))
             .inner_margin(egui::Margin::symmetric(12.0, 10.0))
             .show(ui, |ui| {
                 ui.set_width(card_width);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("👤").size(22.0));
-                    
+
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
                             let (dot_color, dot_text) = if is_alive {
@@ -195,23 +237,39 @@ pub fn draw_room_panel(
                                 (egui::Color32::from_rgb(180, 185, 195), "○")
                             };
                             ui.colored_label(dot_color, dot_text);
-                            
-                            let display_addr = if peer.address.starts_with("Iroh:") && peer.address.len() > 18 {
-                                format!("{}..", &peer.address[..16])
-                            } else {
-                                peer.address.clone()
-                            };
 
-                            ui.label(egui::RichText::new(format!("ID: {} ({})", peer.id, display_addr)).strong().color(egui::Color32::WHITE));
+                            let display_addr =
+                                if peer.address.starts_with("Iroh:") && peer.address.len() > 18 {
+                                    format!("{}..", &peer.address[..16])
+                                } else {
+                                    peer.address.clone()
+                                };
+
+                            ui.label(
+                                egui::RichText::new(format!("ID: {} ({})", peer.id, display_addr))
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
                             if peer.is_host {
                                 ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "👑 [ХОСТ]");
                             }
                         });
 
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Громкость:").size(12.0).color(egui::Color32::from_rgb(180, 185, 195)));
+                            ui.label(
+                                egui::RichText::new("Громкость:")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(180, 185, 195)),
+                            );
                             let mut p_vol = mixer.get_peer_volume(peer.id);
-                            if ui.add(egui::Slider::new(&mut p_vol, 0..=300).suffix("%").show_value(true)).changed() {
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut p_vol, 0..=300)
+                                        .suffix("%")
+                                        .show_value(true),
+                                )
+                                .changed()
+                            {
                                 mixer.set_peer_volume(peer.id, p_vol);
                             }
                         });

@@ -1,29 +1,28 @@
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::net::SocketAddr;
 use albus::{
-    room::RoomManager, mixer::AudioMixer, audio::UniversalAudioCapture, 
-    network::NetworkManager, migration::MigrationManager, gui::RadioApp, 
-    devices::DeviceSelector
+    audio::UniversalAudioCapture, devices::DeviceSelector, gui::RadioApp,
+    migration::MigrationManager, mixer::AudioMixer, network::NetworkManager, room::RoomManager,
 };
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::{Arc, Mutex};
 
 fn main() {
     // 1. Автоматическая настройка правил фаервола Windows
     albus::firewall::setup_firewall_rules();
-    
+
     let args: Vec<String> = std::env::args().collect();
-    let local_addr = if args.len() >= 2 { 
-        format!("0.0.0.0:{}", args[1]) 
-    } else { 
-        "0.0.0.0:0".to_string() 
+    let local_addr = if args.len() >= 2 {
+        format!("0.0.0.0:{}", args[1])
+    } else {
+        "0.0.0.0:0".to_string()
     };
-    
+
     let socket_addr: SocketAddr = local_addr.parse().unwrap();
     let my_id: u64 = rand::random();
     let ptt_flag = Arc::new(AtomicBool::new(false));
     let is_host = Arc::new(AtomicBool::new(true));
     let rt = tokio::runtime::Runtime::new().unwrap();
-    
+
     let selected_input = Arc::new(AtomicU32::new(0));
     let selected_output = Arc::new(AtomicU32::new(0));
     let ext_ip = Arc::new(Mutex::new("Определение...".to_string()));
@@ -48,16 +47,16 @@ fn main() {
             *lock = p2p.my_node_id.clone();
         }
     }
-    
+
     // 3. Сетевой сокет UDP + UPnP + STUN
     let std_socket = std::net::UdpSocket::bind(socket_addr).unwrap_or_else(|e| {
         panic!("Не удалось привязать сокет к {}: {}", socket_addr, e);
     });
-    
+
     if let Ok(local_addr) = std_socket.local_addr() {
         albus::upnp::auto_forward_port(local_addr.port());
     }
-    
+
     println!("[STUN] Определение внешнего UDP адреса для P2P...");
     let stun_addr = albus::stun::get_external_addr(&std_socket);
     let stun_resolved = stun_addr.is_some();
@@ -75,10 +74,10 @@ fn main() {
     let network = rt.block_on(async {
         Arc::new(
             NetworkManager::from_std(std_socket, iroh_p2p.clone())
-                .expect("Не удалось инициализировать NetworkManager из сокета")
+                .expect("Не удалось инициализировать NetworkManager из сокета"),
         )
     });
-    
+
     if !stun_resolved && iroh_p2p.is_none() {
         let ext_ip_clone = ext_ip.clone();
         rt.spawn(async move {
@@ -88,7 +87,7 @@ fn main() {
             }
         });
     }
-    
+
     let room = Arc::new(RoomManager::new(my_id));
     let mixer = Arc::new(AudioMixer::new());
     let mut audio = UniversalAudioCapture::new().unwrap();
@@ -99,26 +98,51 @@ fn main() {
     let (playback_tx, playback_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(100);
     let playback_rx = Arc::new(std::sync::Mutex::new(playback_rx));
     let playback_stream = Arc::new(Mutex::new(None));
-    
-    if let Ok(stream) = albus::audio::UniversalAudioCapture::create_playback_stream(None, playback_rx.clone(), mixer.clone()) {
+
+    if let Ok(stream) = albus::audio::UniversalAudioCapture::create_playback_stream(
+        None,
+        playback_rx.clone(),
+        mixer.clone(),
+    ) {
         *playback_stream.lock().unwrap() = Some(stream);
     }
-    
-    if let Ok(stream) = audio.create_input_stream(None, ptt_flag.clone(), packet_tx.clone(), mixer.clone()) {
+
+    if let Ok(stream) =
+        audio.create_input_stream(None, ptt_flag.clone(), packet_tx.clone(), mixer.clone())
+    {
         *mic_stream.lock().unwrap() = Some(stream);
     }
 
     // 5. Запуск фоновых сервисов (декомпозированные модули)
-    albus::network::receiver::spawn_network_receiver(&rt, network.clone(), room.clone(), playback_tx.clone());
-    albus::network::iroh_service::spawn_iroh_receiver(&rt, iroh_p2p.clone(), room.clone(), playback_tx.clone(), is_host.clone());
-    albus::network::broadcast::spawn_audio_broadcast(&rt, packet_rx, room.clone(), network.clone(), my_id);
-    
+    albus::network::receiver::spawn_network_receiver(
+        &rt,
+        network.clone(),
+        room.clone(),
+        playback_tx.clone(),
+    );
+    albus::network::iroh_service::spawn_iroh_receiver(
+        &rt,
+        iroh_p2p.clone(),
+        room.clone(),
+        playback_tx.clone(),
+        is_host.clone(),
+    );
+    albus::network::broadcast::spawn_audio_broadcast(
+        &rt,
+        packet_rx,
+        room.clone(),
+        network.clone(),
+        my_id,
+    );
+
     let migration_loop = migration.clone();
     let is_host_loop = is_host.clone();
     let room_id_str = my_id.to_string();
     rt.spawn(async move {
         println!("[МИГРАЦИЯ] Фоновый цикл Heartbeat/Failover запущен.");
-        migration_loop.start_heartbeat_loop(is_host_loop, room_id_str).await;
+        migration_loop
+            .start_heartbeat_loop(is_host_loop, room_id_str)
+            .await;
     });
 
     // 6. Настройка окна, размера и иконки приложения
@@ -127,12 +151,12 @@ fn main() {
 
     // Загрузка иконки из assets/icon.png для панели задач и заголовка окна
     let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
-    
+
     let mut native_options = eframe::NativeOptions::default();
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([460.0, 700.0])
         .with_min_inner_size([420.0, 520.0]);
-        
+
     if let Some(icon) = icon_data {
         viewport = viewport.with_icon(icon);
     }
@@ -145,10 +169,24 @@ fn main() {
         native_options,
         Box::new(move |_cc| {
             Ok(Box::new(RadioApp::new(
-                mixer, room, None, ptt_flag, selected_input, selected_output,
-                network, my_id, ext_ip, mic_stream, packet_tx, input_devices, output_devices, is_host,
-                playback_stream, playback_rx
+                mixer,
+                room,
+                None,
+                ptt_flag,
+                selected_input,
+                selected_output,
+                network,
+                my_id,
+                ext_ip,
+                mic_stream,
+                packet_tx,
+                input_devices,
+                output_devices,
+                is_host,
+                playback_stream,
+                playback_rx,
             )))
         }),
-    ).unwrap();
+    )
+    .unwrap();
 }

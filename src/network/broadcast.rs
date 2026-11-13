@@ -1,11 +1,11 @@
 //! Фоновый сервис трансляции аудиопакетов с микрофона в P2P-сеть
 
-use std::sync::Arc;
-use std::net::SocketAddr;
-use tokio::sync::mpsc::Receiver;
+use crate::network::NetworkManager;
 use crate::network::NetworkMessage;
 use crate::room::RoomManager;
-use crate::network::NetworkManager;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::mpsc::Receiver;
 
 /// Запускает фоновую таску чтения пакетов микрофона и их отправки в Iroh и UDP
 pub fn spawn_audio_broadcast(
@@ -17,7 +17,7 @@ pub fn spawn_audio_broadcast(
 ) {
     let network_net = network.clone();
     let room_net = room.clone();
-    
+
     rt.spawn(async move {
         println!("[СЕТЬ] Готов к трансляции аудиопакетов in P2P...");
         let mut send_count = 0u64;
@@ -33,7 +33,7 @@ pub fn spawn_audio_broadcast(
             }
 
             // 2. Трансляция через сырой UDP (пропуская Iroh-пиров)
-            let peers = room_net.get_all_peers(); 
+            let peers = room_net.get_all_peers();
             for peer in peers {
                 if peer.address.starts_with("Iroh:") {
                     continue;
@@ -48,7 +48,11 @@ pub fn spawn_audio_broadcast(
             }
             send_count += 1;
             if send_count % 100 == 1 {
-                println!("[АУДИО] Отправка голоса в P2P (пакет #{}, размер: {} байт)", send_count, packet.len());
+                println!(
+                    "[АУДИО] Отправка голоса в P2P (пакет #{}, размер: {} байт)",
+                    send_count,
+                    packet.len()
+                );
             }
         }
     });

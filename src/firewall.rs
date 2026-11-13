@@ -11,12 +11,18 @@ pub fn setup_firewall_rules() {
             let exe_str = exe_path.to_string_lossy();
             const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-            println!("[ФАЕРВОЛ] Проверка и настройка Брандмауэра Windows для: {}", exe_str);
+            println!(
+                "[ФАЕРВОЛ] Проверка и настройка Брандмауэра Windows для: {}",
+                exe_str
+            );
 
             // Добавляем разрешающее правило для входящего UDP-трафика
             let output = std::process::Command::new("netsh")
-                .args(&[
-                    "advfirewall", "firewall", "add", "rule",
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
                     "name=DiscordRF",
                     "dir=in",
                     "action=allow",
@@ -37,7 +43,10 @@ pub fn setup_firewall_rules() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[ФАЕРВОЛ] Не удалось выполнить команду настройки фаервола: {}", e);
+                    eprintln!(
+                        "[ФАЕРВОЛ] Не удалось выполнить команду настройки фаервола: {}",
+                        e
+                    );
                 }
             }
         }

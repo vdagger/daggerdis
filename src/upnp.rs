@@ -1,6 +1,6 @@
 //! Модуль автоматического проброса портов через UPnP (IGD)
 
-use std::net::{SocketAddrV4, Ipv4Addr};
+use std::net::SocketAddrV4;
 
 /// Пытается автоматически открыть UDP-порт на домашнем роутере
 pub fn auto_forward_port(local_port: u16) {
@@ -28,7 +28,10 @@ pub fn auto_forward_port(local_port: u16) {
 
                 if let Some(local_ipv4) = local_ip {
                     let local_dest = SocketAddrV4::new(local_ipv4, local_port);
-                    println!("[UPnP] Запрос на проброс порта {} -> {}...", local_port, local_dest);
+                    println!(
+                        "[UPnP] Запрос на проброс порта {} -> {}...",
+                        local_port, local_dest
+                    );
 
                     match gateway.add_port(
                         igd::PortMappingProtocol::UDP,

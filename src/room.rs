@@ -1,5 +1,5 @@
-use std::sync::Mutex;
 use crate::types::Peer;
+use std::sync::Mutex;
 
 pub struct RoomManager {
     my_id: u64,
@@ -17,7 +17,10 @@ impl RoomManager {
     pub fn update_peer(&self, peer: Peer) {
         let mut peers = self.peers.lock().unwrap();
         // Ищем либо по точному ID, либо по адресу, если ID был 0 (заглушка пробива NAT)
-        if let Some(existing_peer) = peers.iter_mut().find(|p| p.id == peer.id || (p.id == 0 && p.address == peer.address)) {
+        if let Some(existing_peer) = peers
+            .iter_mut()
+            .find(|p| p.id == peer.id || (p.id == 0 && p.address == peer.address))
+        {
             existing_peer.id = peer.id; // перезаписываем временный ID 0 на реальный ID
             existing_peer.last_heartbeat = peer.last_heartbeat;
             existing_peer.address = peer.address;
@@ -39,7 +42,7 @@ impl RoomManager {
         }
 
         let min_peer_id = peers.iter().map(|peer| peer.id).min().unwrap();
-        
+
         if min_peer_id < self.my_id {
             Some(min_peer_id)
         } else {
@@ -51,17 +54,17 @@ impl RoomManager {
         let peers = self.peers.lock().unwrap();
         peers.iter().map(|peer| peer.address.clone()).collect()
     }
-    
+
     // Добавляем публичные методы для доступа к приватным полям
     pub fn get_all_peers(&self) -> Vec<Peer> {
         let peers = self.peers.lock().unwrap();
         peers.clone()
     }
-    
+
     pub fn get_my_id(&self) -> u64 {
         self.my_id
     }
-    
+
     pub fn set_host(&self, new_host_id: u64) {
         let mut peers = self.peers.lock().unwrap();
         let now = std::time::SystemTime::now()

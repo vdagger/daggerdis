@@ -1,7 +1,7 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::collections::HashMap;
 
 /// Преобразует значение ползунка 0..=300 в логарифмический коэффициент усиления
 fn slider_to_gain(val: u32) -> f32 {
@@ -12,7 +12,7 @@ fn slider_to_gain(val: u32) -> f32 {
     } else {
         // 100%..300% -> честный децибельный буст до +18.0 дБ (усиление до 8 раз!)
         let boost_ratio = (v - 100.0) / 200.0; // 0.0 .. 1.0
-        let db = boost_ratio * 18.0;           // 0.0 .. +18.0 dB
+        let db = boost_ratio * 18.0; // 0.0 .. +18.0 dB
         10.0f32.powf(db / 20.0)
     }
 }
@@ -50,7 +50,7 @@ impl AudioMixer {
             for sample in buffer.iter_mut() {
                 *sample *= volume;
             }
-            
+
             // Обновляем пиковую амплитуду для VU-метра
             let max_sample = buffer.iter().map(|&x| x.abs()).fold(0.0, f32::max);
             let peak = (max_sample * 100.0) as u32;
@@ -63,14 +63,14 @@ impl AudioMixer {
         let volume_gain = slider_to_gain(self.output_volume.load(Ordering::Relaxed));
         let peer_gain = slider_to_gain(self.get_peer_volume(peer_id));
         let combined_gain = volume_gain * peer_gain;
-        
+
         // Порог лимитера: -1.0 dBFS = 0.891
         const THRESHOLD: f32 = 0.891;
 
         for sample in buffer.iter_mut() {
             let boosted = *sample * combined_gain;
             let abs_val = boosted.abs();
-            
+
             if abs_val <= THRESHOLD {
                 // В рабочем диапазоне звук остается 100% прозрачным, без искажений
                 *sample = boosted;
@@ -130,7 +130,7 @@ impl AudioMixer {
     pub fn get_input_peak(&self) -> f32 {
         self.input_peak.load(Ordering::Relaxed) as f32 / 100.0
     }
-    
+
     pub fn set_input_peak_raw(&self, peak: u32) {
         self.input_peak.store(peak, Ordering::Relaxed);
     }

@@ -1,11 +1,11 @@
 //! Фоновый сервис приема и ретрансляции пакетов через Iroh P2P
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc::Sender;
 use crate::network::p2p_iroh::IrohP2pManager;
-use crate::room::RoomManager;
 use crate::network::NetworkMessage;
+use crate::room::RoomManager;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 
 /// Запускает фоновую таску приема аудио и Heartbeat через Iroh, включая ретрансляцию (SFU) на хосте
 pub fn spawn_iroh_receiver(
@@ -31,7 +31,11 @@ pub fn spawn_iroh_receiver(
                         .as_millis() as u64;
 
                     match msg {
-                        NetworkMessage::IrohSync { sender_id, node_id, is_host: peer_is_host } => {
+                        NetworkMessage::IrohSync {
+                            sender_id,
+                            node_id,
+                            is_host: peer_is_host,
+                        } => {
                             // 1. Сохраняем пира с ПОЛНЫМ 64-символьным NodeID
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
@@ -47,7 +51,10 @@ pub fn spawn_iroh_receiver(
                                 tokio::spawn(async move {
                                     let connected = p2p_connect.get_connected_peers().await;
                                     if !connected.contains(&target_id) {
-                                        println!("[IROH] Авто-связывание Full-Mesh с NodeID: {}", target_id);
+                                        println!(
+                                            "[IROH] Авто-связывание Full-Mesh с NodeID: {}",
+                                            target_id
+                                        );
                                         let _ = p2p_connect.connect_to_peer(&target_id).await;
                                     }
                                 });
@@ -55,11 +62,16 @@ pub fn spawn_iroh_receiver(
 
                             // 3. Релеинг: если мы Хост, пересылаем IrohSync остальным участникам
                             if is_host_iroh.load(Ordering::Relaxed) {
-                                p2p_recv.broadcast_bytes_except(&pkt.sender_id, &pkt.data).await;
+                                p2p_recv
+                                    .broadcast_bytes_except(&pkt.sender_id, &pkt.data)
+                                    .await;
                             }
                         }
                         NetworkMessage::HostMigration { new_host_id } => {
-                            println!("[IROH] 👑 Получено уведомление о смене хоста. Новый лидер ID: {}", new_host_id);
+                            println!(
+                                "[IROH] 👑 Получено уведомление о смене хоста. Новый лидер ID: {}",
+                                new_host_id
+                            );
                             room_iroh.set_host(new_host_id);
                             if new_host_id == room_iroh.get_my_id() {
                                 is_host_iroh.store(true, Ordering::SeqCst);
@@ -67,8 +79,13 @@ pub fn spawn_iroh_receiver(
                                 is_host_iroh.store(false, Ordering::SeqCst);
                             }
                         }
-                        NetworkMessage::AudioFrame { sender_id, opus_data } => {
-                            let is_peer_host = room_iroh.get_all_peers().iter()
+                        NetworkMessage::AudioFrame {
+                            sender_id,
+                            opus_data,
+                        } => {
+                            let is_peer_host = room_iroh
+                                .get_all_peers()
+                                .iter()
                                 .find(|p| p.id == sender_id)
                                 .map(|p| p.is_host)
                                 .unwrap_or(false);
@@ -83,7 +100,10 @@ pub fn spawn_iroh_receiver(
                             let _ = playback_tx_iroh.try_send((sender_id, opus_data));
                             // Ретрансляция голоса удалена, чтобы исключить задвоение сэмплов и замедление звука
                         }
-                        NetworkMessage::Heartbeat { sender_id, is_host: peer_is_host } => {
+                        NetworkMessage::Heartbeat {
+                            sender_id,
+                            is_host: peer_is_host,
+                        } => {
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
                                 address: format!("Iroh:{}", pkt.sender_id),
@@ -92,7 +112,9 @@ pub fn spawn_iroh_receiver(
                             });
 
                             if is_host_iroh.load(Ordering::Relaxed) {
-                                p2p_recv.broadcast_bytes_except(&pkt.sender_id, &pkt.data).await;
+                                p2p_recv
+                                    .broadcast_bytes_except(&pkt.sender_id, &pkt.data)
+                                    .await;
                             }
                         }
                         _ => {}

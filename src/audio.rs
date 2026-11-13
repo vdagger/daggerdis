@@ -42,16 +42,21 @@ impl UniversalAudioCapture {
         let host = cpal::default_host();
         let input_device = match device {
             Some(d) => d,
-            None => host.default_input_device().ok_or("No default input device")?,
+            None => host
+                .default_input_device()
+                .ok_or("No default input device")?,
         };
 
         // Ищем конфигурацию, поддерживающую 48000 Гц, либо берем дефолтную
         let supported_configs = input_device.supported_input_configs().ok();
-        let best_config = supported_configs.and_then(|mut configs| {
-            configs.find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
-                .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
-        }).or_else(|| input_device.default_input_config().ok().map(|c| c.config()))
-          .ok_or("Не удалось получить поддерживаемый формат микрофона")?;
+        let best_config = supported_configs
+            .and_then(|mut configs| {
+                configs
+                    .find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
+                    .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
+            })
+            .or_else(|| input_device.default_input_config().ok().map(|c| c.config()))
+            .ok_or("Не удалось получить поддерживаемый формат микрофона")?;
 
         let sample_rate = best_config.sample_rate.0;
         let total_channels = best_config.channels as usize;
@@ -98,7 +103,10 @@ impl UniversalAudioCapture {
 
                 // Noise Gate (Шумовой затвор): порог ~ -44 dBFS (0.006)
                 let mut processed_chunk = normalized_chunk;
-                let chunk_peak = processed_chunk.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                let chunk_peak = processed_chunk
+                    .iter()
+                    .map(|s| s.abs())
+                    .fold(0.0f32, f32::max);
                 let target_gain = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
 
                 for sample in processed_chunk.iter_mut() {
@@ -145,16 +153,26 @@ impl UniversalAudioCapture {
         let host = cpal::default_host();
         let output_device = match device {
             Some(d) => d,
-            None => host.default_output_device().ok_or("No default output device")?,
+            None => host
+                .default_output_device()
+                .ok_or("No default output device")?,
         };
 
         // Запрашиваем 48000 Гц у динамиков, либо берем их дефолтный формат
         let supported_configs = output_device.supported_output_configs().ok();
-        let best_config = supported_configs.and_then(|mut configs| {
-            configs.find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
-                .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
-        }).or_else(|| output_device.default_output_config().ok().map(|c| c.config()))
-          .ok_or("Не удалось получить поддерживаемый формат динамиков")?;
+        let best_config = supported_configs
+            .and_then(|mut configs| {
+                configs
+                    .find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
+                    .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
+            })
+            .or_else(|| {
+                output_device
+                    .default_output_config()
+                    .ok()
+                    .map(|c| c.config())
+            })
+            .ok_or("Не удалось получить поддерживаемый формат динамиков")?;
 
         let sample_rate = best_config.sample_rate.0;
         let output_channels = best_config.channels as usize;
@@ -180,11 +198,16 @@ impl UniversalAudioCapture {
                     while let Ok((sender_id, packet)) = rx_lock.try_recv() {
                         if let Ok(len) = decoder.decode(&packet, 960, &mut mono_decoded) {
                             mixer.process_output(sender_id, &mut mono_decoded[..len]);
-                            
+
                             // Если звуковая карта работает не на 48 кГц (например 44.1 или 96 кГц),
                             // ресэмплируем декодированный звук строго под частоту звуковой карты!
                             if sample_rate != 48000 {
-                                let resampled = resample_linear(&mono_decoded[..len], 48000, sample_rate, &mut resample_pos);
+                                let resampled = resample_linear(
+                                    &mono_decoded[..len],
+                                    48000,
+                                    sample_rate,
+                                    &mut resample_pos,
+                                );
                                 pcm_buffer.extend_from_slice(&resampled);
                             } else {
                                 pcm_buffer.extend_from_slice(&mono_decoded[..len]);
