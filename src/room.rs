@@ -35,21 +35,6 @@ impl RoomManager {
         peers.retain(|peer| peer.id != id);
     }
 
-    pub fn get_next_host_id(&self) -> Option<u64> {
-        let peers = self.peers.lock().unwrap();
-        if peers.is_empty() {
-            return Some(self.my_id);
-        }
-
-        let min_peer_id = peers.iter().map(|peer| peer.id).min().unwrap();
-
-        if min_peer_id < self.my_id {
-            Some(min_peer_id)
-        } else {
-            Some(self.my_id)
-        }
-    }
-
     pub fn get_all_addresses(&self) -> Vec<String> {
         let peers = self.peers.lock().unwrap();
         peers.iter().map(|peer| peer.address.clone()).collect()

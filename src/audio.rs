@@ -147,7 +147,7 @@ impl UniversalAudioCapture {
 
     pub fn create_playback_stream(
         device: Option<cpal::Device>,
-        rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>>>,
+        rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
         mixer: std::sync::Arc<crate::mixer::AudioMixer>,
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
@@ -189,28 +189,53 @@ impl UniversalAudioCapture {
         let mut pcm_buffer: Vec<f32> = Vec::with_capacity(3840);
         let mut resample_pos: f64 = 0.0;
         let mut prebuffered = false;
+        let mut reorder: std::collections::HashMap<
+            u64,
+            (u32, std::collections::BTreeMap<u32, Vec<u8>>),
+        > = std::collections::HashMap::new();
 
         let stream = output_device.build_output_stream(
             &best_config,
             move |data: &mut [f32], _| {
-                // Принимаем входящие пакеты и декодируем (всегда 48 кГц от Opus)
+                // Принимаем входящие пакеты, переупорядочиваем по seq и декодируем
                 if let Ok(mut rx_lock) = rx.try_lock() {
-                    while let Ok((sender_id, packet)) = rx_lock.try_recv() {
-                        if let Ok(len) = decoder.decode(&packet, 960, &mut mono_decoded) {
-                            mixer.process_output(sender_id, &mut mono_decoded[..len]);
+                    while let Ok((sender_id, seq, packet)) = rx_lock.try_recv() {
+                        let entry = reorder
+                            .entry(sender_id)
+                            .or_insert_with(|| (seq, std::collections::BTreeMap::new()));
 
-                            // Если звуковая карта работает не на 48 кГц (например 44.1 или 96 кГц),
-                            // ресэмплируем декодированный звук строго под частоту звуковой карты!
-                            if sample_rate != 48000 {
-                                let resampled = resample_linear(
-                                    &mono_decoded[..len],
-                                    48000,
-                                    sample_rate,
-                                    &mut resample_pos,
-                                );
-                                pcm_buffer.extend_from_slice(&resampled);
-                            } else {
-                                pcm_buffer.extend_from_slice(&mono_decoded[..len]);
+                        // Отбрасываем устаревшие/дублированные кадры
+                        if seq.wrapping_sub(entry.0) >= 0x8000_0000 {
+                            continue;
+                        }
+                        entry.1.insert(seq, packet);
+
+                        // Не даём буферу переупорядочивания расти при большой дыре в потоке
+                        while entry.1.len() > 64 {
+                            let oldest = *entry.1.keys().next().unwrap();
+                            entry.1.remove(&oldest);
+                            entry.0 = oldest.wrapping_add(1);
+                        }
+
+                        // Выдаём все кадры строго по порядку
+                        while let Some(packet) = entry.1.remove(&entry.0) {
+                            entry.0 = entry.0.wrapping_add(1);
+                            if let Ok(len) = decoder.decode(&packet, 960, &mut mono_decoded) {
+                                mixer.process_output(sender_id, &mut mono_decoded[..len]);
+
+                                // Если звуковая карта работает не на 48 кГц (например 44.1 или 96 кГц),
+                                // ресэмплируем декодированный звук строго под частоту звуковой карты!
+                                if sample_rate != 48000 {
+                                    let resampled = resample_linear(
+                                        &mono_decoded[..len],
+                                        48000,
+                                        sample_rate,
+                                        &mut resample_pos,
+                                    );
+                                    pcm_buffer.extend_from_slice(&resampled);
+                                } else {
+                                    pcm_buffer.extend_from_slice(&mono_decoded[..len]);
+                                }
                             }
                         }
                     }

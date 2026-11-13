@@ -21,11 +21,13 @@ pub fn spawn_audio_broadcast(
     rt.spawn(async move {
         println!("[СЕТЬ] Готов к трансляции аудиопакетов in P2P...");
         let mut send_count = 0u64;
+        let mut seq: u32 = 0;
         while let Some(packet) = packet_rx.recv().await {
             // 1. Трансляция через Iroh P2P
             if let Some(ref p2p) = network_net.iroh {
                 let network_message = NetworkMessage::AudioFrame {
                     sender_id: my_id,
+                    seq,
                     opus_data: packet.clone(),
                 };
                 let serialized = crate::network::message::serialize_msg(&network_message);
@@ -40,12 +42,14 @@ pub fn spawn_audio_broadcast(
                 }
                 let network_message = NetworkMessage::AudioFrame {
                     sender_id: my_id,
+                    seq,
                     opus_data: packet.clone(),
                 };
                 if let Ok(addr) = peer.address.parse::<SocketAddr>() {
                     let _ = network_net.send_packet(addr, &network_message).await;
                 }
             }
+            seq = seq.wrapping_add(1);
             send_count += 1;
             if send_count % 100 == 1 {
                 println!(

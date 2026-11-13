@@ -14,6 +14,7 @@ pub enum NetworkMessage {
     },
     AudioFrame {
         sender_id: u64,
+        seq: u32,
         opus_data: Vec<u8>,
     },
     HostMigration {
@@ -61,10 +62,12 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
         }
         NetworkMessage::AudioFrame {
             sender_id,
+            seq,
             opus_data,
         } => {
             data.push(3);
             data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&seq.to_le_bytes());
             data.extend_from_slice(opus_data);
         }
         NetworkMessage::HostMigration { new_host_id } => {
@@ -83,7 +86,6 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             data.extend_from_slice(&(node_bytes.len() as u16).to_le_bytes());
             data.extend_from_slice(node_bytes);
         }
-        _ => data.push(99), // Заглушка для остальных типов
     }
     data
 }
@@ -160,11 +162,13 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
                 None // Неправильный формат данных
             }
         }
-        3 if bytes.len() >= 9 => {
+        3 if bytes.len() >= 13 => {
             let id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let seq = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
             Some(NetworkMessage::AudioFrame {
                 sender_id: id,
-                opus_data: bytes[9..].to_vec(),
+                seq,
+                opus_data: bytes[13..].to_vec(),
             })
         }
         4 if bytes.len() >= 9 => {

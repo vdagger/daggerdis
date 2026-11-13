@@ -28,7 +28,7 @@ pub struct RadioApp {
     output_devices: Vec<String>,
     is_host: Arc<AtomicBool>,
     playback_stream: Arc<Mutex<Option<cpal::Stream>>>,
-    playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>>>,
+    playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
     prev_output_index: std::sync::atomic::AtomicU32,
     continuous_mode: bool,
     theme_configured: bool,
@@ -51,7 +51,7 @@ impl RadioApp {
         output_devices: Vec<String>,
         is_host: Arc<AtomicBool>,
         playback_stream: Arc<Mutex<Option<cpal::Stream>>>,
-        playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>>>,
+        playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
     ) -> Self {
         Self {
             mixer,

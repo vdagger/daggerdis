@@ -13,32 +13,23 @@ pub fn restart_audio_stream(
     mixer: Arc<crate::mixer::AudioMixer>,
     device_name: String,
 ) {
-    let mut stream_lock = mic_stream.lock().unwrap();
+    let mut stream_lock = match mic_stream.lock() {
+        Ok(l) => l,
+        Err(p) => p.into_inner(),
+    };
     *stream_lock = None; // Останавливаем старый поток
 
-    // Находим устройство по имени вместо использования индекса
+    // Находим устройство по имени без паник (если устройство исчезло — просто выходим)
     let host = cpal::default_host();
-    let device = host
-        .input_devices()
-        .unwrap()
-        .into_iter()
-        .find(|d| d.name().unwrap_or_default() == device_name)
-        .expect("Выбранное устройство не найдено по имени");
-
-    // Получаем поддерживаемую конфигурацию от устройства с безопасным подбором
-    let supported_formats = device
-        .supported_input_configs()
-        .expect("Failed to query supported configs");
-
-    let _config = supported_formats
-        .filter(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
-        .next()
-        .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
-        .unwrap_or_else(|| device.default_input_config().unwrap().into());
-
-    // Используем переданный selected_input вместо создания нового
-    // Но в текущей сигнатуре нет параметра selected_input, поэтому оставим как есть
-    // Однако, если мы хотим использовать правильный индекс, нужно изменить сигнатуру функции
+    let device = match host.input_devices().ok().and_then(|mut devs| {
+        devs.find(|d| d.name().unwrap_or_default() == device_name)
+    }) {
+        Some(d) => d,
+        None => {
+            eprintln!("[ОШИБКА] Выбранное устройство не найдено: {}", device_name);
+            return;
+        }
+    };
 
     match audio.create_input_stream(Some(device), ptt_flag, packet_tx, mixer) {
         Ok(new_stream) => {
@@ -52,7 +43,7 @@ pub fn restart_audio_stream(
 /// Перезапускает аудиопоток воспроизведения
 pub fn restart_playback_stream(
     playback_stream: &std::sync::Arc<std::sync::Mutex<Option<cpal::Stream>>>,
-    rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, Vec<u8>)>>>,
+    rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
     device_name: String,
     mixer: std::sync::Arc<crate::mixer::AudioMixer>,
 ) {

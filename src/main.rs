@@ -95,7 +95,7 @@ fn main() {
 
     // 4. Каналы передачи аудио
     let (packet_tx, packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
-    let (playback_tx, playback_rx) = tokio::sync::mpsc::channel::<(u64, Vec<u8>)>(100);
+    let (playback_tx, playback_rx) = tokio::sync::mpsc::channel::<(u64, u32, Vec<u8>)>(100);
     let playback_rx = Arc::new(std::sync::Mutex::new(playback_rx));
     let playback_stream = Arc::new(Mutex::new(None));
 

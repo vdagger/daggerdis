@@ -7,7 +7,7 @@ pub fn spawn_network_receiver(
     rt: &tokio::runtime::Runtime,
     network: Arc<NetworkManager>,
     room: Arc<RoomManager>,
-    playback_tx: Sender<(u64, Vec<u8>)>,
+    playback_tx: Sender<(u64, u32, Vec<u8>)>,
 ) {
     let network_recv = network.clone();
     let room_net = room.clone();
@@ -27,10 +27,6 @@ pub fn spawn_network_receiver(
                     continue;
                 }
             };
-            println!(
-                "[СЕТЬ] 🔥 ВХОДЯЩИЙ UDP ПАКЕТ! Размер: {} байт от {}",
-                amt, sender_addr
-            );
             let bytes = &buf[..amt];
             if let Some(msg) = crate::network::message::deserialize_msg(bytes) {
                 match msg {
@@ -52,6 +48,7 @@ pub fn spawn_network_receiver(
                     }
                     crate::network::message::NetworkMessage::AudioFrame {
                         sender_id,
+                        seq,
                         opus_data,
                     } => {
                         let now = std::time::SystemTime::now()
@@ -65,7 +62,7 @@ pub fn spawn_network_receiver(
                             p.last_heartbeat = now;
                             room_net.update_peer(p);
                         }
-                        let _ = playback_tx_clone.try_send((sender_id, opus_data));
+                        let _ = playback_tx_clone.try_send((sender_id, seq, opus_data));
                         audio_recv_count += 1;
                         if audio_recv_count % 100 == 1 {
                             println!(
