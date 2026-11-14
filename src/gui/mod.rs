@@ -54,6 +54,8 @@ pub struct RadioApp {
     video: Option<video_session::VideoSession>,
     #[cfg(windows)]
     video_error: Option<String>,
+    #[cfg(windows)]
+    video_fullscreen: bool,
 }
 
 impl RadioApp {
@@ -120,6 +122,8 @@ impl RadioApp {
             video: None,
             #[cfg(windows)]
             video_error: None,
+            #[cfg(windows)]
+            video_fullscreen: false,
         }
     }
 
@@ -287,6 +291,9 @@ impl eframe::App for RadioApp {
                 }
             });
 
+        #[cfg(windows)]
+        self.draw_fullscreen_video(ctx);
+
         self.persist_if_needed();
 
         ctx.request_repaint();
@@ -413,6 +420,7 @@ impl RadioApp {
     /// Трансляция экрана: запуск/остановка и локальное превью.
     #[cfg(windows)]
     fn draw_video_panel(&mut self, ui: &mut egui::Ui) {
+        let mut go_fullscreen = false;
         egui::Frame::none()
             .fill(t::SURFACE)
             .rounding(Rounding::same(12.0))
@@ -437,6 +445,7 @@ impl RadioApp {
                     {
                         if running {
                             self.video = None;
+                            self.video_fullscreen = false;
                         } else {
                             match video_session::VideoSession::start() {
                                 Ok(v) => {
@@ -478,8 +487,15 @@ impl RadioApp {
                                 tex.id(),
                                 size,
                             ))
-                            .rounding(Rounding::same(8.0));
-                            ui.add(img);
+                            .rounding(Rounding::same(8.0))
+                            .sense(egui::Sense::click());
+                            let resp = ui.add(img);
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                go_fullscreen = true;
+                            }
                         }
                         None => {
                             ui.label(
@@ -489,8 +505,65 @@ impl RadioApp {
                             );
                         }
                     }
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("Клик по кадру — на весь экран (Esc — выход)")
+                            .size(9.5)
+                            .color(t::TEXT_MUTED),
+                    );
                 }
             });
+        if go_fullscreen {
+            self.video_fullscreen = true;
+        }
+    }
+
+    /// Просмотр трансляции на весь экран в отдельном окне.
+    #[cfg(windows)]
+    fn draw_fullscreen_video(&mut self, ctx: &egui::Context) {
+        if !self.video_fullscreen || self.video.is_none() {
+            self.video_fullscreen = false;
+            return;
+        }
+        let close_requested = std::cell::Cell::new(false);
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("video-fullscreen"),
+            egui::ViewportBuilder::default()
+                .with_title("Albus — трансляция")
+                .with_fullscreen(true)
+                .with_decorations(false),
+            |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+                    .show(ctx, |ui| {
+                        if let Some(v) = &self.video {
+                            if let Some(tex) = v.texture() {
+                                let (w, h) = v.size();
+                                let rect = ui.max_rect();
+                                let scale = (rect.width() / w as f32)
+                                    .min(rect.height() / h as f32);
+                                let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+                                let img = egui::Image::new(egui::load::SizedTexture::new(
+                                    tex.id(),
+                                    size,
+                                ));
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(img);
+                                });
+                            }
+                        }
+                        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            close_requested.set(true);
+                        }
+                    });
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close_requested.set(true);
+                }
+            },
+        );
+        if close_requested.get() {
+            self.video_fullscreen = false;
+        }
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
