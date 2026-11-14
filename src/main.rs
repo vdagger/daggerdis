@@ -23,8 +23,28 @@ fn main() {
     let is_host = Arc::new(AtomicBool::new(true));
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let selected_input = Arc::new(AtomicU32::new(0));
-    let selected_output = Arc::new(AtomicU32::new(0));
+    // Загруженные настройки: устройства ищутся по имени, порядок индексов
+    // между запусками не гарантирован
+    let config = albus::config::AppConfig::load();
+    let input_devices = DeviceSelector::get_input_devices();
+    let input_channel_counts = DeviceSelector::get_input_channel_counts();
+    let output_devices = DeviceSelector::get_output_devices();
+
+    let input_index = config
+        .input_device
+        .as_deref()
+        .and_then(|name| input_devices.iter().position(|d| d == name))
+        .or_else(DeviceSelector::default_input_index)
+        .unwrap_or(0) as u32;
+    let output_index = config
+        .output_device
+        .as_deref()
+        .and_then(|name| output_devices.iter().position(|d| d == name))
+        .or_else(DeviceSelector::default_output_index)
+        .unwrap_or(0) as u32;
+
+    let selected_input = Arc::new(AtomicU32::new(input_index));
+    let selected_output = Arc::new(AtomicU32::new(output_index));
     let ext_ip = Arc::new(Mutex::new("Определение...".to_string()));
     let mic_stream = Arc::new(Mutex::new(None));
 
@@ -90,6 +110,24 @@ fn main() {
 
     let room = Arc::new(RoomManager::new(my_id));
     let mixer = Arc::new(AudioMixer::new());
+    if let Some(v) = config.ch1_volume {
+        mixer.set_ch1_volume(v);
+    }
+    if let Some(v) = config.ch2_volume {
+        mixer.set_ch2_volume(v);
+    }
+    if let Some(v) = config.output_volume {
+        mixer.set_output_volume(v);
+    }
+    if let Some(c) = config.input1_channel {
+        mixer.set_input1_channel(c);
+    }
+    if let Some(c) = config.input2_channel {
+        mixer.set_input2_channel(c);
+    }
+    if let Some(vk) = config.ptt_vk {
+        albus::keybind::CURRENT_VK.store(vk, std::sync::atomic::Ordering::Relaxed);
+    }
     let mut audio = UniversalAudioCapture::new().unwrap();
     let migration = Arc::new(MigrationManager::new(my_id, room.clone(), network.clone()));
 
@@ -99,16 +137,24 @@ fn main() {
     let playback_rx = Arc::new(std::sync::Mutex::new(playback_rx));
     let playback_stream = Arc::new(Mutex::new(None));
 
+    let configured_output = config
+        .output_device
+        .as_deref()
+        .and_then(DeviceSelector::find_output_device_by_name);
     if let Ok(stream) = albus::audio::UniversalAudioCapture::create_playback_stream(
-        None,
+        configured_output,
         playback_rx.clone(),
         mixer.clone(),
     ) {
         *playback_stream.lock().unwrap() = Some(stream);
     }
 
+    let configured_input = config
+        .input_device
+        .as_deref()
+        .and_then(DeviceSelector::find_input_device_by_name);
     if let Ok(stream) =
-        audio.create_input_stream(None, ptt_flag.clone(), packet_tx.clone(), mixer.clone())
+        audio.create_input_stream(configured_input, ptt_flag.clone(), packet_tx.clone(), mixer.clone())
     {
         *mic_stream.lock().unwrap() = Some(stream);
     }
@@ -146,10 +192,6 @@ fn main() {
     });
 
     // 6. Настройка окна, размера и иконки приложения
-    let input_devices = DeviceSelector::get_input_devices();
-    let input_channel_counts = DeviceSelector::get_input_channel_counts();
-    let output_devices = DeviceSelector::get_output_devices();
-
     // Загрузка иконки из assets/icon.png для панели задач и заголовка окна
     let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
 
@@ -172,7 +214,7 @@ fn main() {
             Ok(Box::new(RadioApp::new(
                 mixer,
                 room,
-                None,
+                config.ptt_vk,
                 ptt_flag,
                 selected_input,
                 selected_output,
@@ -187,6 +229,7 @@ fn main() {
                 is_host,
                 playback_stream,
                 playback_rx,
+                config,
             )))
         }),
     )

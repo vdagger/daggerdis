@@ -84,4 +84,36 @@ impl DeviceSelector {
         let device_vec: Vec<_> = devices.collect();
         device_vec.get(index).cloned()
     }
+
+    /// Находит устройство ввода по имени (порядок устройств меняется между запусками)
+    pub fn find_input_device_by_name(name: &str) -> Option<cpal::Device> {
+        let host = cpal::default_host();
+        let mut devices = host.input_devices().ok()?;
+        devices.find(|d| d.name().map(|n| n == name).unwrap_or(false))
+    }
+
+    /// Находит устройство вывода по имени
+    pub fn find_output_device_by_name(name: &str) -> Option<cpal::Device> {
+        let host = cpal::default_host();
+        let mut devices = host.output_devices().ok()?;
+        devices.find(|d| d.name().map(|n| n == name).unwrap_or(false))
+    }
+
+    /// Индекс устройства ввода по умолчанию в списке get_input_devices()
+    pub fn default_input_index() -> Option<usize> {
+        let host = cpal::default_host();
+        let default_name = host.default_input_device()?.name().ok()?;
+        Self::get_input_devices()
+            .iter()
+            .position(|n| *n == default_name)
+    }
+
+    /// Индекс устройства вывода по умолчанию в списке get_output_devices()
+    pub fn default_output_index() -> Option<usize> {
+        let host = cpal::default_host();
+        let default_name = host.default_output_device()?.name().ok()?;
+        Self::get_output_devices()
+            .iter()
+            .position(|n| *n == default_name)
+    }
 }

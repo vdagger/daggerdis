@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use theme as t;
 
@@ -40,6 +41,9 @@ pub struct RadioApp {
     theme_configured: bool,
     settings_open: bool,
     wave: VecDeque<f32>,
+    config: crate::config::AppConfig,
+    pending_save: bool,
+    last_save: Instant,
 }
 
 impl RadioApp {
@@ -61,7 +65,11 @@ impl RadioApp {
         is_host: Arc<AtomicBool>,
         playback_stream: Arc<Mutex<Option<cpal::Stream>>>,
         playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
+        config: crate::config::AppConfig,
     ) -> Self {
+        let initial_input = selected_input.load(std::sync::atomic::Ordering::Relaxed);
+        let initial_output = selected_output.load(std::sync::atomic::Ordering::Relaxed);
+
         Self {
             mixer,
             ptt_bind,
@@ -76,7 +84,7 @@ impl RadioApp {
             my_id,
             ext_ip,
             mic_stream,
-            prev_input_index: std::sync::atomic::AtomicU32::new(0),
+            prev_input_index: std::sync::atomic::AtomicU32::new(initial_input),
             packet_tx,
             input_devices,
             input_channel_counts,
@@ -84,11 +92,14 @@ impl RadioApp {
             is_host,
             playback_stream,
             playback_rx,
-            prev_output_index: std::sync::atomic::AtomicU32::new(0),
-            continuous_mode: false,
+            prev_output_index: std::sync::atomic::AtomicU32::new(initial_output),
+            continuous_mode: config.continuous_mode.unwrap_or(false),
             theme_configured: false,
             settings_open: false,
             wave: VecDeque::new(),
+            config,
+            pending_save: false,
+            last_save: Instant::now(),
         }
     }
 
@@ -170,15 +181,18 @@ impl eframe::App for RadioApp {
             .prev_input_index
             .load(std::sync::atomic::Ordering::Relaxed);
         if current_input_index != prev_input_index {
-            let device_name = self.input_devices[current_input_index as usize].clone();
-            stream_control::restart_audio_stream(
-                &self.mic_stream,
-                crate::audio::UniversalAudioCapture::new().unwrap(),
-                self.packet_tx.clone(),
-                self.ptt_flag.clone(),
-                self.mixer.clone(),
-                device_name,
-            );
+            if let Some(device_name) = self.input_devices.get(current_input_index as usize).cloned() {
+                stream_control::restart_audio_stream(
+                    &self.mic_stream,
+                    crate::audio::UniversalAudioCapture::new().unwrap(),
+                    self.packet_tx.clone(),
+                    self.ptt_flag.clone(),
+                    self.mixer.clone(),
+                    device_name.clone(),
+                );
+                self.config.input_device = Some(device_name);
+                self.pending_save = true;
+            }
             self.prev_input_index
                 .store(current_input_index, std::sync::atomic::Ordering::Relaxed);
         }
@@ -190,13 +204,15 @@ impl eframe::App for RadioApp {
             .prev_output_index
             .load(std::sync::atomic::Ordering::Relaxed);
         if current_output_index != prev_output_index {
-            if let Some(device_name) = self.output_devices.get(current_output_index as usize) {
+            if let Some(device_name) = self.output_devices.get(current_output_index as usize).cloned() {
                 stream_control::restart_playback_stream(
                     &self.playback_stream,
                     self.playback_rx.clone(),
                     device_name.clone(),
                     self.mixer.clone(),
                 );
+                self.config.output_device = Some(device_name);
+                self.pending_save = true;
             }
             self.prev_output_index
                 .store(current_output_index, std::sync::atomic::Ordering::Relaxed);
@@ -249,6 +265,8 @@ impl eframe::App for RadioApp {
                     self.draw_main(ui, level, transmitting, &wave);
                 }
             });
+
+        self.persist_if_needed();
 
         ctx.request_repaint();
     }
@@ -353,6 +371,56 @@ impl RadioApp {
                     &mut self.ptt_bind,
                 );
             });
+    }
+
+    /// Сохраняет настройки на диск не чаще раза в 400 мс после изменений
+    fn persist_if_needed(&mut self) {
+        let mut changed = false;
+
+        let ch1 = self.mixer.ch1_volume();
+        if self.config.ch1_volume != Some(ch1) {
+            self.config.ch1_volume = Some(ch1);
+            changed = true;
+        }
+        let ch2 = self.mixer.ch2_volume();
+        if self.config.ch2_volume != Some(ch2) {
+            self.config.ch2_volume = Some(ch2);
+            changed = true;
+        }
+        let out = self.mixer.output_volume();
+        if self.config.output_volume != Some(out) {
+            self.config.output_volume = Some(out);
+            changed = true;
+        }
+        let in1 = self.mixer.input1_channel();
+        if self.config.input1_channel != Some(in1) {
+            self.config.input1_channel = Some(in1);
+            changed = true;
+        }
+        let in2 = self.mixer.input2_channel();
+        if self.config.input2_channel != Some(in2) {
+            self.config.input2_channel = Some(in2);
+            changed = true;
+        }
+        if self.config.continuous_mode != Some(self.continuous_mode) {
+            self.config.continuous_mode = Some(self.continuous_mode);
+            changed = true;
+        }
+        let vk = crate::keybind::CURRENT_VK.load(std::sync::atomic::Ordering::Relaxed);
+        if self.config.ptt_vk != Some(vk) {
+            self.config.ptt_vk = Some(vk);
+            changed = true;
+        }
+
+        if changed {
+            self.pending_save = true;
+        }
+
+        if self.pending_save && self.last_save.elapsed() >= Duration::from_millis(400) {
+            self.config.save();
+            self.pending_save = false;
+            self.last_save = Instant::now();
+        }
     }
 }
 

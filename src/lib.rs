@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod config;
 pub mod devices;
 pub mod firewall;
 pub mod gui;
