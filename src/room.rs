@@ -16,12 +16,7 @@ impl RoomManager {
 
     pub fn update_peer(&self, peer: Peer) {
         let mut peers = self.peers.lock().unwrap();
-        // Ищем либо по точному ID, либо по адресу, если ID был 0 (заглушка пробива NAT)
-        if let Some(existing_peer) = peers
-            .iter_mut()
-            .find(|p| p.id == peer.id || (p.id == 0 && p.address == peer.address))
-        {
-            existing_peer.id = peer.id; // перезаписываем временный ID 0 на реальный ID
+        if let Some(existing_peer) = peers.iter_mut().find(|p| p.id == peer.id) {
             existing_peer.last_heartbeat = peer.last_heartbeat;
             existing_peer.address = peer.address;
             existing_peer.is_host = peer.is_host;

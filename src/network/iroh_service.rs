@@ -65,7 +65,7 @@ pub fn spawn_iroh_receiver(
                             // 1. Сохраняем пира с ПОЛНЫМ 64-символьным NodeID
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
-                                address: format!("Iroh:{}", node_id),
+                                address: node_id.clone(),
                                 is_host: peer_is_host,
                                 last_heartbeat: now,
                             });
@@ -130,7 +130,7 @@ pub fn spawn_iroh_receiver(
 
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
-                                address: format!("Iroh:{}", pkt.sender_id),
+                                address: pkt.sender_id.clone(),
                                 is_host: is_peer_host,
                                 last_heartbeat: now,
                             });
@@ -147,7 +147,7 @@ pub fn spawn_iroh_receiver(
                             }
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
-                                address: format!("Iroh:{}", pkt.sender_id),
+                                address: pkt.sender_id.clone(),
                                 is_host: peer_is_host,
                                 last_heartbeat: now,
                             });
@@ -205,7 +205,6 @@ pub fn spawn_iroh_receiver(
                                 pkt.sender_id
                             );
                         }
-                        _ => {}
                     }
                 }
             }

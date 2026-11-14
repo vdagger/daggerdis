@@ -1,15 +1,25 @@
 //! Участники эфира и подключение к комнате
 
 use crate::gui::theme as t;
+use crate::network::p2p_iroh::IrohP2pManager;
 use eframe::egui;
 use egui::{Color32, Rounding, Stroke};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn short_node_id(node_id: &str) -> String {
+    if node_id.len() > 16 {
+        format!("{}…", &node_id[..15])
+    } else {
+        node_id.to_string()
+    }
 }
 
 /// Компактный аватар с кольцом состояния
@@ -183,8 +193,7 @@ pub fn draw_participants(
 pub fn draw_room_panel(
     ui: &mut egui::Ui,
     connect_ip: &mut String,
-    _connect_port: &mut String,
-    network: std::sync::Arc<crate::network::NetworkManager>,
+    iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
     room: std::sync::Arc<crate::room::RoomManager>,
@@ -208,13 +217,8 @@ pub fn draw_room_panel(
 
     ui.add_space(4.0);
 
-    let short_id = if my_node_id.len() > 24 {
-        format!("{}…", &my_node_id[..23])
-    } else {
-        my_node_id.to_string()
-    };
     ui.label(
-        egui::RichText::new(short_id)
+        egui::RichText::new(short_node_id(my_node_id))
             .monospace()
             .size(11.0)
             .color(t::BRAND),
@@ -243,7 +247,7 @@ pub fn draw_room_panel(
         .rounding(Rounding::same(8.0));
 
         if ui.add_sized([btn_width, 26.0], btn).clicked() {
-            join_room(connect_ip, network, my_id, is_host.clone(), room.clone());
+            join_room(connect_ip, iroh.clone(), my_id, is_host.clone());
         }
     });
 
@@ -253,7 +257,7 @@ pub fn draw_room_panel(
         let host_addr = peers
             .iter()
             .find(|p| p.is_host)
-            .map(|p| p.address.clone())
+            .map(|p| short_node_id(&p.address))
             .unwrap_or_else(|| "Ожидание хоста…".to_string());
         ui.label(
             egui::RichText::new(format!("Хост: {}", host_addr))
@@ -265,75 +269,44 @@ pub fn draw_room_panel(
 
 fn join_room(
     connect_ip: &mut String,
-    network: std::sync::Arc<crate::network::NetworkManager>,
+    iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    room: std::sync::Arc<crate::room::RoomManager>,
 ) {
     let raw_addr = connect_ip.trim();
 
-    if raw_addr.len() == 64 && raw_addr.chars().all(|c| c.is_ascii_hexdigit()) {
-        if let Some(ref p2p) = network.iroh {
-            let p2p_clone = p2p.clone();
-            let target_node_id = raw_addr.to_string();
-            let my_peer_id = my_id;
-
-            is_host.store(false, Ordering::SeqCst);
-            println!(
-                "[СЕТЬ] Переключился в режим КЛИЕНТА (Iroh P2P). Цель: {}",
-                target_node_id
-            );
-
-            tokio::task::spawn(async move {
-                println!("[IROH] Попытка P2P-подключения к NodeID: {}", target_node_id);
-                match p2p_clone.connect_to_peer(&target_node_id).await {
-                    Ok(()) => {
-                        println!("[IROH] Прямое P2P-подключение установлено");
-                        let hello_msg = crate::network::NetworkMessage::Heartbeat {
-                            sender_id: my_peer_id,
-                            is_host: false,
-                        };
-                        let bytes = crate::network::message::serialize_msg(&hello_msg);
-                        p2p_clone.broadcast_bytes(&bytes).await;
-                    }
-                    Err(e) => eprintln!("[IROH] Ошибка P2P-подключения по NodeID: {}", e),
-                }
-            });
-        }
+    if raw_addr.len() != 64 || !raw_addr.chars().all(|c| c.is_ascii_hexdigit()) {
+        eprintln!("[ОШИБКА] NodeID должен состоять из 64 hex-символов.");
         return;
     }
 
-    let target_addr: Result<std::net::SocketAddr, _> = if raw_addr.contains(':') {
-        raw_addr.parse()
-    } else {
-        format!("{}:8080", raw_addr).parse()
+    let Some(ref p2p) = iroh else {
+        return;
     };
 
-    match target_addr {
-        Ok(addr) => {
-            let net = network.clone();
-            let room_clone = room.clone();
-            let my_peer_id = my_id;
-            tokio::task::spawn(async move {
-                for _ in 1..=6 {
-                    let msg = crate::network::NetworkMessage::JoinRequest {
-                        sender_id: my_peer_id,
-                    };
-                    let _ = net.send_packet(addr, &msg).await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(350)).await;
-                    if !room_clone.get_all_peers().is_empty() {
-                        break;
-                    }
-                }
+    let p2p_clone = p2p.clone();
+    let target_node_id = raw_addr.to_string();
+    let my_peer_id = my_id;
+
+    is_host.store(false, Ordering::SeqCst);
+    println!(
+        "[СЕТЬ] Подключение к узлу (Iroh P2P). Цель: {}",
+        target_node_id
+    );
+
+    tokio::task::spawn(async move {
+        println!("[IROH] Попытка P2P-подключения к NodeID: {}", target_node_id);
+        match p2p_clone.connect_to_peer(&target_node_id).await {
+            Ok(()) => {
+                println!("[IROH] Прямое P2P-подключение установлено");
                 let hello_msg = crate::network::NetworkMessage::Heartbeat {
                     sender_id: my_peer_id,
                     is_host: false,
                 };
                 let bytes = crate::network::message::serialize_msg(&hello_msg);
-                let _ = net.send_audio_packet(addr, &bytes).await;
-            });
-            is_host.store(false, Ordering::SeqCst);
+                p2p_clone.broadcast_bytes(&bytes).await;
+            }
+            Err(e) => eprintln!("[IROH] Ошибка P2P-подключения по NodeID: {}", e),
         }
-        Err(e) => eprintln!("[ОШИБКА] Неверный адрес: {}", e),
-    }
+    });
 }

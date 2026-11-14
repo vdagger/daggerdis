@@ -20,13 +20,10 @@ pub struct RadioApp {
     ptt_flag: Arc<AtomicBool>,
     room: Arc<crate::room::RoomManager>,
     connect_ip_input: String,
-    connect_port_input: String,
-    my_external_ip: String,
     selected_input: Arc<std::sync::atomic::AtomicU32>,
     selected_output: Arc<std::sync::atomic::AtomicU32>,
-    network: Arc<crate::network::NetworkManager>,
+    iroh: Option<Arc<crate::network::p2p_iroh::IrohP2pManager>>,
     my_id: u64,
-    ext_ip: Arc<Mutex<String>>,
     mic_stream: Arc<Mutex<Option<cpal::Stream>>>,
     prev_input_index: std::sync::atomic::AtomicU32,
     packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -44,6 +41,7 @@ pub struct RadioApp {
     config: crate::config::AppConfig,
     friends: Arc<crate::friends::FriendsManager>,
     my_node_id: String,
+    network_error: Option<String>,
     nick: String,
     add_friend_node: String,
     reset_note: Option<String>,
@@ -59,9 +57,8 @@ impl RadioApp {
         ptt_flag: Arc<AtomicBool>,
         selected_input: Arc<std::sync::atomic::AtomicU32>,
         selected_output: Arc<std::sync::atomic::AtomicU32>,
-        network: Arc<crate::network::NetworkManager>,
+        iroh: Option<Arc<crate::network::p2p_iroh::IrohP2pManager>>,
         my_id: u64,
-        ext_ip: Arc<Mutex<String>>,
         mic_stream: Arc<Mutex<Option<cpal::Stream>>>,
         packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         input_devices: Vec<String>,
@@ -73,6 +70,7 @@ impl RadioApp {
         config: crate::config::AppConfig,
         friends: Arc<crate::friends::FriendsManager>,
         my_node_id: String,
+        network_error: Option<String>,
     ) -> Self {
         let initial_input = selected_input.load(std::sync::atomic::Ordering::Relaxed);
         let initial_output = selected_output.load(std::sync::atomic::Ordering::Relaxed);
@@ -84,13 +82,10 @@ impl RadioApp {
             ptt_flag,
             room,
             connect_ip_input: String::new(),
-            connect_port_input: "8080".to_string(),
-            my_external_ip: String::new(),
             selected_input,
             selected_output,
-            network,
+            iroh,
             my_id,
-            ext_ip,
             mic_stream,
             prev_input_index: std::sync::atomic::AtomicU32::new(initial_input),
             packet_tx,
@@ -108,6 +103,7 @@ impl RadioApp {
             config,
             friends,
             my_node_id,
+            network_error,
             nick,
             add_friend_node: String::new(),
             reset_note: None,
@@ -182,10 +178,6 @@ impl RadioApp {
 impl eframe::App for RadioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
-
-        if let Ok(ip_lock) = self.ext_ip.try_lock() {
-            self.my_external_ip = ip_lock.clone();
-        }
 
         let current_input_index = self
             .selected_input
@@ -305,6 +297,19 @@ impl RadioApp {
                 let peer_count = self.room.get_all_peers().len();
                 let is_host = self.is_host.load(std::sync::atomic::Ordering::Relaxed);
 
+                if let Some(err) = &self.network_error {
+                    egui::Frame::none()
+                        .fill(t::with_alpha(t::REC, 0.12))
+                        .rounding(Rounding::same(10.0))
+                        .stroke(Stroke::new(1.0_f32, t::with_alpha(t::REC, 0.4)))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new(err).size(11.0).color(t::REC));
+                        });
+                    ui.add_space(10.0);
+                }
+
                 crate::widgets::hero::draw_hero(ui, level, transmitting, is_host, wave, peer_count);
 
                 ui.add_space(12.0);
@@ -339,12 +344,11 @@ impl RadioApp {
                         crate::widgets::room_panel::draw_room_panel(
                             ui,
                             &mut self.connect_ip_input,
-                            &mut self.connect_port_input,
-                            self.network.clone(),
+                            self.iroh.clone(),
                             self.my_id,
                             self.is_host.clone(),
                             self.room.clone(),
-                            &self.my_external_ip,
+                            &self.my_node_id,
                         );
                     });
 
@@ -360,7 +364,7 @@ impl RadioApp {
                         crate::widgets::friends_panel::draw_friends_panel(
                             ui,
                             &self.friends,
-                            self.network.clone(),
+                            self.iroh.clone(),
                             self.my_id,
                             &self.my_node_id,
                             &self.nick,

@@ -1,4 +1,4 @@
-use crate::network::NetworkManager;
+use crate::network::p2p_iroh::IrohP2pManager;
 use crate::network::NetworkMessage;
 use crate::room::RoomManager;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,27 +8,23 @@ use tokio::time::interval;
 
 pub struct MigrationManager {
     room: Arc<RoomManager>,
-    network: Arc<NetworkManager>,
+    iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,
 }
 
 impl MigrationManager {
-    pub fn new(my_id: u64, room: Arc<RoomManager>, network: Arc<NetworkManager>) -> Self {
-        MigrationManager {
-            room,
-            network,
-            my_id,
-        }
+    pub fn new(my_id: u64, room: Arc<RoomManager>, iroh: Option<Arc<IrohP2pManager>>) -> Self {
+        MigrationManager { room, iroh, my_id }
     }
 
-    pub async fn start_heartbeat_loop(&self, is_host: Arc<AtomicBool>, room_id: String) {
+    pub async fn start_heartbeat_loop(&self, is_host: Arc<AtomicBool>) {
         let mut interval = interval(Duration::from_millis(1000));
         loop {
             interval.tick().await;
 
             let my_is_host = is_host.load(Ordering::Relaxed);
-            // Рассылаем IrohSync через Iroh P2P для Full-Mesh связности
-            if let Some(ref p2p) = self.network.iroh {
+            // Рассылаем IrohSync через Iroh P2P для Full-Mesh связности и анонса хоста
+            if let Some(ref p2p) = self.iroh {
                 let sync_msg = NetworkMessage::IrohSync {
                     sender_id: self.my_id,
                     node_id: p2p.my_node_id.clone(),
@@ -58,42 +54,13 @@ impl MigrationManager {
                 self.room.remove_peer(dead_id);
             }
 
-            let peers = self.room.get_all_peers();
-            for peer in &peers {
-                // Пропускаем Iroh-пиры для отправки по сырому UDP
-                if peer.address.starts_with("Iroh:") {
-                    continue;
-                }
-                match peer.address.parse::<std::net::SocketAddr>() {
-                    Ok(addr) => {
-                        let heartbeat_msg = NetworkMessage::Heartbeat {
-                            sender_id: self.my_id,
-                            is_host: my_is_host,
-                        };
-                        if let Err(e) = self.network.send_packet(addr, &heartbeat_msg).await {
-                            eprintln!(
-                                "[ОШИБКА] Не удалось отправить Heartbeat на {} (ID={}): {}",
-                                addr, peer.id, e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[ОШИБКА] Некорректный адрес пира '{}' (ID={}): {}",
-                            peer.address, peer.id, e
-                        );
-                    }
-                }
-            }
-
-            // Если узел НЕ является хостом (!my_is_host), он дополнительно проверяет доступность текущего хоста
+            // Если узел НЕ является хостом, он проверяет доступность текущего хоста
             if !my_is_host {
                 let now = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64;
 
-                // Получаем свежий список пиров перед проверкой доступности хоста
                 let current_peers = self.room.get_all_peers();
                 let host_opt = current_peers.iter().find(|p| p.is_host);
                 if let Some(host) = host_opt {
@@ -104,17 +71,17 @@ impl MigrationManager {
                             host.id,
                             now.saturating_sub(host.last_heartbeat)
                         );
-                        self.migrate_host(is_host.clone(), room_id.clone()).await;
+                        self.migrate_host(is_host.clone()).await;
                     }
                 } else if !current_peers.is_empty() {
                     println!("[МИГРАЦИЯ] В комнате нет активного хоста. Инициируем выборы!");
-                    self.migrate_host(is_host.clone(), room_id.clone()).await;
+                    self.migrate_host(is_host.clone()).await;
                 }
             }
         }
     }
 
-    async fn migrate_host(&self, is_host: Arc<AtomicBool>, _room_id: String) {
+    async fn migrate_host(&self, is_host: Arc<AtomicBool>) {
         let peers = self.room.get_all_peers();
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -164,7 +131,7 @@ impl MigrationManager {
                     new_host_id: self.my_id,
                 };
                 let serialized = crate::network::message::serialize_msg(&msg);
-                if let Some(ref p2p) = self.network.iroh {
+                if let Some(ref p2p) = self.iroh {
                     p2p.broadcast_bytes(&serialized).await;
                 }
             } else {

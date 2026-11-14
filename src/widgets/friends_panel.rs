@@ -3,7 +3,6 @@
 use crate::friends::FriendsManager;
 use crate::gui::theme as t;
 use crate::network::p2p_iroh::IrohP2pManager;
-use crate::network::NetworkManager;
 use eframe::egui;
 use egui::{Color32, Rounding, Stroke};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,7 +103,7 @@ fn card_frame() -> egui::Frame {
 pub fn draw_friends_panel(
     ui: &mut egui::Ui,
     friends: &Arc<FriendsManager>,
-    network: Arc<NetworkManager>,
+    iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,
     my_node_id: &str,
     nick: &str,
@@ -112,7 +111,7 @@ pub fn draw_friends_panel(
     add_friend_node: &mut String,
 ) {
     let row_width = ui.available_width();
-    let p2p = network.iroh.clone();
+    let p2p = iroh;
 
     ui.horizontal(|ui| {
         t::section_label(ui, "ДРУЗЬЯ");
