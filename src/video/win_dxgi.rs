@@ -9,7 +9,6 @@ use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID
 use windows::Win32::Graphics::Dxgi::*;
 
 use super::win_d3d::{create_device, Converter};
-use super::VideoTarget;
 
 pub struct ScreenCapture {
     #[allow(dead_code)]
@@ -27,7 +26,8 @@ pub struct ScreenCapture {
 }
 
 impl ScreenCapture {
-    pub fn new(target: &VideoTarget) -> Result<Self, String> {
+    /// `requested = None` — захватываем в нативном разрешении монитора.
+    pub fn new(requested: Option<(u32, u32)>, fps: u32) -> Result<Self, String> {
         unsafe {
             let factory: IDXGIFactory1 =
                 CreateDXGIFactory1().map_err(|e| format!("CreateDXGIFactory1: {e}"))?;
@@ -79,14 +79,17 @@ impl ScreenCapture {
                         continue;
                     }
 
+                    let (dst_w, dst_h) = requested.unwrap_or((src_w, src_h));
                     let converter = Converter::new(
                         &d3d.device,
                         &d3d.context,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
                         src_w,
                         src_h,
-                        target.width,
-                        target.height,
-                        target.fps,
+                        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12,
+                        dst_w,
+                        dst_h,
+                        fps,
                     )?;
 
                     return Ok(Self {
@@ -94,8 +97,8 @@ impl ScreenCapture {
                         context: d3d.context,
                         duplication,
                         converter,
-                        out_width: target.width,
-                        out_height: target.height,
+                        out_width: dst_w,
+                        out_height: dst_h,
                         adapter_name,
                         source_width: src_w,
                         source_height: src_h,
@@ -125,7 +128,7 @@ impl ScreenCapture {
                 .as_ref()
                 .and_then(|r| r.cast::<ID3D11Texture2D>().ok());
             let result = match texture {
-                Some(t) => self.converter.to_nv12(&t).map(Some),
+                Some(t) => self.converter.convert_and_read(&t).map(Some),
                 None => Ok(None),
             };
             // освобождать кадр надо до следующего AcquireNextFrame

@@ -13,7 +13,11 @@
 //! без изменений в кодеке и транспорте.
 
 #[cfg(windows)]
+pub mod publisher;
+#[cfg(windows)]
 pub mod win_d3d;
+#[cfg(windows)]
+pub mod win_decode;
 #[cfg(windows)]
 pub mod win_dxgi;
 #[cfg(windows)]

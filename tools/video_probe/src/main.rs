@@ -148,8 +148,10 @@ fn main() {
         let mut conv = match win_d3d::Converter::new(
             &d3d.device,
             &d3d.context,
+            win_d3d::FORMAT_BGRA,
             target.width,
             target.height,
+            win_d3d::FORMAT_NV12,
             target.width,
             target.height,
             target.fps,
@@ -169,8 +171,8 @@ fn main() {
         let start = Instant::now();
         for i in 0..frames {
             fill_bgra(&mut bgra, target.width, target.height, i as u32);
-            win_d3d::upload_bgra(&d3d.context, &tex, target.width, target.height, &bgra);
-            let nv12 = match conv.to_nv12(&tex) {
+            win_d3d::upload_bgra(&d3d.context, &tex, target.width, &bgra);
+            let nv12 = match conv.convert_and_read(&tex) {
                 Ok(v) => v,
                 Err(e) => {
                     println!("ОШИБКА конверсии на кадре {i}: {e}");
@@ -215,8 +217,7 @@ fn main() {
         use albus::video::win_dxgi::ScreenCapture;
         use std::time::{Duration, Instant};
 
-        let target = target_for(2560, 1440, 60);
-        let mut cap = match ScreenCapture::new(&target) {
+        let mut cap = match ScreenCapture::new(None, 60) {
             Ok(c) => c,
             Err(e) => {
                 println!("ОШИБКА захвата: {e}");
@@ -224,13 +225,10 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        let (out_w, out_h) = cap.dimensions();
         println!(
             "Экран: {} {}x{} → {}x{}",
-            cap.adapter_name,
-            cap.source_width,
-            cap.source_height,
-            target.width,
-            target.height
+            cap.adapter_name, cap.source_width, cap.source_height, out_w, out_h
         );
 
         let deadline = Instant::now() + Duration::from_secs(seconds);
@@ -243,7 +241,7 @@ fn main() {
                 Ok(Some(buf)) => {
                     frames += 1;
                     bytes += buf.len() as u64;
-                    let n = (target.width * target.height) as usize;
+                    let n = (out_w * out_h) as usize;
                     last_y = buf[..n.min(buf.len())]
                         .iter()
                         .map(|&v| v as u64)

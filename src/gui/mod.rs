@@ -4,6 +4,9 @@ pub mod theme;
 
 mod stream_control;
 
+#[cfg(windows)]
+mod video_session;
+
 use eframe::egui;
 use egui::{FontFamily, FontId, Rounding, Stroke, TextStyle};
 use std::collections::VecDeque;
@@ -47,6 +50,10 @@ pub struct RadioApp {
     reset_note: Option<String>,
     pending_save: bool,
     last_save: Instant,
+    #[cfg(windows)]
+    video: Option<video_session::VideoSession>,
+    #[cfg(windows)]
+    video_error: Option<String>,
 }
 
 impl RadioApp {
@@ -109,6 +116,10 @@ impl RadioApp {
             reset_note: None,
             pending_save: false,
             last_save: Instant::now(),
+            #[cfg(windows)]
+            video: None,
+            #[cfg(windows)]
+            video_error: None,
         }
     }
 
@@ -178,6 +189,11 @@ impl RadioApp {
 impl eframe::App for RadioApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
+
+        #[cfg(windows)]
+        if let Some(video) = &mut self.video {
+            video.poll(ctx);
+        }
 
         let current_input_index = self
             .selected_input
@@ -314,6 +330,12 @@ impl RadioApp {
 
                 ui.add_space(12.0);
 
+                #[cfg(windows)]
+                {
+                    self.draw_video_panel(ui);
+                    ui.add_space(12.0);
+                }
+
                 crate::widgets::ptt_button::draw_ptt_button(
                     ui,
                     &self.ptt_flag,
@@ -385,6 +407,89 @@ impl RadioApp {
                     });
 
                 ui.add_space(10.0);
+            });
+    }
+
+    /// Трансляция экрана: запуск/остановка и локальное превью.
+    #[cfg(windows)]
+    fn draw_video_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(t::SURFACE)
+            .rounding(Rounding::same(12.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE))
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let running = self.video.is_some();
+
+                ui.horizontal(|ui| {
+                    let label = if running {
+                        "Остановить трансляцию"
+                    } else {
+                        "Транслировать экран"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(label).size(11.0).strong())
+                                .rounding(Rounding::same(8.0)),
+                        )
+                        .clicked()
+                    {
+                        if running {
+                            self.video = None;
+                        } else {
+                            match video_session::VideoSession::start() {
+                                Ok(v) => {
+                                    self.video = Some(v);
+                                    self.video_error = None;
+                                }
+                                Err(e) => self.video_error = Some(e),
+                            }
+                        }
+                    }
+
+                    if let Some(v) = &self.video {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {} кадров",
+                                v.source,
+                                v.frames()
+                            ))
+                            .size(10.0)
+                            .color(t::TEXT_MUTED),
+                        );
+                    }
+                });
+
+                if let Some(err) = &self.video_error {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(err).size(10.5).color(t::REC));
+                }
+
+                if let Some(v) = &self.video {
+                    ui.add_space(6.0);
+                    match v.texture() {
+                        Some(tex) => {
+                            let (w, h) = v.size();
+                            let avail = ui.available_width();
+                            let scale = (avail / w as f32).min(1.0);
+                            let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+                            let img = egui::Image::new(egui::load::SizedTexture::new(
+                                tex.id(),
+                                size,
+                            ))
+                            .rounding(Rounding::same(8.0));
+                            ui.add(img);
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new("Жду первый кадр…")
+                                    .size(10.5)
+                                    .color(t::TEXT_MUTED),
+                            );
+                        }
+                    }
+                }
             });
     }
 

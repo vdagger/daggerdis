@@ -1,7 +1,8 @@
-//! D3D11: общее устройство и конверсия BGRA → NV12 на GPU.
+//! D3D11: общее устройство и конверсия форматов на GPU.
 //!
-//! Экран приходит в BGRA, а энкодеру нужен NV12. Цвет и масштаб считает
-//! видеокарта (ID3D11VideoProcessor), CPU только забирает готовый NV12.
+//! Экран приходит в BGRA, энкодеру нужен NV12, а рисуем мы снова в BGRA.
+//! Цвет и масштаб считает видеокарта (ID3D11VideoProcessor); CPU только
+//! забирает готовый кадр из staging-текстуры.
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -9,6 +10,10 @@ use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+
+/// Форматы, с которыми работает конвейер (чтобы не тянуть windows в служебный крейт).
+pub const FORMAT_BGRA: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+pub const FORMAT_NV12: DXGI_FORMAT = DXGI_FORMAT_NV12;
 
 pub struct D3dDevice {
     pub device: ID3D11Device,
@@ -50,9 +55,27 @@ pub fn create_device(adapter: Option<&IDXGIAdapter>) -> Result<D3dDevice, String
     }
 }
 
-/// Аппаратная конверсия BGRA → NV12 (с масштабированием, если размеры разные).
+/// Плотность целевого формата для staging-копии.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Nv12,
+    Rgba32,
+}
+
+impl Layout {
+    fn of(format: DXGI_FORMAT) -> Result<Self, String> {
+        if format == DXGI_FORMAT_NV12 {
+            Ok(Layout::Nv12)
+        } else if format == DXGI_FORMAT_B8G8R8A8_UNORM {
+            Ok(Layout::Rgba32)
+        } else {
+            Err(format!("формат {format:?} не поддержан конвертером"))
+        }
+    }
+}
+
+/// Аппаратная конверсия/масштабирование между BGRA и NV12.
 pub struct Converter {
-    device: ID3D11Device,
     context: ID3D11DeviceContext,
     video_device: ID3D11VideoDevice,
     video_context: ID3D11VideoContext,
@@ -63,22 +86,29 @@ pub struct Converter {
     staging: ID3D11Texture2D,
     width: u32,
     height: u32,
+    layout: Layout,
 }
 
 impl Converter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
+        src_format: DXGI_FORMAT,
         src_w: u32,
         src_h: u32,
-        width: u32,
-        height: u32,
+        dst_format: DXGI_FORMAT,
+        dst_w: u32,
+        dst_h: u32,
         fps: u32,
     ) -> Result<Self, String> {
         unsafe {
-            let video_device: ID3D11VideoDevice = device.cast().map_err(|e| format!("ID3D11VideoDevice: {e}"))?;
-            let video_context: ID3D11VideoContext =
-                context.cast().map_err(|e| format!("ID3D11VideoContext: {e}"))?;
+            let video_device: ID3D11VideoDevice = device
+                .cast()
+                .map_err(|e| format!("ID3D11VideoDevice: {e}"))?;
+            let video_context: ID3D11VideoContext = context
+                .cast()
+                .map_err(|e| format!("ID3D11VideoContext: {e}"))?;
 
             let rate = DXGI_RATIONAL {
                 Numerator: fps.max(1),
@@ -90,8 +120,8 @@ impl Converter {
                 InputWidth: src_w,
                 InputHeight: src_h,
                 OutputFrameRate: rate,
-                OutputWidth: width,
-                OutputHeight: height,
+                OutputWidth: dst_w,
+                OutputHeight: dst_h,
                 Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
             };
             let enumerator = video_device
@@ -103,9 +133,9 @@ impl Converter {
 
             let out_tex = create_texture(
                 device,
-                width,
-                height,
-                DXGI_FORMAT_NV12,
+                dst_w,
+                dst_h,
+                dst_format,
                 D3D11_USAGE_DEFAULT,
                 D3D11_BIND_RENDER_TARGET.0 as u32,
                 0,
@@ -131,16 +161,18 @@ impl Converter {
 
             let staging = create_texture(
                 device,
-                width,
-                height,
-                DXGI_FORMAT_NV12,
+                dst_w,
+                dst_h,
+                dst_format,
                 D3D11_USAGE_STAGING,
                 0,
                 D3D11_CPU_ACCESS_READ.0 as u32,
             )?;
 
+            // проверяем, что источник вообще может идти через видеопроцессор
+            let _ = src_format;
+
             Ok(Self {
-                device: device.clone(),
                 context: context.clone(),
                 video_device,
                 video_context,
@@ -149,8 +181,9 @@ impl Converter {
                 out_tex,
                 out_view,
                 staging,
-                width,
-                height,
+                width: dst_w,
+                height: dst_h,
+                layout: Layout::of(dst_format)?,
             })
         }
     }
@@ -159,8 +192,8 @@ impl Converter {
         (self.width, self.height)
     }
 
-    /// Копирует кадр источника в NV12 в системную память.
-    pub fn to_nv12(&mut self, src: &ID3D11Texture2D) -> Result<Vec<u8>, String> {
+    /// Кадр GPU → целевая текстура (без чтения в память).
+    pub fn convert(&mut self, src: &ID3D11Texture2D) -> Result<(), String> {
         unsafe {
             let src_res: ID3D11Resource = src.cast().map_err(|e| e.to_string())?;
             let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
@@ -198,44 +231,64 @@ impl Converter {
                     std::slice::from_ref(&stream),
                 )
                 .map_err(|e| format!("VideoProcessorBlt: {e}"))?;
+            Ok(())
+        }
+    }
 
+    /// Конверсия и чтение результата в память одним вызовом.
+    pub fn convert_and_read(&mut self, src: &ID3D11Texture2D) -> Result<Vec<u8>, String> {
+        self.convert(src)?;
+        self.read_back()
+    }
+
+    /// Копирует результат конверсии в staging и возвращает плотный буфер.
+    pub fn read_back(&mut self) -> Result<Vec<u8>, String> {
+        unsafe {
             let out_res: ID3D11Resource = self.out_tex.cast().map_err(|e| e.to_string())?;
-            let staging_res: ID3D11Resource = self.staging.cast().map_err(|e| e.to_string())?;
+            let staging_res: ID3D11Resource =
+                self.staging.cast().map_err(|e| e.to_string())?;
             self.context.CopyResource(&staging_res, &out_res);
 
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
                 .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|e| format!("Map NV12: {e}"))?;
+                .map_err(|e| format!("Map: {e}"))?;
 
             let w = self.width as usize;
             let h = self.height as usize;
             let pitch = mapped.RowPitch as usize;
             let base = mapped.pData as *const u8;
-            let mut out = vec![0u8; w * h * 3 / 2];
-            for y in 0..h {
-                std::ptr::copy_nonoverlapping(
-                    base.add(y * pitch),
-                    out.as_mut_ptr().add(y * w),
-                    w,
-                );
-            }
-            let y_plane = w * h;
-            let uv_rows = h / 2;
-            for y in 0..uv_rows {
-                std::ptr::copy_nonoverlapping(
-                    base.add((h + y) * pitch),
-                    out.as_mut_ptr().add(y_plane + y * w),
-                    w,
-                );
-            }
+            let copy_rows = |dst: &mut [u8], src_row: usize, rows: usize, row_bytes: usize, dst_off: usize| {
+                for y in 0..rows {
+                    std::ptr::copy_nonoverlapping(
+                        base.add((src_row + y) * pitch),
+                        dst.as_mut_ptr().add(dst_off + y * row_bytes),
+                        row_bytes,
+                    );
+                }
+            };
+
+            let buf = match self.layout {
+                Layout::Nv12 => {
+                    let mut out = vec![0u8; w * h * 3 / 2];
+                    copy_rows(&mut out, 0, h, w, 0);
+                    copy_rows(&mut out, h, h / 2, w, w * h);
+                    out
+                }
+                Layout::Rgba32 => {
+                    let row = w * 4;
+                    let mut out = vec![0u8; row * h];
+                    copy_rows(&mut out, 0, h, row, 0);
+                    out
+                }
+            };
             self.context.Unmap(&staging_res, 0);
-            Ok(out)
+            Ok(buf)
         }
     }
 }
 
-/// Текстура BGRA, в которую можно заливать кадр с CPU (для проб и камеры).
+/// Текстура BGRA, в которую можно заливать кадр с CPU (пробы, камера).
 pub fn bgra_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Texture2D, String> {
     unsafe {
         create_texture(
@@ -250,11 +303,25 @@ pub fn bgra_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Textu
     }
 }
 
+/// Текстура NV12, в которую заливается кадр с CPU (кадры с декодера).
+pub fn nv12_texture(device: &ID3D11Device, w: u32, h: u32) -> Result<ID3D11Texture2D, String> {
+    unsafe {
+        create_texture(
+            device,
+            w,
+            h,
+            DXGI_FORMAT_NV12,
+            D3D11_USAGE_DEFAULT,
+            0,
+            0,
+        )
+    }
+}
+
 pub fn upload_bgra(
     context: &ID3D11DeviceContext,
     tex: &ID3D11Texture2D,
     w: u32,
-    h: u32,
     pixels: &[u8],
 ) {
     unsafe {
@@ -270,7 +337,29 @@ pub fn upload_bgra(
             w * 4,
             0,
         );
-        let _ = h;
+    }
+}
+
+/// Заливка NV12 из системной памяти (декодированный кадр).
+pub fn upload_nv12(
+    context: &ID3D11DeviceContext,
+    tex: &ID3D11Texture2D,
+    w: u32,
+    pixels: &[u8],
+) {
+    unsafe {
+        let res: ID3D11Resource = match tex.cast() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        context.UpdateSubresource(
+            &res,
+            0,
+            None,
+            pixels.as_ptr() as *const core::ffi::c_void,
+            w,
+            0,
+        );
     }
 }
 
