@@ -452,7 +452,7 @@ unsafe fn enumerate_h264_decoders() -> Result<Vec<IMFActivate>, String> {
 
 unsafe fn activation_name(act: &IMFActivate) -> Option<String> {
     let mut buf = [0u16; 256];
-    let mut len = 0u32;
+    let mut len = buf.len() as u32;
     act.GetString(&MFT_FRIENDLY_NAME_Attribute, &mut buf, Some(&mut len))
         .ok()?;
     let end = buf.iter().position(|&c| c == 0).unwrap_or(len as usize);
