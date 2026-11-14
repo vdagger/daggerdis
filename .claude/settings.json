@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./target/**)",
+      "Read(./**/target/**)",
+      "Read(./**/*.exe)",
+      "Read(./**/*.dll)",
+      "Read(./**/*.pdb)"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+# ripgrep-native ignore list (honored even outside a git repository)
+target/
+*.exe
+*.dll
+*.pdb
+*.obj
+*.lib
+*.msi
+*.msix
+*.zip
+*.7z
+*.log
+.git/
