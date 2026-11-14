@@ -57,6 +57,8 @@ pub struct RadioApp {
     #[cfg(windows)]
     video_fullscreen: bool,
     #[cfg(windows)]
+    video_window: bool,
+    #[cfg(windows)]
     remote: Option<video_session::RemoteView>,
     #[cfg(windows)]
     video_link: Option<Arc<crate::network::video_link::VideoLink>>,
@@ -130,6 +132,8 @@ impl RadioApp {
             video_error: None,
             #[cfg(windows)]
             video_fullscreen: false,
+            #[cfg(windows)]
+            video_window: false,
             #[cfg(windows)]
             remote: None,
             #[cfg(windows)]
@@ -240,7 +244,11 @@ impl eframe::App for RadioApp {
                             sequence_header: frame.sequence_header.clone(),
                         };
                         match video_session::RemoteView::new(&info, frame.from.clone()) {
-                            Ok(v) => self.remote = Some(v),
+                            Ok(v) => {
+                                self.remote = Some(v);
+                                // зрителю не нужно искать кнопку — сразу открываем окно
+                                self.video_window = true;
+                            }
                             Err(e) => self.video_error = Some(e),
                         }
                     }
@@ -344,7 +352,7 @@ impl eframe::App for RadioApp {
             });
 
         #[cfg(windows)]
-        self.draw_fullscreen_video(ctx);
+        self.draw_video_window(ctx);
 
         self.persist_if_needed();
 
@@ -472,7 +480,7 @@ impl RadioApp {
     /// Трансляция экрана: запуск/остановка и локальное превью.
     #[cfg(windows)]
     fn draw_video_panel(&mut self, ui: &mut egui::Ui) {
-        let mut go_fullscreen = false;
+        let mut open_window = false;
         egui::Frame::none()
             .fill(t::SURFACE)
             .rounding(Rounding::same(12.0))
@@ -563,7 +571,7 @@ impl RadioApp {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                             }
                             if resp.clicked() {
-                                go_fullscreen = true;
+                                open_window = true;
                             }
                         }
                         None => {
@@ -576,7 +584,7 @@ impl RadioApp {
                     }
                     ui.add_space(2.0);
                     ui.label(
-                        egui::RichText::new("Клик по кадру — на весь экран (Esc — выход)")
+                        egui::RichText::new("Клик по кадру открывает окно просмотра")
                             .size(9.5)
                             .color(t::TEXT_MUTED),
                     );
@@ -609,65 +617,124 @@ impl RadioApp {
                         .rounding(Rounding::same(8.0))
                         .sense(egui::Sense::click());
                         if ui.add(img).clicked() {
-                            go_fullscreen = true;
+                            open_window = true;
                         }
                     }
                 }
             });
-        if go_fullscreen {
-            self.video_fullscreen = true;
+        if open_window {
+            self.video_window = true;
         }
     }
 
-    /// Просмотр трансляции на весь экран в отдельном окне.
+    /// Окно просмотра: отдельное, растягиваемое, с полноэкранным режимом.
     #[cfg(windows)]
-    fn draw_fullscreen_video(&mut self, ctx: &egui::Context) {
-        if !self.video_fullscreen || (self.video.is_none() && self.remote.is_none()) {
+    fn draw_video_window(&mut self, ctx: &egui::Context) {
+        let has_source = self.video.is_some() || self.remote.is_some();
+        if !self.video_window || !has_source {
+            self.video_window = false;
             self.video_fullscreen = false;
             return;
         }
+
         let close_requested = std::cell::Cell::new(false);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("Albus — трансляция")
+            .with_inner_size([1280.0, 720.0])
+            .with_min_inner_size([360.0, 240.0])
+            .with_resizable(true);
+        if self.video_fullscreen {
+            builder = builder.with_fullscreen(true);
+        }
+
         ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("video-fullscreen"),
-            egui::ViewportBuilder::default()
-                .with_title("Albus — трансляция")
-                .with_fullscreen(true)
-                .with_decorations(false),
+            egui::ViewportId::from_hash_of("video-window"),
+            builder,
             |ctx, _class| {
+                egui::TopBottomPanel::top("video-window-bar")
+                    .frame(
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(16, 18, 22))
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            let label = if self.video_fullscreen {
+                                "Выйти из полноэкранного"
+                            } else {
+                                "На весь экран"
+                            };
+                            if ui.button(label).clicked() {
+                                self.video_fullscreen = !self.video_fullscreen;
+                            }
+                            if let Some(remote) = &self.remote {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Смотрит: {} · {} кадров",
+                                        remote.peer,
+                                        remote.frames()
+                                    ))
+                                    .size(10.0)
+                                    .color(t::TEXT_MUTED),
+                                );
+                            } else if let Some(video) = &self.video {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {} кадров",
+                                        video.source,
+                                        video.frames()
+                                    ))
+                                    .size(10.0)
+                                    .color(t::TEXT_MUTED),
+                                );
+                            }
+                            if ui.button("Закрыть").clicked() {
+                                close_requested.set(true);
+                            }
+                        });
+                    });
+
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
-                        // приоритет у чужого потока: его и смотрят на весь экран
+                        // приоритет у чужого потока
                         let source = self
                             .remote
                             .as_ref()
                             .map(|r| (r.texture(), r.size()))
                             .or_else(|| self.video.as_ref().map(|v| (v.texture(), v.size())));
                         if let Some((Some(tex), (w, h))) = source {
-                            {
-                                let rect = ui.max_rect();
-                                let scale = (rect.width() / w as f32)
-                                    .min(rect.height() / h as f32);
-                                let size = egui::vec2(w as f32 * scale, h as f32 * scale);
-                                let img = egui::Image::new(egui::load::SizedTexture::new(
-                                    tex.id(),
-                                    size,
-                                ));
-                                ui.centered_and_justified(|ui| {
-                                    ui.add(img);
-                                });
+                            let rect = ui.max_rect();
+                            let scale =
+                                (rect.width() / w as f32).min(rect.height() / h as f32);
+                            let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+                            let img = egui::Image::new(egui::load::SizedTexture::new(
+                                tex.id(),
+                                size,
+                            ))
+                            .sense(egui::Sense::click());
+                            let resp = ui.centered_and_justified(|ui| ui.add(img)).inner;
+                            if resp.double_clicked() {
+                                self.video_fullscreen = !self.video_fullscreen;
                             }
                         }
-                        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            close_requested.set(true);
-                        }
                     });
+
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if self.video_fullscreen {
+                        self.video_fullscreen = false;
+                    } else {
+                        close_requested.set(true);
+                    }
+                }
                 if ctx.input(|i| i.viewport().close_requested()) {
                     close_requested.set(true);
                 }
             },
         );
+
         if close_requested.get() {
+            self.video_window = false;
             self.video_fullscreen = false;
         }
     }

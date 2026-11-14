@@ -44,12 +44,13 @@ impl VideoPreset {
     }
 
     /// Биты на пиксель кадра при H.264 и длинном GOP.
-    /// 0.085 при 2560x1440x60 даёт ~18 Мбит/с, при 1920x1080x60 — ~10 Мбит/с.
+    /// Рабочий стол и текст требуют больше, чем видео: 0.10 при 1920x1080x60
+    /// даёт ~12 Мбит/с, при 2560x1440x60 — ~22 Мбит/с.
     pub fn bits_per_pixel(self) -> f64 {
         match self {
-            VideoPreset::Low => 0.035,
-            VideoPreset::Balanced => 0.055,
-            VideoPreset::Quality => 0.085,
+            VideoPreset::Low => 0.04,
+            VideoPreset::Balanced => 0.07,
+            VideoPreset::Quality => 0.10,
         }
     }
 
