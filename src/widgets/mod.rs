@@ -1,6 +1,7 @@
 //! Модуль виджетов
 
 pub mod audio_settings;
+pub mod chat_panel;
 pub mod friends_panel;
 pub mod hero;
 pub mod identity;

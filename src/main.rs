@@ -39,6 +39,7 @@ fn main() {
     // между запусками не гарантирован
     let config = albus::config::AppConfig::load();
     let friends = Arc::new(albus::friends::FriendsManager::load());
+    let chat_log = Arc::new(albus::chat::ChatLog::new());
     let input_devices = DeviceSelector::get_input_devices();
     let input_channel_counts = DeviceSelector::get_input_channel_counts();
     let output_devices = DeviceSelector::get_output_devices();
@@ -138,6 +139,7 @@ fn main() {
         playback_tx.clone(),
         is_host.clone(),
         friends.clone(),
+        chat_log.clone(),
     );
     albus::network::broadcast::spawn_audio_broadcast(&rt, packet_rx, iroh_p2p.clone(), my_id);
 
@@ -196,6 +198,7 @@ fn main() {
                 playback_rx,
                 config,
                 friends,
+                chat_log,
                 my_node_id,
                 network_error,
             );

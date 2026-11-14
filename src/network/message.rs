@@ -31,6 +31,10 @@ pub enum NetworkMessage {
         sender_id: u64,
         node_id: String,
     },
+    ChatMessage {
+        sender_id: u64,
+        text: String,
+    },
 }
 
 /// Пишет строку как `длина u16 LE` + байты UTF-8 (единый формат для текстовых полей).
@@ -114,6 +118,11 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             data.extend_from_slice(&sender_id.to_le_bytes());
             push_str(&mut data, node_id);
         }
+        NetworkMessage::ChatMessage { sender_id, text } => {
+            data.push(9);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            push_str(&mut data, text);
+        }
     }
     data
 }
@@ -185,6 +194,12 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
             let mut off = 9;
             let node_id = read_str(bytes, &mut off)?;
             Some(NetworkMessage::FriendRemove { sender_id, node_id })
+        }
+        9 if bytes.len() >= 9 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let mut off = 9;
+            let text = read_str(bytes, &mut off)?;
+            Some(NetworkMessage::ChatMessage { sender_id, text })
         }
         _ => None,
     }

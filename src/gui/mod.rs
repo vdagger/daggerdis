@@ -43,6 +43,9 @@ pub struct RadioApp {
     wave: VecDeque<f32>,
     config: crate::config::AppConfig,
     friends: Arc<crate::friends::FriendsManager>,
+    chat_log: Arc<crate::chat::ChatLog>,
+    active_chat: Option<String>,
+    chat_input: String,
     my_node_id: String,
     network_error: Option<String>,
     nick: String,
@@ -86,6 +89,7 @@ impl RadioApp {
         playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
         config: crate::config::AppConfig,
         friends: Arc<crate::friends::FriendsManager>,
+        chat_log: Arc<crate::chat::ChatLog>,
         my_node_id: String,
         network_error: Option<String>,
     ) -> Self {
@@ -119,6 +123,9 @@ impl RadioApp {
             wave: VecDeque::new(),
             config,
             friends,
+            chat_log,
+            active_chat: None,
+            chat_input: String::new(),
             my_node_id,
             network_error,
             nick,
@@ -362,6 +369,10 @@ impl eframe::App for RadioApp {
 
 impl RadioApp {
     fn draw_main(&mut self, ui: &mut egui::Ui, level: f32, transmitting: bool, wave: &[f32]) {
+        if let Some(active) = self.active_chat.clone() {
+            self.chat_log.mark_read(&active);
+        }
+
         // Мягкий градиент и брендовое свечение вместо плоской заливки
         let full = ui.max_rect();
         let mut mesh = egui::Mesh::default();
@@ -454,6 +465,32 @@ impl RadioApp {
 
                 ui.add_space(10.0);
 
+                if let Some(active) = self.active_chat.clone() {
+                    ui.add_space(10.0);
+                    let mut close = false;
+                    egui::Frame::none()
+                        .fill(t::SURFACE)
+                        .rounding(Rounding::same(12.0))
+                        .stroke(Stroke::new(1.0_f32, t::STROKE))
+                        .inner_margin(egui::Margin::same(12.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            crate::widgets::chat_panel::draw_chat_panel(
+                                ui,
+                                &self.chat_log,
+                                &self.friends,
+                                &active,
+                                &mut self.chat_input,
+                                self.iroh.clone(),
+                                self.my_id,
+                                &mut close,
+                            );
+                        });
+                    if close {
+                        self.active_chat = None;
+                    }
+                }
+
                 egui::Frame::none()
                     .fill(t::SURFACE)
                     .rounding(Rounding::same(12.0))
@@ -470,6 +507,8 @@ impl RadioApp {
                             &self.nick,
                             self.is_host.clone(),
                             &mut self.add_friend_node,
+                            &self.chat_log,
+                            &mut self.active_chat,
                         );
                     });
 

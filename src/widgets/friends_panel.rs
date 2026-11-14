@@ -1,5 +1,6 @@
 ﻿//! Список друзей, входящие заявки и добавление нового друга
 
+use crate::chat::ChatLog;
 use crate::friends::FriendsManager;
 use crate::gui::theme as t;
 use crate::network::p2p_iroh::IrohP2pManager;
@@ -109,6 +110,8 @@ pub fn draw_friends_panel(
     nick: &str,
     is_host: Arc<AtomicBool>,
     add_friend_node: &mut String,
+    chat_log: &Arc<ChatLog>,
+    active_chat: &mut Option<String>,
 ) {
     let row_width = ui.available_width();
     let p2p = iroh;
@@ -194,12 +197,24 @@ pub fn draw_friends_panel(
                 ui.set_width(row_width - 20.0);
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(&friend.name)
-                                .size(12.5)
-                                .strong()
-                                .color(t::TEXT),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(&friend.name)
+                                    .size(12.5)
+                                    .strong()
+                                    .color(t::TEXT),
+                            );
+                            let unread = chat_log.unread(&friend.node_id);
+                            if unread > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("{}", unread))
+                                        .size(9.0)
+                                        .strong()
+                                        .color(Color32::WHITE)
+                                        .background_color(t::REC),
+                                );
+                            }
+                        });
                         ui.label(
                             egui::RichText::new(short_node_id(&friend.node_id))
                                 .monospace()
@@ -223,6 +238,22 @@ pub fn draw_friends_panel(
                             if let Some(ref p2p) = p2p {
                                 send_remove(p2p, &friend.node_id, my_id, my_node_id);
                             }
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Чат")
+                                        .size(10.5)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(t::BRAND)
+                                .rounding(Rounding::same(7.0)),
+                            )
+                            .clicked()
+                        {
+                            chat_log.mark_read(&friend.node_id);
+                            *active_chat = Some(friend.node_id.clone());
                         }
                         if ui
                             .add(

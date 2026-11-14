@@ -1,5 +1,6 @@
 //! Фоновый сервис приема и ретрансляции пакетов через Iroh P2P
 
+use crate::chat::ChatLog;
 use crate::friends::FriendsManager;
 use crate::network::p2p_iroh::IrohP2pManager;
 use crate::network::NetworkMessage;
@@ -25,6 +26,7 @@ pub fn spawn_iroh_receiver(
     playback_tx: Sender<(u64, u32, Vec<u8>)>,
     is_host: Arc<AtomicBool>,
     friends: Arc<FriendsManager>,
+    chat_log: Arc<ChatLog>,
 ) {
     if let Some(p2p) = iroh_p2p {
         let p2p_recv = p2p.clone();
@@ -32,6 +34,7 @@ pub fn spawn_iroh_receiver(
         let room_iroh = room.clone();
         let is_host_iroh = is_host.clone();
         let friends_iroh = friends.clone();
+        let chat_log_iroh = chat_log.clone();
 
         rt.spawn(async move {
             println!("[IROH] Слушатель входящих P2P пакетов активен.");
@@ -204,6 +207,23 @@ pub fn spawn_iroh_receiver(
                                 "[ДРУЗЬЯ] {} удалил вас из друзей.",
                                 pkt.sender_id
                             );
+                        }
+                        NetworkMessage::ChatMessage { sender_id, text } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            if !friends_iroh.is_friend(&pkt.sender_id) {
+                                eprintln!(
+                                    "[ЧАТ] Сообщение от незнакомца {} отброшено.",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+                            chat_log_iroh.push(&pkt.sender_id, crate::chat::ChatMessage {
+                                from_me: false,
+                                text,
+                                at: now,
+                            });
                         }
                     }
                 }
