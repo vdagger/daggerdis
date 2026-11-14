@@ -135,6 +135,11 @@ impl AudioMixer {
         volumes.get(&peer_id).copied().unwrap_or(100)
     }
 
+    /// Снимок всех per-peer громкостей (для сохранения в конфиг)
+    pub fn peer_volumes(&self) -> HashMap<u64, u32> {
+        self.peer_volumes.lock().unwrap().clone()
+    }
+
     pub fn is_mic_muted(&self) -> bool {
         self.mic_muted.load(Ordering::Relaxed)
     }

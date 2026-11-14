@@ -24,10 +24,14 @@ pub struct IrohP2pManager {
 }
 
 impl IrohP2pManager {
-    /// Инициализирует узел Iroh и подключается к сети релеев
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        println!("[IROH] Инициализация P2P-эндпоинта (пресет N0)...");
+    /// Инициализирует узел Iroh и подключается к сети релеев.
+    /// `secret_key` закрепляет личность: NodeID не меняется между запусками.
+    pub async fn new(
+        secret_key: iroh::SecretKey,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        println!("[IROH] Инициализация P2P-эндпоинта (пресет N0, закреплённый ключ)...");
         let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
             .alpns(vec![IROH_ALPN.to_vec()])
             .bind()
             .await?;

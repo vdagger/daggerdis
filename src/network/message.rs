@@ -25,6 +25,42 @@ pub enum NetworkMessage {
         node_id: String,
         is_host: bool,
     },
+    FriendRequest {
+        sender_id: u64,
+        node_id: String,
+        nick: String,
+    },
+    FriendAccept {
+        sender_id: u64,
+        node_id: String,
+        nick: String,
+    },
+    FriendRemove {
+        sender_id: u64,
+        node_id: String,
+    },
+}
+
+/// Пишет строку как `длина u16 LE` + байты UTF-8 (единый формат для текстовых полей).
+fn push_str(data: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    data.extend_from_slice(&(b.len() as u16).to_le_bytes());
+    data.extend_from_slice(b);
+}
+
+/// Читает строку из `bytes`, продвигая `offset`; `None` при обрезанных данных.
+fn read_str(bytes: &[u8], offset: &mut usize) -> Option<String> {
+    if *offset + 2 > bytes.len() {
+        return None;
+    }
+    let len = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]) as usize;
+    *offset += 2;
+    if *offset + len > bytes.len() {
+        return None;
+    }
+    let s = String::from_utf8(bytes[*offset..*offset + len].to_vec()).ok()?;
+    *offset += len;
+    Some(s)
 }
 
 pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
@@ -85,6 +121,31 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             let node_bytes = node_id.as_bytes();
             data.extend_from_slice(&(node_bytes.len() as u16).to_le_bytes());
             data.extend_from_slice(node_bytes);
+        }
+        NetworkMessage::FriendRequest {
+            sender_id,
+            node_id,
+            nick,
+        } => {
+            data.push(6);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            push_str(&mut data, node_id);
+            push_str(&mut data, nick);
+        }
+        NetworkMessage::FriendAccept {
+            sender_id,
+            node_id,
+            nick,
+        } => {
+            data.push(7);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            push_str(&mut data, node_id);
+            push_str(&mut data, nick);
+        }
+        NetworkMessage::FriendRemove { sender_id, node_id } => {
+            data.push(8);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            push_str(&mut data, node_id);
         }
     }
     data
@@ -189,6 +250,34 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
             } else {
                 None
             }
+        }
+        6 if bytes.len() >= 9 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let mut off = 9;
+            let node_id = read_str(bytes, &mut off)?;
+            let nick = read_str(bytes, &mut off)?;
+            Some(NetworkMessage::FriendRequest {
+                sender_id,
+                node_id,
+                nick,
+            })
+        }
+        7 if bytes.len() >= 9 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let mut off = 9;
+            let node_id = read_str(bytes, &mut off)?;
+            let nick = read_str(bytes, &mut off)?;
+            Some(NetworkMessage::FriendAccept {
+                sender_id,
+                node_id,
+                nick,
+            })
+        }
+        8 if bytes.len() >= 9 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let mut off = 9;
+            let node_id = read_str(bytes, &mut off)?;
+            Some(NetworkMessage::FriendRemove { sender_id, node_id })
         }
         _ => None,
     }

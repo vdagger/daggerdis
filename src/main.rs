@@ -18,7 +18,12 @@ fn main() {
     };
 
     let socket_addr: SocketAddr = local_addr.parse().unwrap();
-    let my_id: u64 = rand::random();
+
+    // Закреплённая личность: секретный ключ iroh (NodeID) и стабильный псевдоним my_id
+    let identity = albus::identity::Identity::load_or_create();
+    let my_id: u64 = identity.my_id;
+    let my_node_id: String = identity.node_id.clone();
+
     let ptt_flag = Arc::new(AtomicBool::new(false));
     let is_host = Arc::new(AtomicBool::new(true));
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -26,6 +31,7 @@ fn main() {
     // Загруженные настройки: устройства ищутся по имени, порядок индексов
     // между запусками не гарантирован
     let config = albus::config::AppConfig::load();
+    let friends = Arc::new(albus::friends::FriendsManager::load());
     let input_devices = DeviceSelector::get_input_devices();
     let input_channel_counts = DeviceSelector::get_input_channel_counts();
     let output_devices = DeviceSelector::get_output_devices();
@@ -45,12 +51,12 @@ fn main() {
 
     let selected_input = Arc::new(AtomicU32::new(input_index));
     let selected_output = Arc::new(AtomicU32::new(output_index));
-    let ext_ip = Arc::new(Mutex::new("Определение...".to_string()));
+    let ext_ip = Arc::new(Mutex::new(my_node_id.clone()));
     let mic_stream = Arc::new(Mutex::new(None));
 
-    // 2. Инициализация Iroh P2P
+    // 2. Инициализация Iroh P2P с закреплённым секретным ключом
     let iroh_p2p = rt.block_on(async {
-        match albus::network::p2p_iroh::IrohP2pManager::new().await {
+        match albus::network::p2p_iroh::IrohP2pManager::new(identity.secret_key).await {
             Ok(p2p) => {
                 println!("[IROH] Эндпоинт готов. NodeID: {}", p2p.my_node_id);
                 Some(Arc::new(p2p))
@@ -61,12 +67,6 @@ fn main() {
             }
         }
     });
-
-    if let Some(ref p2p) = iroh_p2p {
-        if let Ok(mut lock) = ext_ip.lock() {
-            *lock = p2p.my_node_id.clone();
-        }
-    }
 
     // 3. Сетевой сокет UDP + UPnP + STUN
     let std_socket = std::net::UdpSocket::bind(socket_addr).unwrap_or_else(|e| {
@@ -125,6 +125,9 @@ fn main() {
     if let Some(c) = config.input2_channel {
         mixer.set_input2_channel(c);
     }
+    for (id, vol) in &config.peer_volumes {
+        mixer.set_peer_volume(*id, *vol);
+    }
     if let Some(vk) = config.ptt_vk {
         albus::keybind::CURRENT_VK.store(vk, std::sync::atomic::Ordering::Relaxed);
     }
@@ -172,6 +175,7 @@ fn main() {
         room.clone(),
         playback_tx.clone(),
         is_host.clone(),
+        friends.clone(),
     );
     albus::network::broadcast::spawn_audio_broadcast(
         &rt,
@@ -230,6 +234,8 @@ fn main() {
                 playback_stream,
                 playback_rx,
                 config,
+                friends,
+                my_node_id,
             )))
         }),
     )

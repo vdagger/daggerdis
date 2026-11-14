@@ -42,6 +42,11 @@ pub struct RadioApp {
     settings_open: bool,
     wave: VecDeque<f32>,
     config: crate::config::AppConfig,
+    friends: Arc<crate::friends::FriendsManager>,
+    my_node_id: String,
+    nick: String,
+    add_friend_node: String,
+    reset_note: Option<String>,
     pending_save: bool,
     last_save: Instant,
 }
@@ -66,9 +71,12 @@ impl RadioApp {
         playback_stream: Arc<Mutex<Option<cpal::Stream>>>,
         playback_rx: Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
         config: crate::config::AppConfig,
+        friends: Arc<crate::friends::FriendsManager>,
+        my_node_id: String,
     ) -> Self {
         let initial_input = selected_input.load(std::sync::atomic::Ordering::Relaxed);
         let initial_output = selected_output.load(std::sync::atomic::Ordering::Relaxed);
+        let nick = config.nick.clone().unwrap_or_else(|| "Гость".to_string());
 
         Self {
             mixer,
@@ -98,6 +106,11 @@ impl RadioApp {
             settings_open: false,
             wave: VecDeque::new(),
             config,
+            friends,
+            my_node_id,
+            nick,
+            add_friend_node: String::new(),
+            reset_note: None,
             pending_save: false,
             last_save: Instant::now(),
         }
@@ -336,6 +349,27 @@ impl RadioApp {
                     });
 
                 ui.add_space(10.0);
+
+                egui::Frame::none()
+                    .fill(t::SURFACE)
+                    .rounding(Rounding::same(12.0))
+                    .stroke(Stroke::new(1.0_f32, t::STROKE))
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        crate::widgets::friends_panel::draw_friends_panel(
+                            ui,
+                            &self.friends,
+                            self.network.clone(),
+                            self.my_id,
+                            &self.my_node_id,
+                            &self.nick,
+                            self.is_host.clone(),
+                            &mut self.add_friend_node,
+                        );
+                    });
+
+                ui.add_space(10.0);
             });
     }
 
@@ -370,6 +404,47 @@ impl RadioApp {
                     &self.mixer,
                     &mut self.ptt_bind,
                 );
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                t::section_label(ui, "ЛИЧНОСТЬ");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Ваше имя")
+                            .size(10.5)
+                            .color(t::TEXT_MUTED),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.nick).desired_width(160.0),
+                    );
+                });
+
+                ui.add_space(6.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Сбросить личность")
+                                .size(11.0)
+                                .strong()
+                                .color(t::REC),
+                        )
+                        .rounding(Rounding::same(8.0)),
+                    )
+                    .clicked()
+                {
+                    crate::identity::Identity::reset();
+                    self.reset_note =
+                        Some("Новый NodeID создан. Перезапустите приложение.".to_string());
+                }
+                if let Some(note) = &self.reset_note {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(note).size(9.5).color(t::TEXT_MUTED),
+                    );
+                }
             });
     }
 
@@ -409,6 +484,15 @@ impl RadioApp {
         let vk = crate::keybind::CURRENT_VK.load(std::sync::atomic::Ordering::Relaxed);
         if self.config.ptt_vk != Some(vk) {
             self.config.ptt_vk = Some(vk);
+            changed = true;
+        }
+        if self.config.nick.as_deref() != Some(self.nick.as_str()) {
+            self.config.nick = Some(self.nick.clone());
+            changed = true;
+        }
+        let peer_vols = self.mixer.peer_volumes();
+        if self.config.peer_volumes != peer_vols {
+            self.config.peer_volumes = peer_vols;
             changed = true;
         }
 

@@ -1,11 +1,21 @@
 //! Фоновый сервис приема и ретрансляции пакетов через Iroh P2P
 
+use crate::friends::FriendsManager;
 use crate::network::p2p_iroh::IrohP2pManager;
 use crate::network::NetworkMessage;
 use crate::room::RoomManager;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
+
+/// Проверяет, что `sender_id` из пакета — это наш хеш от аутентичного NodeID
+/// QUIC-соединения. Любой другой sender_id = попытка выдать себя за другого.
+fn sender_id_verified(remote_node_id: &str, sender_id: u64) -> bool {
+    match crate::identity::my_id_from_node_id(remote_node_id) {
+        Some(id) => id == sender_id,
+        None => false,
+    }
+}
 
 /// Запускает фоновую таску приема аудио и Heartbeat через Iroh, включая ретрансляцию (SFU) на хосте
 pub fn spawn_iroh_receiver(
@@ -14,16 +24,20 @@ pub fn spawn_iroh_receiver(
     room: Arc<RoomManager>,
     playback_tx: Sender<(u64, u32, Vec<u8>)>,
     is_host: Arc<AtomicBool>,
+    friends: Arc<FriendsManager>,
 ) {
     if let Some(p2p) = iroh_p2p {
         let p2p_recv = p2p.clone();
         let playback_tx_iroh = playback_tx.clone();
         let room_iroh = room.clone();
         let is_host_iroh = is_host.clone();
+        let friends_iroh = friends.clone();
 
         rt.spawn(async move {
             println!("[IROH] Слушатель входящих P2P пакетов активен.");
             while let Some(pkt) = p2p_recv.recv_packet().await {
+                // `pkt.sender_id` — это аутентичный NodeID удалённого узла (из QUIC/TLS).
+                // Хеш от него даёт ожидаемый sender_id; всё остальное отбрасываем.
                 if let Some(msg) = crate::network::message::deserialize_msg(&pkt.data) {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -36,6 +50,18 @@ pub fn spawn_iroh_receiver(
                             node_id,
                             is_host: peer_is_host,
                         } => {
+                            // Узел обязан назвать в пакете тот же NodeID, что у соединения,
+                            // а sender_id должен быть хешем этого NodeID.
+                            if !sender_id_verified(&pkt.sender_id, sender_id)
+                                || node_id != pkt.sender_id
+                            {
+                                eprintln!(
+                                    "[БЕЗОПАСНОСТЬ] IrohSync с чужим sender_id/NodeID от {} отброшен",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+
                             // 1. Сохраняем пира с ПОЛНЫМ 64-символьным NodeID
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
@@ -48,6 +74,7 @@ pub fn spawn_iroh_receiver(
                             if node_id != p2p_recv.my_node_id {
                                 let p2p_connect = p2p_recv.clone();
                                 let target_id = node_id.clone();
+                                let friends_resend = friends_iroh.clone();
                                 tokio::spawn(async move {
                                     let connected = p2p_connect.get_connected_peers().await;
                                     if !connected.contains(&target_id) {
@@ -57,6 +84,13 @@ pub fn spawn_iroh_receiver(
                                         );
                                         let _ = p2p_connect.connect_to_peer(&target_id).await;
                                     }
+                                    // Повторно шлём не доставленные заявки после соединения
+                                    crate::friends::resend_pending_to(
+                                        friends_resend.as_ref(),
+                                        &p2p_connect,
+                                        &target_id,
+                                    )
+                                    .await;
                                 });
                             }
 
@@ -84,6 +118,9 @@ pub fn spawn_iroh_receiver(
                             seq,
                             opus_data,
                         } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
                             let is_peer_host = room_iroh
                                 .get_all_peers()
                                 .iter()
@@ -105,6 +142,9 @@ pub fn spawn_iroh_receiver(
                             sender_id,
                             is_host: peer_is_host,
                         } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
                                 address: format!("Iroh:{}", pkt.sender_id),
@@ -117,6 +157,53 @@ pub fn spawn_iroh_receiver(
                                     .broadcast_bytes_except(&pkt.sender_id, &pkt.data)
                                     .await;
                             }
+                        }
+                        NetworkMessage::FriendRequest {
+                            sender_id, nick, ..
+                        } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                eprintln!(
+                                    "[БЕЗОПАСНОСТЬ] FriendRequest с чужим sender_id от {} отброшен",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+                            friends_iroh.add_incoming(crate::friends::FriendRequest {
+                                sender_id,
+                                node_id: pkt.sender_id.clone(),
+                                nick: nick.clone(),
+                            });
+                            println!(
+                                "[ДРУЗЬЯ] Входящая заявка от {} ({}).",
+                                nick, pkt.sender_id
+                            );
+                        }
+                        NetworkMessage::FriendAccept {
+                            sender_id,
+                            node_id,
+                            nick,
+                        } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id)
+                                || node_id != pkt.sender_id
+                            {
+                                eprintln!(
+                                    "[БЕЗОПАСНОСТЬ] FriendAccept с чужим sender_id/NodeID от {} отброшен",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+                            friends_iroh.resolve_outgoing(&node_id, &nick);
+                            println!("[ДРУЗЬЯ] {} принял заявку.", nick);
+                        }
+                        NetworkMessage::FriendRemove { sender_id, .. } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            friends_iroh.remove_friend(&pkt.sender_id);
+                            println!(
+                                "[ДРУЗЬЯ] {} удалил вас из друзей.",
+                                pkt.sender_id
+                            );
                         }
                         _ => {}
                     }
