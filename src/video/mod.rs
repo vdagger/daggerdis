@@ -13,6 +13,10 @@
 //! без изменений в кодеке и транспорте.
 
 #[cfg(windows)]
+pub mod win_d3d;
+#[cfg(windows)]
+pub mod win_dxgi;
+#[cfg(windows)]
 pub mod win_mf;
 
 /// Пресет качества.
