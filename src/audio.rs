@@ -89,18 +89,30 @@ impl UniversalAudioCapture {
                 let mut peak1 = 0.0f32;
                 let mut peak2 = 0.0f32;
 
-                // Сводим выбранные входы в моно с независимым усилением
+                // Сводим выбранные входы в моно с независимым усилением.
+                // Нормируем по числу активных каналов, чтобы сумма не превышала 1.0
+                // (иначе при двух каналах на 100% уровень удваивается и жёстко клиппится).
                 for chunk in data.chunks_exact(total_channels) {
                     let mut sample = 0.0f32;
+                    let mut active = 0u32;
                     if (ch1 as usize) < total_channels {
                         let v1 = chunk[ch1 as usize];
                         peak1 = peak1.max(v1.abs());
-                        sample += v1 * gain1;
+                        if gain1 > 0.0 {
+                            sample += v1 * gain1;
+                            active += 1;
+                        }
                     }
                     if (ch2 as usize) < total_channels {
                         let v2 = chunk[ch2 as usize];
                         peak2 = peak2.max(v2.abs());
-                        sample += v2 * gain2;
+                        if gain2 > 0.0 {
+                            sample += v2 * gain2;
+                            active += 1;
+                        }
+                    }
+                    if active > 1 {
+                        sample /= active as f32;
                     }
                     mono_chunk.push(sample.clamp(-1.0, 1.0));
                 }
