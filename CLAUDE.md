@@ -81,6 +81,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/types.rs` | `Peer { id, address, is_host, last_heartbeat }` — `address` holds the bare NodeID |
 | `src/identity.rs` | Pinned iroh `SecretKey` (`secret.key`), `my_id` = FNV-1a hash of NodeID, reset |
 | `src/friends.rs` | `FriendsManager`: `friends.json` (node_id/name/date), incoming/outgoing requests |
+| `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate |
@@ -100,7 +101,8 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/widgets/audio_settings.rs` | Settings grid: VU meter, sliders, device lists |
 | `src/widgets/info_panel.rs` | Header: logo, user ID, copyable NodeID, settings entry |
 | `src/widgets/identity.rs` | "Мой NodeID" block: full ID + copy button/click-to-copy |
-| `src/widgets/friends_panel.rs` | Friends list, incoming requests, add-friend, call/remove |
+| `src/widgets/friends_panel.rs` | Friends list, incoming requests, add-friend, call/remove, chat button + unread |
+| `src/widgets/chat_panel.rs` | DM chat: message bubbles, input, send over iroh datagrams |
 | `src/widgets/ptt_button.rs` | Hands-free toggle, on-screen PTT, TX indicator |
 | `src/video/mod.rs` | OS-independent: `VideoPreset`/`VideoTarget` (bitrate from pixel count), `StreamInfo`, `EncodedUnit` |
 | `src/video/win_dxgi.rs` | DXGI Desktop Duplication capture; `next_nv12()` returns one frame as NV12 or `None` |
@@ -129,6 +131,7 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 6 | `FriendRequest` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 7 | `FriendAccept` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 8 | `FriendRemove` | `sender_id` u64 LE, `node_id` str |
+| 9 | `ChatMessage` | `sender_id` u64 LE, `text` str |
 
 Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP mesh.
 
@@ -180,6 +183,11 @@ video window. Peers who join mid-stream are not subscribed yet.
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
   commands are not currently reachable.
+- **Chat (DM):** session-only and in-memory (`src/chat.rs`, never persisted) — by
+  design, so chat history cannot leak to disk. Friends-only: messages from non-friends
+  are dropped. Transport is iroh **datagrams** (same as friends/control), so delivery
+  is best-effort with no ack/retry; a dropped datagram loses the message. Text is
+  capped to 1024 bytes on send (QUIC datagram MTU).
 - **Video pipeline (Windows):** DXGI capture (BGRA, GPU) → `ID3D11VideoProcessor`
   converts/scales to NV12 on the GPU → hardware H.264 MFT → iroh → decoder MFT →
   NV12 → Video Processor → BGRA → egui texture. Bitrate is `pixels × fps ×

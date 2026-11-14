@@ -19,6 +19,7 @@
 * **Глобальный PTT (Push-To-Talk):** Перехват хоткеев на уровне ядра Windows (`GetAsyncKeyState`) — рация работает прямо в играх при свернутом окне.
 * **Hands-Free режим:** Удобный тумблер постоянной передачи без залипаний.
 * **Трансляция экрана (1080p/1440p60):** захват через DXGI Desktop Duplication, аппаратный H.264 (NVENC/AMF/QSV) через Media Foundation, передача отдельным iroh-соединением (`discordrf-video/1`) — видео не душит голос.
+* **Друзья и текстовый чат (DM):** список друзей по NodeID, входящие заявки и личные сообщения. Чат — только на время сессии (не пишется на диск) и только с друзьями; сообщения идут тем же iroh-каналом, что и заявки.
 * **Монолитный билд:** Все изображения (`assets/logo.png`, `assets/icon.png`) вшиваются прямо в исполняемый файл через `include_bytes!`.
 
 ---
@@ -36,6 +37,9 @@ albus/
 │   ├── main.rs              # Компактная точка входа: инициализация сервисов, запуск Tokio и GUI
 │   ├── lib.rs               # Экспорт модулей библиотеки
 │   ├── types.rs             # Базовые структуры (Peer, сетевые идентификаторы)
+│   ├── identity.rs          # Закреплённый SecretKey iroh, стабильный my_id (FNV-1a хеш NodeID)
+│   ├── friends.rs           # FriendsManager: friends.json, входящие/исходящие заявки
+│   ├── chat.rs              # ChatLog: сессионная история DM в памяти (per-NodeID, непрочитанные)
 │   ├── room.rs              # RoomManager: потокобезопасное состояние комнаты и участников
 │   ├── migration.rs         # Фоновый Heartbeat/IrohSync и алгоритм выбора нового лидера
 │   │
@@ -45,6 +49,8 @@ albus/
 │   ├── keybind.rs           # Системный Win32-поток глобального перехвата клавиш/мыши в играх
 │   │
 │   ├── firewall.rs          # Автоматическая регистрация входящего UDP в Брандмауэре Windows
+│   ├── config.rs            # AppConfig: config.ini (устройства, PTT, микшер, ник, громкость пиров)
+│   ├── menu.rs              # Консольные команды /mute /vol /mic /devices (пока не подключены)
 │   │
 │   ├── network/
 │   │   ├── mod.rs           # Реэкспорт сетевых компонентов
@@ -52,7 +58,7 @@ albus/
 │   │   ├── iroh_service.rs  # Фоновый слушатель Iroh, авто-связывание Full-Mesh и ретрансляция
 │   │   ├── broadcast.rs     # Сервис параллельной отправки голоса в P2P
 │   │   ├── video_link.rs    # Видеотранспорт: discordrf-video/1, uni-стрим на кадр, кадрирование
-│   │   └── message.rs       # Бинарный протокол (Heartbeat, AudioFrame, HostMigration, IrohSync, друзья)
+│   │   └── message.rs       # Бинарный протокол (Heartbeat, AudioFrame, HostMigration, IrohSync, друзья, чат)
 │   │
 │   ├── video/
 │   │   ├── mod.rs           # Пресеты, StreamInfo, EncodedUnit (не зависит от ОС)
@@ -71,7 +77,8 @@ albus/
 │       ├── info_panel.rs    # Шапка: логотип, ID пользователя, безопасная строка NodeID + копирование
 │       ├── audio_settings.rs# 2-колоночная сетка настроек: VU-метр, слайдеры, списки карт, PTT
 │       ├── ptt_button.rs    # Тумблер Hands-Free, экранная кнопка PTT и индикатор эфира
-│       ├── friends_panel.rs # Друзья, заявки, добавление по NodeID
+│       ├── friends_panel.rs # Друзья, заявки, добавление по NodeID, кнопка «Чат» и непрочитанные
+│       ├── chat_panel.rs    # DM-чат: пузыри сообщений, ввод, отправка через iroh
 │       └── room_panel.rs    # Строка ввода NodeID, Discord-карточки участников, персональная громкость
 │
 ├── tools/
