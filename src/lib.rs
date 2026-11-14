@@ -12,6 +12,7 @@ pub mod mixer;
 pub mod network;
 pub mod room;
 pub mod types;
+pub mod video;
 pub mod widgets;
 
 pub use types::Peer;

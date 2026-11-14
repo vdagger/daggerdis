@@ -18,3 +18,7 @@
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Служебный крейт video_probe: lock копируется из корня для офлайн-сборки
+/tools/video_probe/Cargo.lock
+/tools/**/target/

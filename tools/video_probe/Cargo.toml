@@ -1,0 +1,10 @@
+[package]
+name = "video_probe"
+version = "0.1.0"
+edition = "2021"
+
+# Отдельный крейт, а не example: манифест requireAdministrator из build.rs
+# пакета albus подмешивается во все его таргеты, включая examples, и такой
+# процесс не стартует в неинтерактивной SSH-сессии.
+[dependencies]
+albus = { path = "../.." }

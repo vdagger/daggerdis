@@ -1,5 +1,13 @@
 #[cfg(windows)]
 fn main() {
+    // Служебные крейты (tools/video_probe) собираются в неинтерактивной
+    // SSH-сессии, где процесс с requireAdministrator просто не стартует.
+    // Для таких сборок манифест отключается переменной окружения.
+    println!("cargo:rerun-if-env-changed=ALBUS_NO_ADMIN_MANIFEST");
+    if std::env::var_os("ALBUS_NO_ADMIN_MANIFEST").is_some() {
+        return;
+    }
+
     let mut res = winres::WindowsResource::new();
     res.set_manifest(
         r#"
