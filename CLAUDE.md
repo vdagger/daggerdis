@@ -50,6 +50,8 @@ Launching from a normal terminal triggers a UAC prompt.
    (fallback to `ip_detector::get_external_ip()` over HTTP if STUN + Iroh both fail).
 6. `NetworkManager::from_std(socket, iroh)` wraps the socket into Tokio.
 7. Build `RoomManager`, `AudioMixer`, `UniversalAudioCapture`, `MigrationManager`.
+   Mixer levels/channels, PTT key and hands-free come from `config::AppConfig`; the mic
+   and playback streams open the saved devices directly (fallback: system default).
 8. Two mpsc channels:
    - `packet_tx/rx: Vec<u8>` — outbound encoded voice.
    - `playback_tx/rx: (u64, Vec<u8>)` — inbound `(sender_id, opus)` for playback.
@@ -73,7 +75,8 @@ Launching from a normal terminal triggers a UAC prompt.
 | `src/migration.rs` | `MigrationManager`: 1 s heartbeat loop, IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate |
 | `src/mixer.rs` | `AudioMixer`: dB boost (0..300%), soft-knee limiter, mute, volume |
-| `src/devices.rs` | `DeviceSelector`: enumerate input/output devices |
+| `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
+| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` persistence (devices, PTT, mixer) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule |
 | `src/upnp.rs` | `auto_forward_port()`: IGD port mapping on home routers |
@@ -120,6 +123,11 @@ Integers are **little-endian except ports, which are big-endian** (`to_be_bytes`
   +18 dB logarithmic boost.
 - **Default PTT key:** Mouse 4 (side button); global via `GetAsyncKeyState`, works in
   fullscreen games / minimized window.
+- **Settings persistence:** `src/config.rs` reads/writes `%APPDATA%\Albus\config.ini`
+  (plain `key=value`, no extra dependencies; a broken file is ignored). Devices are
+  matched by **name** — cpal indices shift between runs. A saved device that is not
+  present falls back to the system default and the saved name is kept. The file is
+  written on change with a 400 ms throttle, never on exit.
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
   commands are not currently reachable.
