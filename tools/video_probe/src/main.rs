@@ -23,6 +23,12 @@ fn main() {
 
     match mode.as_str() {
         "--capture" => run_capture(nums.first().copied().unwrap_or(5) as u64),
+        "--loopback" => run_loopback(
+            nums.first().copied().unwrap_or(1920),
+            nums.get(1).copied().unwrap_or(1080),
+            nums.get(2).copied().unwrap_or(60),
+            nums.get(3).copied().unwrap_or(180) as usize,
+        ),
         "--gpu" => run_gpu(
             nums.first().copied().unwrap_or(2560),
             nums.get(1).copied().unwrap_or(1440),
@@ -264,6 +270,66 @@ fn main() {
             last_y
         );
         println!("Байт NV12 на кадр: {}", bytes / frames.max(1));
+    }
+
+    /// Полный круг без экрана и сети: синтетика → H.264 → декодер.
+    fn run_loopback(width: u32, height: u32, fps: u32, frames: usize) {
+        use albus::video::publisher::StreamInfo;
+        use albus::video::win_decode::MfDecoder;
+        use std::time::Instant;
+
+        let target = target_for(width, height, fps);
+        let mut enc = new_encoder(&target);
+        let info = StreamInfo {
+            width: target.width,
+            height: target.height,
+            fps: target.fps,
+            sequence_header: enc.sequence_header.clone(),
+        };
+        let mut dec = match MfDecoder::new(&info) {
+            Ok(d) => d,
+            Err(e) => {
+                println!("ОШИБКА декодера: {e}");
+                std::process::exit(1);
+            }
+        };
+        println!("Декодер: {} {:?}", dec.mft_name, dec.notes);
+
+        let mut nv12 = vec![0u8; (target.width * target.height * 3 / 2) as usize];
+        let (mut decoded, mut bytes) = (0usize, 0usize);
+        let start = Instant::now();
+        for i in 0..frames {
+            fill_nv12(&mut nv12, target.width, target.height, i as u32);
+            let units = match enc.push_nv12(&nv12) {
+                Ok(u) => u,
+                Err(e) => {
+                    println!("ОШИБКА энкодера: {e}");
+                    std::process::exit(1);
+                }
+            };
+            for u in &units {
+                match dec.push(u) {
+                    Ok(frames) => {
+                        for f in frames {
+                            decoded += 1;
+                            bytes += f.len();
+                        }
+                    }
+                    Err(e) => {
+                        println!("ОШИБКА декодера: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        let secs = start.elapsed().as_secs_f64();
+        println!(
+            "Круговой прогон: {} кадров декодировано за {:.2} с ({:.1} fps), {} байт NV12 на кадр",
+            decoded,
+            secs,
+            decoded as f64 / secs,
+            bytes / decoded.max(1)
+        );
     }
 
     fn fill_nv12(buf: &mut [u8], w: u32, h: u32, frame: u32) {

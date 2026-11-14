@@ -2,6 +2,9 @@
 //!
 //! Вход — Annex-B кадры, выход — NV12 в системной памяти. Дальше
 //! `win_d3d::Converter` переводит NV12 в BGRA на GPU для показа.
+//!
+//! Штатный декодер Microsoft — синхронный MFT (без IMFMediaEventGenerator),
+//! аппаратные — асинхронные, поэтому поддерживаются оба режима.
 
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
@@ -21,9 +24,17 @@ enum Ev {
     Other,
 }
 
+/// Результат одной попытки забрать выходной кадр.
+enum Output {
+    NeedInput,
+    StreamChanged,
+    Frame(Vec<u8>),
+}
+
 pub struct MfDecoder {
     transform: IMFTransform,
-    events: IMFMediaEventGenerator,
+    /// `None` — MFT синхронный, работаем через ProcessInput/ProcessOutput.
+    events: Option<IMFMediaEventGenerator>,
     output_info: MFT_OUTPUT_STREAM_INFO,
     frame_duration: i64,
     next_pts: i64,
@@ -129,9 +140,14 @@ impl MfDecoder {
             .SetOutputType(0, &out_type, 0)
             .map_err(|e| format!("{name}: SetOutputType NV12: {e}"))?;
 
-        let events: IMFMediaEventGenerator = transform
-            .cast()
-            .map_err(|e| format!("{name}: MFT не асинхронный: {e}"))?;
+        let mut notes = Vec::new();
+        let events: Option<IMFMediaEventGenerator> = match transform.cast() {
+            Ok(g) => Some(g),
+            Err(_) => {
+                notes.push("синхронный MFT".into());
+                None
+            }
+        };
         let output_info = transform
             .GetOutputStreamInfo(0)
             .map_err(|e| format!("{name}: GetOutputStreamInfo: {e}"))?;
@@ -154,7 +170,7 @@ impl MfDecoder {
             height: info.height,
             fps: info.fps,
             mft_name: name,
-            notes: Vec::new(),
+            notes,
         })
     }
 
@@ -164,13 +180,25 @@ impl MfDecoder {
 
     /// Отдаёт один сжатый кадр, возвращает все декодированные NV12-кадры.
     pub fn push(&mut self, unit: &EncodedUnit) -> Result<Vec<Vec<u8>>, String> {
+        if self.events.is_some() {
+            self.push_async(unit)
+        } else {
+            self.push_sync(unit)
+        }
+    }
+
+    fn push_async(&mut self, unit: &EncodedUnit) -> Result<Vec<Vec<u8>>, String> {
         let mut out = Vec::new();
         let deadline = Instant::now() + WAIT;
 
         while !self.need_input {
             match self.wait_event(deadline)? {
                 Ev::NeedInput => self.need_input = true,
-                Ev::HaveOutput => out.extend(self.pull_output()?),
+                Ev::HaveOutput => {
+                    if let Output::Frame(b) = self.process_output_once()? {
+                        out.push(b);
+                    }
+                }
                 Ev::Other => {}
             }
         }
@@ -179,7 +207,11 @@ impl MfDecoder {
 
         loop {
             match self.poll_event()? {
-                Some(Ev::HaveOutput) => out.extend(self.pull_output()?),
+                Some(Ev::HaveOutput) => {
+                    if let Output::Frame(b) = self.process_output_once()? {
+                        out.push(b);
+                    }
+                }
                 Some(Ev::NeedInput) => self.need_input = true,
                 Some(Ev::Other) => {}
                 None => break,
@@ -188,9 +220,45 @@ impl MfDecoder {
         Ok(out)
     }
 
+    /// Синхронный MFT: вход может отклоняться, пока не вычитан выход.
+    fn push_sync(&mut self, unit: &EncodedUnit) -> Result<Vec<Vec<u8>>, String> {
+        let mut out = Vec::new();
+        let sample = self.make_sample(unit)?;
+        let mut pending = Some(sample);
+        let deadline = Instant::now() + WAIT;
+
+        loop {
+            if let Some(s) = pending.take() {
+                match unsafe { self.transform.ProcessInput(0, &s, 0) } {
+                    Ok(()) => {}
+                    Err(e) if e.code() == MF_E_NOTACCEPTING => pending = Some(s),
+                    Err(e) => return Err(format!("ProcessInput: {e}")),
+                }
+            }
+            loop {
+                match self.process_output_once()? {
+                    Output::Frame(b) => out.push(b),
+                    Output::StreamChanged => continue,
+                    Output::NeedInput => break,
+                }
+            }
+            if pending.is_none() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("декодер не принимает кадр (нет окна вывода)".into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Ok(out)
+    }
+
     fn poll_event(&self) -> Result<Option<Ev>, String> {
+        let Some(events) = &self.events else {
+            return Ok(None);
+        };
         unsafe {
-            match self.events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
+            match events.GetEvent(MF_EVENT_FLAG_NO_WAIT) {
                 Ok(ev) => Ok(Some(Self::classify(&ev)?)),
                 Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => Ok(None),
                 Err(e) => Err(format!("GetEvent: {e}")),
@@ -221,7 +289,7 @@ impl MfDecoder {
         })
     }
 
-    fn send_input(&mut self, unit: &EncodedUnit) -> Result<(), String> {
+    fn make_sample(&mut self, unit: &EncodedUnit) -> Result<IMFSample, String> {
         unsafe {
             let buf = MFCreateMemoryBuffer(unit.data.len() as u32).map_err(|e| e.to_string())?;
             let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -243,22 +311,31 @@ impl MfDecoder {
             sample
                 .SetSampleDuration(self.frame_duration)
                 .map_err(|e| e.to_string())?;
+            Ok(sample)
+        }
+    }
 
+    fn send_input(&mut self, unit: &EncodedUnit) -> Result<(), String> {
+        let sample = self.make_sample(unit)?;
+        unsafe {
             self.transform
                 .ProcessInput(0, &sample, 0)
                 .map_err(|e| format!("ProcessInput: {e}"))
         }
     }
 
-    fn pull_output(&mut self) -> Result<Vec<Vec<u8>>, String> {
+    fn process_output_once(&mut self) -> Result<Output, String> {
         unsafe {
             let provides_samples =
                 self.output_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
             let sample = if provides_samples {
                 None
             } else {
-                let buf = MFCreateMemoryBuffer(self.output_info.cbSize.max(self.width * self.height * 3 / 2))
-                    .map_err(|e| e.to_string())?;
+                let size = self
+                    .output_info
+                    .cbSize
+                    .max(self.width * self.height * 3 / 2);
+                let buf = MFCreateMemoryBuffer(size).map_err(|e| e.to_string())?;
                 let s = MFCreateSample().map_err(|e| e.to_string())?;
                 s.AddBuffer(&buf).map_err(|e| e.to_string())?;
                 Some(s)
@@ -276,10 +353,12 @@ impl MfDecoder {
                 .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status)
             {
                 Ok(()) => {}
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(Vec::new()),
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                    return Ok(Output::NeedInput)
+                }
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     self.apply_stream_change()?;
-                    return Ok(Vec::new());
+                    return Ok(Output::StreamChanged);
                 }
                 Err(e) => return Err(format!("ProcessOutput: {e}")),
             }
@@ -287,7 +366,7 @@ impl MfDecoder {
             let sample = ManuallyDrop::take(&mut data.pSample);
             let sample = match sample {
                 Some(s) => s,
-                None => return Ok(Vec::new()),
+                None => return Ok(Output::NeedInput),
             };
             let buf = sample
                 .ConvertToContiguousBuffer()
@@ -296,9 +375,9 @@ impl MfDecoder {
             let mut current = 0u32;
             buf.Lock(&mut ptr, None, Some(&mut current))
                 .map_err(|e| format!("Lock output: {e}"))?;
-            let bytes = std::slice::from_raw_parts(ptr, current as usize).to_vec();
+            let raw = std::slice::from_raw_parts(ptr, current as usize).to_vec();
             buf.Unlock().map_err(|e| e.to_string())?;
-            Ok(vec![bytes])
+            Ok(Output::Frame(repack_nv12(raw, self.width, self.height)))
         }
     }
 
@@ -378,6 +457,31 @@ unsafe fn activation_name(act: &IMFActivate) -> Option<String> {
         .ok()?;
     let end = buf.iter().position(|&c| c == 0).unwrap_or(len as usize);
     Some(String::from_utf16_lossy(&buf[..end.min(buf.len())]))
+}
+
+/// Декодер отдаёт высоту, выровненную по 16 (1088 вместо 1080), и UV-плоскость
+/// начинается ниже. Для показа нужен плотный кадр ровно w×h.
+fn repack_nv12(data: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+    let w = w as usize;
+    let h = h as usize;
+    let need = w * h * 3 / 2;
+    if data.len() == need {
+        return data;
+    }
+    let real_h = (data.len() * 2 / 3) / w;
+    if real_h <= h || data.len() < need {
+        let mut v = data;
+        v.truncate(need.min(v.len()));
+        return v;
+    }
+    let mut out = Vec::with_capacity(need);
+    out.extend_from_slice(&data[..w * h]);
+    let uv_start = w * real_h;
+    let uv_len = w * (h / 2);
+    if data.len() >= uv_start + uv_len {
+        out.extend_from_slice(&data[uv_start..uv_start + uv_len]);
+    }
+    out
 }
 
 fn pack2(a: u32, b: u32) -> u64 {
