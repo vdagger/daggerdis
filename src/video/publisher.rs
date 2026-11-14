@@ -13,14 +13,7 @@ use super::win_dxgi::ScreenCapture;
 use super::win_mf::MfEncoder;
 use super::{EncodedUnit, VideoPreset, VideoTarget};
 
-/// Описание запущенного потока: зрителю нужны размеры и SPS/PPS.
-#[derive(Clone, Debug)]
-pub struct StreamInfo {
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub sequence_header: Vec<u8>,
-}
+pub use super::StreamInfo;
 
 pub struct ScreenPublisher {
     stop: Arc<AtomicBool>,

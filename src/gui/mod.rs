@@ -56,6 +56,12 @@ pub struct RadioApp {
     video_error: Option<String>,
     #[cfg(windows)]
     video_fullscreen: bool,
+    #[cfg(windows)]
+    remote: Option<video_session::RemoteView>,
+    #[cfg(windows)]
+    video_link: Option<Arc<crate::network::video_link::VideoLink>>,
+    #[cfg(windows)]
+    video_rt: Option<tokio::runtime::Handle>,
 }
 
 impl RadioApp {
@@ -124,7 +130,24 @@ impl RadioApp {
             video_error: None,
             #[cfg(windows)]
             video_fullscreen: false,
+            #[cfg(windows)]
+            remote: None,
+            #[cfg(windows)]
+            video_link: None,
+            #[cfg(windows)]
+            video_rt: None,
         }
+    }
+
+    /// Подключает видео к сети: транспорт и рантайм для исходящих соединений.
+    #[cfg(windows)]
+    pub fn attach_video(
+        &mut self,
+        link: Arc<crate::network::video_link::VideoLink>,
+        rt: tokio::runtime::Handle,
+    ) {
+        self.video_link = Some(link);
+        self.video_rt = Some(rt);
     }
 
     fn apply_theme(&mut self, ctx: &egui::Context) {
@@ -195,8 +218,37 @@ impl eframe::App for RadioApp {
         self.apply_theme(ctx);
 
         #[cfg(windows)]
-        if let Some(video) = &mut self.video {
-            video.poll(ctx);
+        {
+            // свои кадры: показать и отправить зрителям
+            if let Some(video) = &mut self.video {
+                let units = video.poll(ctx);
+                if let Some(link) = &self.video_link {
+                    for unit in &units {
+                        link.publish(unit, video.info());
+                    }
+                }
+            }
+
+            // чужие кадры из сети
+            if let Some(link) = &self.video_link {
+                while let Some(frame) = link.try_recv_remote() {
+                    if self.remote.is_none() {
+                        let info = crate::video::StreamInfo {
+                            width: frame.width,
+                            height: frame.height,
+                            fps: frame.fps,
+                            sequence_header: frame.sequence_header.clone(),
+                        };
+                        match video_session::RemoteView::new(&info, frame.from.clone()) {
+                            Ok(v) => self.remote = Some(v),
+                            Err(e) => self.video_error = Some(e),
+                        }
+                    }
+                    if let Some(remote) = &mut self.remote {
+                        remote.feed(frame.unit, ctx);
+                    }
+                }
+            }
         }
 
         let current_input_index = self
@@ -451,6 +503,20 @@ impl RadioApp {
                                 Ok(v) => {
                                     self.video = Some(v);
                                     self.video_error = None;
+                                    // раздаём поток всем, кто уже в комнате
+                                    if let (Some(link), Some(rt)) =
+                                        (self.video_link.clone(), self.video_rt.clone())
+                                    {
+                                        for peer in self.room.get_all_peers() {
+                                            if peer.address != self.my_node_id {
+                                                let link = link.clone();
+                                                let target = peer.address.clone();
+                                                rt.spawn(async move {
+                                                    link.add_viewer(target).await;
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(e) => self.video_error = Some(e),
                             }
@@ -477,6 +543,9 @@ impl RadioApp {
 
                 if let Some(v) = &self.video {
                     ui.add_space(6.0);
+                    if let Some(err) = v.last_error() {
+                        ui.label(egui::RichText::new(err).size(10.0).color(t::REC));
+                    }
                     match v.texture() {
                         Some(tex) => {
                             let (w, h) = v.size();
@@ -512,6 +581,38 @@ impl RadioApp {
                             .color(t::TEXT_MUTED),
                     );
                 }
+
+                // чужой поток: смотрим, что транслирует собеседник
+                if let Some(remote) = &self.remote {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Смотрит: {} · {} кадров",
+                            remote.peer,
+                            remote.frames()
+                        ))
+                        .size(10.0)
+                        .color(t::TEXT_MUTED),
+                    );
+                    if let Some(err) = remote.last_error() {
+                        ui.label(egui::RichText::new(err).size(10.0).color(t::REC));
+                    }
+                    if let Some(tex) = remote.texture() {
+                        let (w, h) = remote.size();
+                        let avail = ui.available_width();
+                        let scale = (avail / w as f32).min(1.0);
+                        let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+                        let img = egui::Image::new(egui::load::SizedTexture::new(
+                            tex.id(),
+                            size,
+                        ))
+                        .rounding(Rounding::same(8.0))
+                        .sense(egui::Sense::click());
+                        if ui.add(img).clicked() {
+                            go_fullscreen = true;
+                        }
+                    }
+                }
             });
         if go_fullscreen {
             self.video_fullscreen = true;
@@ -521,7 +622,7 @@ impl RadioApp {
     /// Просмотр трансляции на весь экран в отдельном окне.
     #[cfg(windows)]
     fn draw_fullscreen_video(&mut self, ctx: &egui::Context) {
-        if !self.video_fullscreen || self.video.is_none() {
+        if !self.video_fullscreen || (self.video.is_none() && self.remote.is_none()) {
             self.video_fullscreen = false;
             return;
         }
@@ -536,9 +637,14 @@ impl RadioApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
-                        if let Some(v) = &self.video {
-                            if let Some(tex) = v.texture() {
-                                let (w, h) = v.size();
+                        // приоритет у чужого потока: его и смотрят на весь экран
+                        let source = self
+                            .remote
+                            .as_ref()
+                            .map(|r| (r.texture(), r.size()))
+                            .or_else(|| self.video.as_ref().map(|v| (v.texture(), v.size())));
+                        if let Some((Some(tex), (w, h))) = source {
+                            {
                                 let rect = ui.max_rect();
                                 let scale = (rect.width() / w as f32)
                                     .min(rect.height() / h as f32);

@@ -91,6 +91,16 @@ impl VideoTarget {
     }
 }
 
+/// Описание потока: нужно и превью, и зрителю по сети.
+#[derive(Clone, Debug)]
+pub struct StreamInfo {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    /// SPS/PPS — декодер должен получить их до первого кадра.
+    pub sequence_header: Vec<u8>,
+}
+
 /// Один закодированный кадр, готовый к отправке.
 #[derive(Clone, Debug)]
 pub struct EncodedUnit {

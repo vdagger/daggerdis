@@ -8,6 +8,8 @@ use tokio::sync::{mpsc, Mutex};
 
 pub const IROH_ALPN: &[u8] = b"discordrf/1";
 
+use crate::network::video_link::VIDEO_ALPN;
+
 /// Пакет, полученный от удаленного участника
 pub struct IncomingPacket {
     pub sender_id: String,
@@ -21,6 +23,8 @@ pub struct IrohP2pManager {
     connections: Arc<Mutex<HashMap<String, Connection>>>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     incoming_rx: Arc<Mutex<mpsc::Receiver<IncomingPacket>>>,
+    /// Входящие соединения видео-ALPN: их обрабатывает видеотранспорт.
+    video_rx: Arc<Mutex<mpsc::Receiver<Connection>>>,
 }
 
 impl IrohP2pManager {
@@ -32,7 +36,9 @@ impl IrohP2pManager {
         println!("[IROH] Инициализация P2P-эндпоинта (пресет N0, закреплённый ключ)...");
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(vec![IROH_ALPN.to_vec()])
+            // голос живёт на discordrf/1, видео — на своём ALPN, чтобы
+            // congestion control видео не душил голос
+            .alpns(vec![IROH_ALPN.to_vec(), VIDEO_ALPN.to_vec()])
             .bind()
             .await?;
 
@@ -42,16 +48,23 @@ impl IrohP2pManager {
 
         let connections = Arc::new(Mutex::new(HashMap::new()));
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(500);
+        let (video_tx, video_rx) = mpsc::channel::<Connection>(8);
 
         // Фоновый цикл приема входящих подключений
         let ep_accept = endpoint.clone();
         let conns_accept = connections.clone();
         let tx_accept = incoming_tx.clone();
+        let video_tx_accept = video_tx.clone();
         tokio::spawn(async move {
             println!("[IROH] Фоновый слушатель входящих подключений запущен.");
             while let Some(incoming) = ep_accept.accept().await {
                 match incoming.await {
                     Ok(conn) => {
+                        // видео-соединения обслуживает отдельный транспорт
+                        if conn.alpn() == VIDEO_ALPN {
+                            let _ = video_tx_accept.send(conn).await;
+                            continue;
+                        }
                         let remote_id = conn.remote_id().to_string();
                         println!(
                             "[IROH] Принято входящее P2P-подключение от NodeID: {}",
@@ -77,6 +90,7 @@ impl IrohP2pManager {
             connections,
             incoming_tx,
             incoming_rx: Arc::new(Mutex::new(incoming_rx)),
+            video_rx: Arc::new(Mutex::new(video_rx)),
         })
     }
 
@@ -169,5 +183,15 @@ impl IrohP2pManager {
     /// Принимает следующий входящий пакет
     pub async fn recv_packet(&self) -> Option<IncomingPacket> {
         self.incoming_rx.lock().await.recv().await
+    }
+
+    /// Входящее видео-соединение (ALPN discordrf-video/1).
+    pub async fn recv_video_conn(&self) -> Option<Connection> {
+        self.video_rx.lock().await.recv().await
+    }
+
+    /// Эндпоинт нужен видеотранспорту для исходящих соединений.
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
     }
 }

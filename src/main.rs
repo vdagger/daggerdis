@@ -145,13 +145,23 @@ fn main() {
     }
     native_options.viewport = viewport;
 
+    // Видеотранспорт: отдельное ALPN, живёт рядом с голосом
+    #[cfg(windows)]
+    let video_link = iroh_p2p
+        .as_ref()
+        .map(|p2p| albus::network::video_link::VideoLink::spawn(p2p.clone()));
+    #[cfg(windows)]
+    let rt_handle = rt.handle().clone();
+    #[cfg(windows)]
+    let video_link_gui = video_link.clone();
+
     let _guard = rt.enter();
     let _runtime_guard = rt;
     eframe::run_native(
         "Albus Audio",
         native_options,
         Box::new(move |_cc| {
-            Ok(Box::new(RadioApp::new(
+            let mut app = RadioApp::new(
                 mixer,
                 room,
                 config.ptt_vk,
@@ -172,7 +182,14 @@ fn main() {
                 friends,
                 my_node_id,
                 network_error,
-            )))
+            );
+
+            #[cfg(windows)]
+            if let Some(link) = video_link_gui {
+                app.attach_video(link, rt_handle.clone());
+            }
+
+            Ok(Box::new(app))
         }),
     )
     .unwrap();
