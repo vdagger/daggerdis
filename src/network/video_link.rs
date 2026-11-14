@@ -48,7 +48,7 @@ pub struct VideoLink {
 }
 
 impl VideoLink {
-    pub fn spawn(p2p: Arc<IrohP2pManager>) -> Arc<Self> {
+    pub fn spawn(p2p: Arc<IrohP2pManager>, rt: tokio::runtime::Handle) -> Arc<Self> {
         let (outgoing, _) = broadcast::channel(8);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let link = Arc::new(Self {
@@ -58,7 +58,7 @@ impl VideoLink {
             events_rx: std::sync::Mutex::new(events_rx),
         });
         let l = link.clone();
-        tokio::spawn(async move { l.accept_loop().await });
+        rt.spawn(async move { l.accept_loop().await });
         link
     }
 

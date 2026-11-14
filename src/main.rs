@@ -7,6 +7,22 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 
 fn main() {
+    // Паника в GUI-приложении иначе выглядит как «окно не открылось»:
+    // пишем её в %TEMP%\albus-panic.log, чтобы было что показать.
+    std::panic::set_hook(Box::new(|info| {
+        let text = format!("[ПАНИКА] {info}\n");
+        eprintln!("{text}");
+        let path = std::env::temp_dir().join("albus-panic.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(text.as_bytes());
+        }
+    }));
+
     // 1. Автоматическая настройка правил фаервола Windows (входящий UDP для iroh QUIC)
     albus::firewall::setup_firewall_rules();
 
@@ -147,11 +163,11 @@ fn main() {
 
     // Видеотранспорт: отдельное ALPN, живёт рядом с голосом
     #[cfg(windows)]
-    let video_link = iroh_p2p
-        .as_ref()
-        .map(|p2p| albus::network::video_link::VideoLink::spawn(p2p.clone()));
-    #[cfg(windows)]
     let rt_handle = rt.handle().clone();
+    #[cfg(windows)]
+    let video_link = iroh_p2p.as_ref().map(|p2p| {
+        albus::network::video_link::VideoLink::spawn(p2p.clone(), rt_handle.clone())
+    });
     #[cfg(windows)]
     let video_link_gui = video_link.clone();
 
