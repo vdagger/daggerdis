@@ -18,6 +18,7 @@
   * **Soft-Knee Limiter (-1.0 dBFS):** Прозрачный пиковый лимитер, исключающий перегруз и хрипы.
 * **Глобальный PTT (Push-To-Talk):** Перехват хоткеев на уровне ядра Windows (`GetAsyncKeyState`) — рация работает прямо в играх при свернутом окне.
 * **Hands-Free режим:** Удобный тумблер постоянной передачи без залипаний.
+* **Трансляция экрана (1080p/1440p60):** захват через DXGI Desktop Duplication, аппаратный H.264 (NVENC/AMF/QSV) через Media Foundation, передача отдельным iroh-соединением (`discordrf-video/1`) — видео не душит голос.
 * **Монолитный билд:** Все изображения (`assets/logo.png`, `assets/icon.png`) вшиваются прямо в исполняемый файл через `include_bytes!`.
 
 ---
@@ -44,31 +45,39 @@ albus/
 │   ├── keybind.rs           # Системный Win32-поток глобального перехвата клавиш/мыши в играх
 │   │
 │   ├── firewall.rs          # Автоматическая регистрация входящего UDP в Брандмауэре Windows
-│   ├── upnp.rs              # Автоматический проброс портов на домашних роутерах (IGD)
-│   ├── stun.rs              # RFC 5389 STUN-клиент + классификатор типов NAT (Cone / Symmetric)
-│   ├── ip_detector.rs       # Резервный HTTP-детектор внешнего адреса
 │   │
 │   ├── network/
 │   │   ├── mod.rs           # Реэкспорт сетевых компонентов
-│   │   ├── p2p_iroh.rs      # Движок Iroh: QUIC Datagrams, эндпоинты, подключение по NodeID
+│   │   ├── p2p_iroh.rs      # Движок Iroh: QUIC Datagrams, эндпоинты, ALPN голоса и видео
 │   │   ├── iroh_service.rs  # Фоновый слушатель Iroh, авто-связывание Full-Mesh и ретрансляция
-│   │   ├── broadcast.rs     # Сервис параллельной отправки голоса в P2P (Iroh + UDP fallback)
-│   │   ├── manager.rs       # NetworkManager: обертка над сокетом Tokio UDP
-│   │   ├── receiver.rs      # Бессмертный цикл приёма UDP (с защитой от Windows 10054)
-│   │   └── message.rs       # Бинарный протокол (Heartbeat, AudioFrame, HostMigration, IrohSync)
+│   │   ├── broadcast.rs     # Сервис параллельной отправки голоса в P2P
+│   │   ├── video_link.rs    # Видеотранспорт: discordrf-video/1, uni-стрим на кадр, кадрирование
+│   │   └── message.rs       # Бинарный протокол (Heartbeat, AudioFrame, HostMigration, IrohSync, друзья)
+│   │
+│   ├── video/
+│   │   ├── mod.rs           # Пресеты, StreamInfo, EncodedUnit (не зависит от ОС)
+│   │   ├── publisher.rs     # Поток публикации: захват → NV12 → энкодер
+│   │   ├── win_dxgi.rs      # Захват экрана (DXGI Desktop Duplication)
+│   │   ├── win_d3d.rs       # D3D11: конверсия BGRA↔NV12 на GPU
+│   │   ├── win_mf.rs        # Аппаратный H.264-энкодер (Media Foundation MFT)
+│   │   └── win_decode.rs    # H.264-декодер (синхронный и асинхронный MFT)
 │   │
 │   ├── gui/
 │   │   ├── mod.rs           # RadioApp: архитектура окна, палитра Cyber Slate, 60 FPS цикл
+│   │   ├── video_session.rs # Показ видео: декод → текстура egui, своя и чужая трансляция
 │   │   └── stream_control.rs# Горячее переключение аудиоустройств на лету
 │   │
 │   └── widgets/
 │       ├── info_panel.rs    # Шапка: логотип, ID пользователя, безопасная строка NodeID + копирование
 │       ├── audio_settings.rs# 2-колоночная сетка настроек: VU-метр, слайдеры, списки карт, PTT
 │       ├── ptt_button.rs    # Тумблер Hands-Free, экранная кнопка PTT и индикатор эфира
+│       ├── friends_panel.rs # Друзья, заявки, добавление по NodeID
 │       └── room_panel.rs    # Строка ввода NodeID, Discord-карточки участников, персональная громкость
 │
+├── tools/
+│   └── video_probe/         # Headless-проверки видеотракта (--capture, --gpu, --loopback)
 ├── build.rs                 # UAC-манифест прав Администратора для сетевого доступа на Windows
-└── Cargo.toml               # Зависимости (tokio, iroh, cpal, rusty-opus, eframe, igd, winres)
+└── Cargo.toml               # Зависимости (tokio, iroh, cpal, rusty-opus, eframe, serde, windows)
 
 📦 Сборка и запуск
 
@@ -115,3 +124,8 @@ cargo build --release
 Разговор:
 Зажмите назначенную клавишу (по умолчанию боковая кнопка мыши Mouse 4) или переключите тумблер «Постоянная передача (Hands-Free)».
 Говорить можно прямо из любых полноэкранных игр — рация перехватывает хоткеи глобально во всей ОС.
+
+Трансляция экрана:
+1. Нажмите «Транслировать экран» под индикатором эфира — появится превью.
+2. Клик по превью открывает отдельное окно «Albus — трансляция»: его можно растянуть под себя, кнопка «На весь экран» разворачивает на весь монитор (Esc — выход).
+3. Все, кто уже в комнате, видят поток автоматически — у них окно просмотра открывается само.

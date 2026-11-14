@@ -13,6 +13,8 @@ servers — every client is a full mesh node. End-to-end-encrypted voice over
   macOS (GitHub Actions "Build macOS Universal").
 - Stack: `eframe`/`egui` 0.28, `cpal` 0.15, `rusty-opus` 1.0 (Opus 64 kbps),
   `iroh` 1.4 (QUIC), `tokio` (full), `serde` + `serde_json`, `bytes`.
+  Windows-only: `windows` 0.62 (DXGI Desktop Duplication, D3D11, Media Foundation)
+  for screen streaming; other platforms build without it (`src/video` is gated).
 
 ## Build & run
 
@@ -59,7 +61,11 @@ normal terminal triggers a UAC prompt.
    - `iroh_service::spawn_iroh_receiver` — Iroh listener + full-mesh + relay + friends.
    - `broadcast::spawn_audio_broadcast` — fan-out voice over Iroh.
    - `MigrationManager::start_heartbeat_loop` — 1 s IrohSync / host failover.
-8. `eframe::run_native("Albus Audio", ...)` → `gui::RadioApp`.
+8. On Windows: `video_link::VideoLink::spawn(p2p, rt.handle())` — the video
+   transport (its own ALPN). It must be spawned with the runtime `Handle`, not
+   bare `tokio::spawn` — at this point `main` has not entered the runtime yet.
+   The GUI receives it via `RadioApp::attach_video(link, rt_handle)`.
+9. `eframe::run_native("Albus Audio", ...)` → `gui::RadioApp`.
 
 Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun.rs`,
 `upnp.rs`, `ip_detector.rs`) was removed — there is no plain-UDP fallback.
@@ -96,6 +102,15 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/widgets/identity.rs` | "Мой NodeID" block: full ID + copy button/click-to-copy |
 | `src/widgets/friends_panel.rs` | Friends list, incoming requests, add-friend, call/remove |
 | `src/widgets/ptt_button.rs` | Hands-free toggle, on-screen PTT, TX indicator |
+| `src/video/mod.rs` | OS-independent: `VideoPreset`/`VideoTarget` (bitrate from pixel count), `StreamInfo`, `EncodedUnit` |
+| `src/video/win_dxgi.rs` | DXGI Desktop Duplication capture; `next_nv12()` returns one frame as NV12 or `None` |
+| `src/video/win_d3d.rs` | D3D11 device + `ID3D11VideoProcessor` BGRA↔NV12 conversion/scaling, staging readback |
+| `src/video/win_mf.rs` | Async hardware H.264 MFT encoder (NVENC/AMF/QSV), CBR/GOP via `ICodecAPI` |
+| `src/video/win_decode.rs` | H.264 decoder MFT — both async and sync paths; NV12 repack 1088→1080 |
+| `src/video/publisher.rs` | `video-publisher` thread: capture 60 fps → NV12 → encode → mpsc of `EncodedUnit` |
+| `src/network/video_link.rs` | `discordrf-video/1`: incoming video connections, one uni-stream per frame, fan-out to viewers |
+| `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
+| `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
 | `src/widgets/room_panel.rs` | NodeID input (connect), participant cards, per-peer volume |
 | `assets/icon.png`, `assets/logo.png` | Embedded via `include_bytes!` (monolithic binary) |
 | `.github/workflows/macos.yml` | macOS Universal 2 build |
@@ -116,6 +131,30 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 8 | `FriendRemove` | `sender_id` u64 LE, `node_id` str |
 
 Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP mesh.
+
+### Video wire format (`src/network/video_link.rs`)
+
+Video uses a **separate iroh connection** with ALPN `discordrf-video/1`: QUIC
+congestion control is per-connection, so video cannot starve voice datagrams.
+Each frame is its own **unidirectional stream** — a lost packet delays one frame,
+not the whole GOP. Little-endian 28-byte header, then optional SPS/PPS and the
+Annex-B H.264 payload:
+
+| Offset | Type | Field |
+|--------|------|-------|
+| 0 | u8 | kind = 1 |
+| 1 | u8 | flags: 1 = keyframe, 2 = has SPS/PPS |
+| 2 | u16 | seq_len |
+| 4 | u32 | width |
+| 8 | u32 | height |
+| 12 | u32 | fps |
+| 16 | i64 | pts (100 ns) |
+| 24 | u32 | payload length |
+| 28 | bytes | SPS/PPS (if flag 2), then H.264 |
+
+When a broadcast starts, `VideoLink::add_viewer` opens a connection to every
+peer already in the room; viewers accept automatically and the GUI opens the
+video window. Peers who join mid-stream are not subscribed yet.
 
 ## Key implementation details & gotchas
 
@@ -141,6 +180,39 @@ Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP me
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
   commands are not currently reachable.
+- **Video pipeline (Windows):** DXGI capture (BGRA, GPU) → `ID3D11VideoProcessor`
+  converts/scales to NV12 on the GPU → hardware H.264 MFT → iroh → decoder MFT →
+  NV12 → Video Processor → BGRA → egui texture. Bitrate is `pixels × fps ×
+  bits_per_pixel` (Low 0.04 / Balanced 0.07 / Quality 0.10, capped 1.5–40 Mbps),
+  so 1080p60 ≈ 8.7 Mbps and 1440p60 ≈ 18–22 Mbps. Capture runs at the monitor's
+  native resolution — upscaling to a preset wastes bitrate.
+- **AMF encoder quirk:** the AMD MFT ignores `MF_MT_FRAME_RATE` and computes rate
+  control against 30 fps — at 60 fps the stream came out twice the requested
+  bitrate. `win_mf::mean_bitrate_for()` compensates with `30/fps` for MFTs whose
+  friendly name contains "amd"; re-check when the NVIDIA MFT is selected instead.
+- **NVIDIA MFT outside a user session:** `ActivateObject` fails with
+  `E_UNEXPECTED` (0x8000FFFF) in a non-interactive SSH session; AMF activates
+  fine. Encoder checks must run interactively.
+- **DXGI capture needs an interactive desktop.** Over SSH `ScreenCapture::new`
+  returns "не найден экран"; use `tools/video_probe --capture` in the user's
+  session (it reports the adapter and effective fps).
+- **Decoder output is 1088 rows** (height aligned to 16) and its UV plane starts
+  below; `repack_nv12()` strips the padding to exactly w×h before upload.
+- **The Microsoft H.264 decoder MFT is synchronous** (no
+  `IMFMediaEventGenerator`); `win_decode.rs` detects both sync and async MFTs and
+  drives them accordingly.
+- **Probe crate:** `tools/video_probe` is a separate package because `build.rs`
+  link args (the requireAdministrator manifest) leak into examples and such a
+  process cannot start in an SSH session. Build with
+  `cargo build --release --manifest-path tools/video_probe/Cargo.toml
+  --target-dir target` and `ALBUS_NO_ADMIN_MANIFEST=1` (build.rs skips the
+  manifest when that variable is set). Its `Cargo.lock` is a copy of the root
+  one (the crates.io cache is read-only for `Claude-Worker`) and is gitignored.
+- **Self-preview feedback:** showing your own stream on the same monitor feeds
+  the capture loop continuously — expected behaviour, not a decoder bug.
+- **Video window:** own preview and remote streams are shown in a separate
+  resizable egui viewport ("Albus — трансляция") with an in-window fullscreen
+  toggle; remote streams open it automatically.
 - **Assets are compiled in** via `include_bytes!` (icon/logo) — no runtime asset loading.
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
