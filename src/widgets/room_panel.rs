@@ -197,34 +197,10 @@ pub fn draw_room_panel(
     my_id: u64,
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
     room: std::sync::Arc<crate::room::RoomManager>,
-    my_node_id: &str,
 ) {
-    ui.horizontal(|ui| {
-        t::section_label(ui, "КОМНАТА");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("Копировать")
-                        .size(9.5)
-                        .color(t::TEXT_DIM),
-                ))
-                .clicked()
-            {
-                ui.output_mut(|o| o.copied_text = my_node_id.to_string());
-            }
-        });
-    });
+    t::section_label(ui, "КОМНАТА");
 
     ui.add_space(4.0);
-
-    ui.label(
-        egui::RichText::new(short_node_id(my_node_id))
-            .monospace()
-            .size(11.0)
-            .color(t::BRAND),
-    );
-
-    ui.add_space(8.0);
 
     ui.horizontal(|ui| {
         let btn_width = 74.0;

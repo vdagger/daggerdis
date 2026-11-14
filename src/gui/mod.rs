@@ -323,6 +323,18 @@ impl RadioApp {
 
                 ui.add_space(16.0);
 
+                egui::Frame::none()
+                    .fill(t::SURFACE)
+                    .rounding(Rounding::same(12.0))
+                    .stroke(Stroke::new(1.0_f32, t::STROKE))
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        crate::widgets::identity::draw_my_node_id(ui, &self.my_node_id);
+                    });
+
+                ui.add_space(10.0);
+
                 crate::widgets::room_panel::draw_participants(
                     ui,
                     self.room.clone(),
@@ -348,7 +360,6 @@ impl RadioApp {
                             self.my_id,
                             self.is_host.clone(),
                             self.room.clone(),
-                            &self.my_node_id,
                         );
                     });
 
