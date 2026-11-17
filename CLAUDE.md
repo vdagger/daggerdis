@@ -204,6 +204,15 @@ video window. Peers who join mid-stream are not subscribed yet.
 - **DXGI capture needs an interactive desktop.** Over SSH `ScreenCapture::new`
   returns "не найден экран"; use `tools/video_probe --capture` in the user's
   session (it reports the adapter and effective fps).
+- **MFT output sample must be reused:** handing a freshly allocated `IMFSample`
+  to `ProcessOutput` leaks it whenever the MFT answers
+  `MF_E_TRANSFORM_NEED_MORE_INPUT` (it nulls `pSample`), i.e. once per frame —
+  gigabytes per minute. `win_decode.rs` and `win_mf.rs` keep one persistent
+  sample (`out_sample`) and always reclaim `pSample`/`pEvents` after the call.
+- **Viewer queue is bounded:** `video_link.rs` holds at most 30 frames
+  (`MAX_QUEUE`); on overflow it drops the queue and waits for the next keyframe —
+  P-frames without their references decode to garbage. The GUI decodes at most
+  4 frames per update so one slow frame cannot stall the UI.
 - **Decoder output is 1088 rows** (height aligned to 16) and its UV plane starts
   below; `repack_nv12()` strips the padding to exactly w×h before upload.
 - **The Microsoft H.264 decoder MFT is synchronous** (no
