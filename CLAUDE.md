@@ -225,6 +225,17 @@ video window. Peers who join mid-stream are not subscribed yet.
   at 60. Do **not** call `CopyResource` inside the retry path: a fresh copy marks the
   staging texture busy again, `Map` answers "still drawing" forever and the preview
   never shows a frame. `pending_since` drops a readback after 500 ms as a safety valve.
+- **Own preview runs at half resolution** (`Renderer::new(info, 2)`): the frame is
+  still decoded at full size, but the GPU converter writes half-size BGRA, so the
+  readback, `bgra_to_image` and texture upload cost 4× less — at 1080p those three
+  stages alone held the preview at ~30 fps. Peer streams stay full-size
+  (`Renderer::new(info, 1)`). `Renderer::timings()` feeds the "декод · чтение с GPU ·
+  картинка" line under the broadcast button.
+- **The audio reorder buffer must not wait for a lost datagram:** in `audio.rs`
+  playback skips a gap (moves `entry.0` to the lowest buffered seq) as soon as 3 newer
+  packets are queued. Waiting for the missing seq froze the playback until the buffer
+  filled up and then dumped it in a burst — that is the "robot voice" one peer hears
+  when its link drops datagrams.
 - **Stream rate is a setting:** `video_fps=30|60` in `config.ini`, picked in the
   broadcast panel before starting (default 60); it threads through
   `VideoSession::start(fps)` → `ScreenPublisher::start(fps)` → capture, encoder and
