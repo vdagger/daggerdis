@@ -218,7 +218,11 @@ video window. Peers who join mid-stream are not subscribed yet.
   many per second, so a burst cannot flood the GPU readback and texture upload. The
   threshold is 75% of the period on purpose: at a 75 Hz repaint (13.3 ms per update) a
   hard 16.7 ms period skipped every second update and pinned the preview at ~32 fps
-  even though each frame cost only ~4 ms.
+  even though each frame cost only ~4 ms. A frame that cannot go to the GPU right
+  away (previous conversion still pending, or the rate check said "too early") is
+  kept in `Renderer.queued` and retried on the next update instead of being dropped;
+  a newer frame replaces it. Dropping it instead cost ~8 fps (52 instead of 60),
+  because every readback that landed one update late threw away the frame after it.
 - **Readback never blocks the GUI:** `Renderer` runs the GPU conversion
   (`converter.convert` → `copy_to_staging`, which also calls `Flush`) and collects the
   result on a later update with `read_back_nowait` (`D3D11_MAP_FLAG_DO_NOT_WAIT`;
