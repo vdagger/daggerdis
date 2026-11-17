@@ -60,7 +60,7 @@ normal terminal triggers a UAC prompt.
    - `packet_tx/rx: Vec<u8>` — outbound encoded voice.
    - `playback_tx/rx: (u64, u32, Vec<u8>)` — inbound `(sender_id, seq, opus)`.
 7. Spawn background tasks:
-   - `iroh_service::spawn_iroh_receiver` — Iroh listener + full-mesh + relay + friends.
+   - `iroh_service::spawn_iroh_receiver` — Iroh listener + full-mesh + relay + friends + chat + calls.
    - `broadcast::spawn_audio_broadcast` — fan-out voice over Iroh.
    - `MigrationManager::start_heartbeat_loop` — 1 s IrohSync / host failover.
 8. On Windows: `video_link::VideoLink::spawn(p2p, rt.handle())` — the video
@@ -84,6 +84,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/identity.rs` | Pinned iroh `SecretKey` (`secret.key`), `my_id` = FNV-1a hash of NodeID, reset |
 | `src/friends.rs` | `FriendsManager`: `friends.json` (node_id/name/date), incoming/outgoing requests |
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
+| `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate + AGC, per-peer mix bus |
@@ -95,7 +96,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
 | `src/network/mod.rs` | Re-exports `NetworkMessage`; declares `broadcast`, `iroh_service`, `message`, `p2p_iroh` |
 | `src/network/p2p_iroh.rs` | `IrohP2pManager`: QUIC datagrams, connect by NodeID, `broadcast_bytes` |
-| `src/network/iroh_service.rs` | `spawn_iroh_receiver`: Iroh listener, sender_id↔NodeID check, full-mesh, relay, friends |
+| `src/network/iroh_service.rs` | `spawn_iroh_receiver`: Iroh listener, sender_id↔NodeID check, full-mesh, relay, friends, chat, звонки (гейт по `CallManager::is_blocked`) |
 | `src/network/broadcast.rs` | `spawn_audio_broadcast`: parallel voice fan-out over Iroh |
 | `src/network/message.rs` | `NetworkMessage` enum + hand-rolled binary (de)serialization |
 | `src/gui/mod.rs` | `RadioApp`: eframe window, "Cyber Slate" theme, 60 FPS, network-error banner; console layout bottom-up, rail as one card, settings/chat overlays |
@@ -105,7 +106,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/widgets/audio_settings.rs` | Settings grid: VU meter, sliders, device lists, тумблер прослушивания тракта |
 | `src/widgets/info_panel.rs` | Header: logo, user ID, copyable NodeID, settings entry |
 | `src/widgets/identity.rs` | "Мой NodeID" block: full ID + copy button/click-to-copy |
-| `src/widgets/friends_panel.rs` | Friends list, incoming requests, add-friend, call/remove, chat button + unread |
+| `src/widgets/friends_panel.rs` | Friends list, incoming requests, add-friend, call (→ `CallManager::start_outgoing`), remove, chat button + unread |
 | `src/widgets/chat_panel.rs` | DM chat: message bubbles, input, send over iroh datagrams |
 | `src/widgets/ptt_button.rs` | Hands-free toggle, on-screen PTT, TX indicator |
 | `src/video/mod.rs` | OS-independent: `VideoPreset`/`VideoTarget` (bitrate from pixel count), `StreamInfo`, `EncodedUnit` |
@@ -136,6 +137,11 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 7 | `FriendAccept` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 8 | `FriendRemove` | `sender_id` u64 LE, `node_id` str |
 | 9 | `ChatMessage` | `sender_id` u64 LE, `text` str |
+| 10 | `CallInvite` | `sender_id` u64 LE, `call_id` u32 LE, `nick` str |
+| 11 | `CallAccept` | `sender_id` u64 LE, `call_id` u32 LE |
+| 12 | `CallDecline` | `sender_id` u64 LE, `call_id` u32 LE, `reason` u8 (0 отклонён / 1 занято / 2 таймаут) |
+| 13 | `CallCancel` | `sender_id` u64 LE, `call_id` u32 LE |
+| 14 | `CallEnd` | `sender_id` u64 LE, `call_id` u32 LE |
 
 Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP mesh.
 
@@ -254,6 +260,18 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
   commands are not currently reachable.
+- **Звонки (`src/calls.rs`):** «Позвонить» только шлёт `CallInvite`; в комнату
+  собеседник попадает после `CallAccept`. Миграции комнаты шлют `IrohSync` каждую
+  секунду и вычищают молчащих >12 с, поэтому согласие держится не состоянием, а
+  гейтом: `CallManager::is_blocked` отбрасывает `IrohSync`/`Heartbeat`/`AudioFrame`
+  от собеседника в состоянии Outgoing/Incoming (35/45 с), а отказ/таймаут/отмена/
+  завершение дополнительно закрывают QUIC-соединение (`disconnect_peer`) — иначе
+  следующий `IrohSync` вернул бы его в комнату. Приглашение переотправляется раз в
+  1.5 с, `CallAccept` — трижды; одновременный вызов с двух сторон разрешается
+  автоответом на встречное приглашение. Отклонение/«занято»/«не ответил» видны
+  тостом; шапка звонка — оверлей `draw_call_overlay`. Тон звонка синтезируется в
+  колбэке воспроизведения (`mixer.ring_mode`: 1 — входящий, 2 — исходящий) после
+  master gain и до миксового лимитера, поэтому не зависит от громкости собеседников.
 - **Chat (DM):** session-only and in-memory (`src/chat.rs`, never persisted) — by
   design, so chat history cannot leak to disk. Friends-only: messages from non-friends
   are dropped. Transport is iroh **datagrams** (same as friends/control), so delivery
