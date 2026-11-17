@@ -270,6 +270,24 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   small buffers). This path runs constantly on 44.1 kHz cards — the QUAD-CAPTURE
   rig is 44100 in and out. The last sample is held past the end of a chunk
   instead of reading past the slice.
+- **The playback stream's sample format must come from the card, never assumed.**
+  `create_playback_stream` used to take the first config range that contains
+  48 kHz and always build a stream from `f32`; on a device that only accepts
+  `i16` (some USB/HDMI outputs, 8-channel virtual cards) cpal answers
+  `BuildStreamError::StreamConfigNotSupported`, no stream opens, and the peer
+  hears nothing at all. Now the candidates are f32@48k → i16@48k → the device's
+  default config, and `build_playback<T>` is generic over the sample type (the
+  jitter buffer and decoders stay in f32 and are converted at the end of the
+  callback). The chosen format is printed with the device line.
+- **A silent "nothing plays" must be visible in the console.** `main.rs` used to
+  swallow `create_playback_stream`/`create_input_stream` errors with `if let Ok`,
+  so a failed stream looked like a working app that transmits but stays quiet.
+  Both now print `[ОШИБКА] Динамики не открылись: …` / `Микрофон не открылся: …`.
+- **Build stamp for stale copies:** `build.rs` exports `ALBUS_BUILD_STAMP` (the
+  newest mtime under `src/` or `build.rs`), and startup prints
+  `[СБОРКА] Albus <version> · сборка <stamp>`. Two peers must show the same
+  stamp — an exe copied to another machine stays whatever it was, and that is
+  the first thing to rule out when one side has "robot voice" or 30 fps video.
 - **Stream rate is a setting:** `video_fps=30|60` in `config.ini`, picked in the
   broadcast panel before starting (default 60); it threads through
   `VideoSession::start(fps)` → `ScreenPublisher::start(fps)` → capture, encoder and
