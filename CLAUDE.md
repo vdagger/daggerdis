@@ -272,6 +272,19 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   тостом; шапка звонка — оверлей `draw_call_overlay`. Тон звонка синтезируется в
   колбэке воспроизведения (`mixer.ring_mode`: 1 — входящий, 2 — исходящий) после
   master gain и до миксового лимитера, поэтому не зависит от громкости собеседников.
+- **«Не запускается» = две разные причины.** exe несёт манифест
+  `requireAdministrator`, поэтому из обычного терминала/без подтверждения UAC
+  процесс получает «requires elevation» и молча не стартует. Если же UAC
+  подтверждён, но окно не появилось — смотреть `%TEMP%\albus-panic.log`:
+  в виртуалке/Hyper-V/RDP нет OpenGL 2.0, и glow падает с
+  `egui_glow requires opengl 2.0+`. Теперь `run_native` не `unwrap`-ится:
+  ошибка печатается и показывается `MessageBoxW` (то же окно упоминает
+  `ALBUS_RENDERER=wgpu`). Feature `wgpu` включён в eframe, рендерер выбирается
+  переменной окружения (по умолчанию glow). `pollster` подключён локальной
+  заменой `vendor/pollster` через `[patch.crates-io]`: его `.crate` не скачивался,
+  потому что реестр cargo на сборочной машине принадлежит другому пользователю.
+  Если в такой VM и DX12-адаптера нет (`Failed to create wgpu adapter`), GUI там
+  не поднять вовсе — приложение проверяется на обычной машине.
 - **Chat (DM):** session-only and in-memory (`src/chat.rs`, never persisted) — by
   design, so chat history cannot leak to disk. Friends-only: messages from non-friends
   are dropped. Transport is iroh **datagrams** (same as friends/control), so delivery
