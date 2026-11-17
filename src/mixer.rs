@@ -106,6 +106,7 @@ impl TransmitAgc {
             return;
         }
         let rms = (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt();
+        let mut target = self.gain;
         if rms > Self::FLOOR_RMS {
             // Огибающая RMS: быстрый захват, медленный спад
             let coef = if rms > self.env_rms { 0.4 } else { 0.1 };
@@ -114,11 +115,16 @@ impl TransmitAgc {
                 (Self::TARGET_RMS / self.env_rms.max(1e-4)).clamp(Self::MIN_GAIN, Self::MAX_GAIN);
             // Вниз — быстрее, вверх — медленнее: так нет «выдоха» между слогами
             let coef = if desired < self.gain { 0.3 } else { 0.05 };
-            self.gain += (desired - self.gain) * coef;
+            target = self.gain + (desired - self.gain) * coef;
         }
-        for sample in buf.iter_mut() {
-            *sample *= self.gain;
+        // Усиление меняется не ступенькой на границе буфера, а плавно по нему:
+        // иначе на каждом колбэке слышен щелчок (zipper noise).
+        let start = self.gain;
+        let step = (target - start) / buf.len() as f32;
+        for (i, sample) in buf.iter_mut().enumerate() {
+            *sample *= start + step * (i as f32 + 1.0);
         }
+        self.gain = target;
     }
 }
 
