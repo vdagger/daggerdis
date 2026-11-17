@@ -26,6 +26,14 @@ fn main() {
     // 1. Автоматическая настройка правил фаервола Windows (входящий UDP для iroh QUIC)
     albus::firewall::setup_firewall_rules();
 
+    // Штамп сборки первым делом: у двух собеседников он должен совпадать,
+    // иначе один из них запускает старый exe и «робот» ищется не там.
+    println!(
+        "[СБОРКА] Albus {} · сборка {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("ALBUS_BUILD_STAMP")
+    );
+
     // Закреплённая личность: секретный ключ iroh (NodeID) и стабильный псевдоним my_id
     let identity = albus::identity::Identity::load_or_create();
     let my_id: u64 = identity.my_id;
@@ -113,22 +121,34 @@ fn main() {
         .output_device
         .as_deref()
         .and_then(DeviceSelector::find_output_device_by_name);
-    if let Ok(stream) = albus::audio::UniversalAudioCapture::create_playback_stream(
+    // Ошибку вывода раньше проглатывал `if let Ok`: при несовпадении формата
+    // динамиков cpal возвращает StreamConfigNotSupported, поток не открывался,
+    // и собеседник просто ничего не слышал — в консоли при этом было пусто.
+    match albus::audio::UniversalAudioCapture::create_playback_stream(
         configured_output,
         playback_rx.clone(),
         mixer.clone(),
     ) {
-        *playback_stream.lock().unwrap() = Some(stream);
+        Ok(stream) => *playback_stream.lock().unwrap() = Some(stream),
+        Err(e) => eprintln!(
+            "[ОШИБКА] Динамики не открылись: {e}. Собеседников не будет слышно — выберите другое устройство вывода в настройках."
+        ),
     }
 
     let configured_input = config
         .input_device
         .as_deref()
         .and_then(DeviceSelector::find_input_device_by_name);
-    if let Ok(stream) =
-        audio.create_input_stream(configured_input, ptt_flag.clone(), packet_tx.clone(), mixer.clone())
-    {
-        *mic_stream.lock().unwrap() = Some(stream);
+    match audio.create_input_stream(
+        configured_input,
+        ptt_flag.clone(),
+        packet_tx.clone(),
+        mixer.clone(),
+    ) {
+        Ok(stream) => *mic_stream.lock().unwrap() = Some(stream),
+        Err(e) => eprintln!(
+            "[ОШИБКА] Микрофон не открылся: {e}. Вас не будет слышно — выберите другое устройство ввода в настройках."
+        ),
     }
 
     // 4. Запуск фоновых сервисов

@@ -351,6 +351,13 @@ impl RemoteView {
         self.renderer.fps()
     }
 
+    /// Стоимость этапов показа (декод, чтение с GPU, картинка), мс.
+    /// Нужна, чтобы по логу/экрану зрителя отличить слабый компьютер
+    /// (дорогой декод или чтение с GPU) от потерь в сети.
+    pub fn timings(&self) -> (f32, f32, f32) {
+        self.renderer.timings()
+    }
+
     pub fn last_error(&self) -> Option<&String> {
         self.renderer.last_error.as_ref()
     }

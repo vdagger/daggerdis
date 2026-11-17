@@ -52,13 +52,25 @@ impl UniversalAudioCapture {
                 .ok_or("No default input device")?,
         };
 
-        // Ищем конфигурацию, поддерживающую 48000 Гц, либо берем дефолтную
-        let supported_configs = input_device.supported_input_configs().ok();
-        let best_config = supported_configs
-            .and_then(|mut configs| {
-                configs
-                    .find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
-                    .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
+        // Ищем конфигурацию на 48000 Гц, предпочитая f32: микрофонный поток
+        // строится с типом f32, и у карты, которая на 48 кГц даёт только i16,
+        // первый подходящий по частоте диапазон приводил к отказу.
+        let ranges: Vec<cpal::SupportedStreamConfigRange> = input_device
+            .supported_input_configs()
+            .map(|configs| configs.collect())
+            .unwrap_or_default();
+        let at_48000 = |f32_only: bool, range: &&cpal::SupportedStreamConfigRange| {
+            range.min_sample_rate().0 <= 48000
+                && range.max_sample_rate().0 >= 48000
+                && (!f32_only || range.sample_format() == cpal::SampleFormat::F32)
+        };
+        let best_config = ranges
+            .iter()
+            .find(|r| at_48000(true, r))
+            .or_else(|| ranges.iter().find(|r| at_48000(false, r)))
+            .map(|r| {
+                r.with_sample_rate(cpal::SampleRate(48000))
+                    .config()
             })
             .or_else(|| input_device.default_input_config().ok().map(|c| c.config()))
             .ok_or("Не удалось получить поддерживаемый формат микрофона")?;
@@ -192,31 +204,93 @@ impl UniversalAudioCapture {
                 .ok_or("No default output device")?,
         };
 
-        // Запрашиваем 48000 Гц у динамиков, либо берем их дефолтный формат
-        let supported_configs = output_device.supported_output_configs().ok();
-        let best_config = supported_configs
-            .and_then(|mut configs| {
-                configs
-                    .find(|c| c.min_sample_rate().0 <= 48000 && c.max_sample_rate().0 >= 48000)
-                    .map(|c| c.with_sample_rate(cpal::SampleRate(48000)).config())
-            })
-            .or_else(|| {
-                output_device
-                    .default_output_config()
-                    .ok()
-                    .map(|c| c.config())
-            })
-            .ok_or("Не удалось получить поддерживаемый формат динамиков")?;
+        // Раньше брали первый диапазон, в который влезает 48 кГц, не глядя на
+        // формат сэмплов, и всегда строили поток из f32. Устройство, которое
+        // принимает только i16 (часть USB/HDMI и многоканальных виртуальных
+        // карт), отвечало StreamConfigNotSupported: поток не открывался, и
+        // собеседника не было слышно вовсе. Теперь формат берём у самой карты.
+        let ranges: Vec<cpal::SupportedStreamConfigRange> = output_device
+            .supported_output_configs()
+            .map(|configs| configs.collect())
+            .unwrap_or_default();
 
-        let sample_rate = best_config.sample_rate.0;
-        let output_channels = best_config.channels as usize;
+        let mut candidates: Vec<(cpal::SampleFormat, u32, u16)> = Vec::new();
+        for format in [cpal::SampleFormat::F32, cpal::SampleFormat::I16] {
+            for range in &ranges {
+                if range.sample_format() != format
+                    || range.min_sample_rate().0 > 48000
+                    || range.max_sample_rate().0 < 48000
+                {
+                    continue;
+                }
+                let cand = (format, 48000u32, range.channels());
+                if !candidates.contains(&cand) {
+                    candidates.push(cand);
+                }
+            }
+        }
+        // Последний шанс — формат устройства по умолчанию, на какой бы частоте
+        // он ни был: ресэмплер ниже приведёт звук к нему.
+        if let Ok(default) = output_device.default_output_config() {
+            let cand = (
+                default.sample_format(),
+                default.sample_rate().0,
+                default.channels(),
+            );
+            if !candidates.contains(&cand) {
+                candidates.push(cand);
+            }
+        }
 
-        println!(
-            "[АУДИО] Открыты динамики: '{}', частота: {} Гц, каналов: {}",
-            output_device.name().unwrap_or_default(),
-            sample_rate,
-            output_channels
-        );
+        for (format, rate, channels) in candidates {
+            let config = cpal::StreamConfig {
+                channels,
+                sample_rate: cpal::SampleRate(rate),
+                buffer_size: cpal::BufferSize::Default,
+            };
+            let built = match format {
+                cpal::SampleFormat::F32 => {
+                    Self::build_playback::<f32>(&output_device, &config, rx.clone(), mixer.clone())
+                }
+                cpal::SampleFormat::I16 => {
+                    Self::build_playback::<i16>(&output_device, &config, rx.clone(), mixer.clone())
+                }
+                _ => continue,
+            };
+            match built {
+                Ok(stream) => {
+                    println!(
+                        "[АУДИО] Открыты динамики: '{}', частота: {} Гц, каналов: {}, формат: {:?}",
+                        output_device.name().unwrap_or_default(),
+                        rate,
+                        channels,
+                        format
+                    );
+                    return Ok(stream);
+                }
+                Err(e) => eprintln!(
+                    "[АУДИО] Динамики: формат {:?} / {} Гц / {} каналов не подошёл: {e}",
+                    format, rate, channels
+                ),
+            }
+        }
+        Err("ни один формат динамиков не открылся".into())
+    }
+
+    /// Поток вывода в формате самой карты (f32 там, где он есть, иначе i16).
+    /// Приём, джиттер-буфер, декодеры и маскирование от типа сэмпла не зависят,
+    /// поэтому параметризованы здесь, а не продублированы.
+    fn build_playback<T>(
+        output_device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
+        mixer: std::sync::Arc<crate::mixer::AudioMixer>,
+    ) -> Result<cpal::Stream, Box<dyn std::error::Error>>
+    where
+        T: cpal::SizedSample + cpal::FromSample<f32>,
+    {
+        let sample_rate = config.sample_rate.0;
+        let output_channels = config.channels as usize;
 
         // Приём ведётся отдельно на каждого собеседника: у Opus своё
         // внутреннее состояние (SILK/CELT), и один общий декодер на всех
@@ -234,6 +308,8 @@ impl UniversalAudioCapture {
 
         let mut mono_decoded = [0.0f32; 960];
         let mut pcm_buffer: Vec<f32> = Vec::with_capacity(3840);
+        // кадр для карты: сначала собираем в f32, в конце переводим в её тип
+        let mut out_scratch: Vec<f32> = Vec::new();
         let mut prebuffered = false;
         let mut peers: std::collections::HashMap<u64, Peer> = std::collections::HashMap::new();
         // диагностика приёма: по этим числам видно, что именно рвёт звук
@@ -242,8 +318,8 @@ impl UniversalAudioCapture {
         let mut last_report = std::time::Instant::now();
 
         let stream = output_device.build_output_stream(
-            &best_config,
-            move |data: &mut [f32], _| {
+            config,
+            move |data: &mut [T], _| {
                 // Принимаем входящие пакеты, переупорядочиваем по seq и декодируем
                 if let Ok(mut rx_lock) = rx.try_lock() {
                     while let Ok((sender_id, seq, packet)) = rx_lock.try_recv() {
@@ -364,41 +440,34 @@ impl UniversalAudioCapture {
                     last_report = std::time::Instant::now();
                 }
 
+                // Кадр собираем в f32 (нули — тишина) и в конце переводим в тип
+                // карты: у i16-устройства данные приходят другим типом.
                 let num_frames = data.len() / output_channels;
+                out_scratch.clear();
+                out_scratch.resize(num_frames, 0.0);
                 let min_prebuffer = (sample_rate as usize * 6) / 100; // 60 мс
 
-                if !prebuffered {
-                    if pcm_buffer.len() >= min_prebuffer {
-                        prebuffered = true;
-                    } else {
-                        data.fill(0.0);
-                        return;
-                    }
+                if !prebuffered && pcm_buffer.len() >= min_prebuffer {
+                    prebuffered = true;
                 }
-
-                if pcm_buffer.is_empty() {
+                if prebuffered && pcm_buffer.is_empty() {
                     prebuffered = false;
                     underruns += 1;
-                    data.fill(0.0);
-                    return;
+                }
+                if prebuffered {
+                    let available_frames = pcm_buffer.len().min(num_frames);
+                    out_scratch[..available_frames]
+                        .copy_from_slice(&pcm_buffer[..available_frames]);
+                    pcm_buffer.drain(..available_frames);
                 }
 
-                let available_frames = pcm_buffer.len().min(num_frames);
-
-                for i in 0..available_frames {
-                    let sample = pcm_buffer[i];
+                for (i, frame) in out_scratch.iter().enumerate() {
+                    let value = T::from_sample(*frame);
+                    let base = i * output_channels;
                     for ch in 0..output_channels {
-                        data[i * output_channels + ch] = sample;
+                        data[base + ch] = value;
                     }
                 }
-
-                for i in available_frames..num_frames {
-                    for ch in 0..output_channels {
-                        data[i * output_channels + ch] = 0.0;
-                    }
-                }
-
-                pcm_buffer.drain(..available_frames);
             },
             |e| eprintln!("[ОШИБКА] Ошибка выходного аудиопотока: {}", e),
             None,
