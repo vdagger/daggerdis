@@ -223,14 +223,18 @@ impl Converter {
                 ..Default::default()
             };
             stream.pInputSurface = std::mem::ManuallyDrop::new(Some(in_view));
-            self.video_context
-                .VideoProcessorBlt(
-                    &self.processor,
-                    &self.out_view,
-                    0,
-                    std::slice::from_ref(&stream),
-                )
-                .map_err(|e| format!("VideoProcessorBlt: {e}"))?;
+            let result = self.video_context.VideoProcessorBlt(
+                &self.processor,
+                &self.out_view,
+                0,
+                std::slice::from_ref(&stream),
+            );
+            // У `D3D11_VIDEO_PROCESSOR_STREAM` нет Drop (входные указатели —
+            // во `ManuallyDrop`), поэтому забытый `pInputSurface` утекает.
+            // Забираем вид обратно при любом исходе: иначе драйвер держал по
+            // копии кадра на каждый вызов — ~3 МБ на кадр 1080p.
+            drop(std::mem::ManuallyDrop::take(&mut stream.pInputSurface));
+            result.map_err(|e| format!("VideoProcessorBlt: {e}"))?;
             Ok(())
         }
     }
