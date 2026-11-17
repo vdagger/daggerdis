@@ -270,6 +270,14 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   streaming (sampled with `PrivateMemorySize64`, did not show in the working set
   until Windows made the pages resident). Both `win_decode.rs` and `win_mf.rs`
   now take the sample first and let it drop on every early return.
+- **Take the input view back out of `D3D11_VIDEO_PROCESSOR_STREAM` after
+  `VideoProcessorBlt`.** `pInputSurface` is a `ManuallyDrop` field and the struct
+  has no `Drop`, so the input view created for every frame in
+  `Converter::convert` was handed to the driver and never released — the driver
+  kept a frame-sized allocation per call (~3 MB at 1080p), which showed up as
+  growth both during a stream and across broadcast start/stop cycles (the
+  driver frees it late). `win_d3d.rs` now `ManuallyDrop::take`s it on every
+  `Blt` outcome. Headless check: `tools/video_probe/src/bin/cycles.rs`.
 - **Probe crate:** `tools/video_probe` is a separate package because `build.rs`
   link args (the requireAdministrator manifest) leak into examples and such a
   process cannot start in an SSH session. Build with
@@ -277,6 +285,13 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   --target-dir target` and `ALBUS_NO_ADMIN_MANIFEST=1` (build.rs skips the
   manifest when that variable is set). Its `Cargo.lock` is a copy of the root
   one (the crates.io cache is read-only for `Claude-Worker`) and is gitignored.
+  `src/bin/cycles.rs` is the start/stop leak finder: it creates and drops exactly
+  what lives between «Начать трансляцию» and «Остановить» (encoder, decoder, D3D
+  device, NV12 texture, converter) for N rounds and prints commit/working-set
+  after each, with no GUI involved. `--enc`, `--dec`, `--gpu` keep one stage
+  only; `--dev`, `--tex`, `--conv` cut inside the GPU path; `--upload`, `--blt`,
+  `--copy` cut inside the per-frame work. Vary the frame count to tell a
+  per-frame leak from a per-session one.
 - **Self-preview feedback:** showing your own stream on the same monitor feeds
   the capture loop continuously — expected behaviour, not a decoder bug.
 - **Video window:** own preview and remote streams are shown in a separate

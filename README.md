@@ -82,7 +82,7 @@ albus/
 │       └── room_panel.rs    # Строка ввода NodeID, Discord-карточки участников, персональная громкость
 │
 ├── tools/
-│   └── video_probe/         # Headless-проверки видеотракта (--capture, --gpu, --loopback)
+│   └── video_probe/         # Headless-проверки видеотракта (--capture, --gpu, --loopback) и поиск утечек (bin/cycles)
 ├── build.rs                 # UAC-манифест прав Администратора для сетевого доступа на Windows
 └── Cargo.toml               # Зависимости (tokio, iroh, cpal, rusty-opus, eframe, serde, windows)
 
