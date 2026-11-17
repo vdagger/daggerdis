@@ -108,13 +108,15 @@ impl TransmitAgc {
         let rms = (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt();
         let mut target = self.gain;
         if rms > Self::FLOOR_RMS {
-            // Огибающая RMS: быстрый захват, медленный спад
-            let coef = if rms > self.env_rms { 0.4 } else { 0.1 };
+            // Огибающая RMS: захват почти мгновенный, спад медленный
+            let coef = if rms > self.env_rms { 0.8 } else { 0.1 };
             self.env_rms += (rms - self.env_rms) * coef;
             let desired =
                 (Self::TARGET_RMS / self.env_rms.max(1e-4)).clamp(Self::MIN_GAIN, Self::MAX_GAIN);
-            // Вниз — быстрее, вверх — медленнее: так нет «выдоха» между слогами
-            let coef = if desired < self.gain { 0.3 } else { 0.05 };
+            // Вниз почти сразу: иначе первая доля громкой фразы проходит
+            // некомпрессированной и на слух получается «громко — резко тише».
+            // Вверх медленно: так нет «выдоха» между слогами.
+            let coef = if desired < self.gain { 0.7 } else { 0.05 };
             target = self.gain + (desired - self.gain) * coef;
         }
         // Усиление меняется не ступенькой на границе буфера, а плавно по нему:
