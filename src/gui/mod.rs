@@ -49,6 +49,11 @@ pub struct RadioApp {
     calls: Arc<crate::calls::CallManager>,
     active_chat: Option<String>,
     chat_input: String,
+    /// Счётчики непрочитанного на прошлом кадре: рост = новое сообщение,
+    /// о нём сообщаем тостом, потому что бейдж легко пропустить.
+    seen_unread: std::collections::HashMap<String, usize>,
+    /// Окно уже мигнуло в панели задач за текущий входящий звонок.
+    call_attention: bool,
     my_node_id: String,
     network_error: Option<String>,
     nick: String,
@@ -136,6 +141,8 @@ impl RadioApp {
             calls,
             active_chat: None,
             chat_input: String::new(),
+            seen_unread: std::collections::HashMap::new(),
+            call_attention: false,
             my_node_id,
             network_error,
             nick,
@@ -316,6 +323,32 @@ impl eframe::App for RadioApp {
         self.mixer.set_ring_mode(self.calls.ring_mode());
         while let Some(note) = self.calls.take_notice() {
             self.show_toast(&note);
+        }
+
+        // Непрочитанное: бейдж в шапке легко пропустить, поэтому о новом
+        // сообщении в закрытом чате говорим тостом.
+        for friend in self.friends.friends() {
+            let unread = self.chat_log.unread(&friend.node_id);
+            let prev = self.seen_unread.get(&friend.node_id).copied().unwrap_or(0);
+            let chat_visible = self.chat_open
+                && self.active_chat.as_deref() == Some(friend.node_id.as_str());
+            if unread > prev && !chat_visible {
+                self.show_toast(&format!("Новое сообщение · {}", friend.name));
+            }
+            self.seen_unread.insert(friend.node_id.clone(), unread);
+        }
+
+        // Входящий звонок: подсветить приложение в панели задач, если оно
+        // свёрнуто или закрыто другим окном, — иначе звонок пропускают.
+        if matches!(self.calls.view(), crate::calls::CallView::Incoming { .. }) {
+            if !self.call_attention {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Critical,
+                ));
+                self.call_attention = true;
+            }
+        } else {
+            self.call_attention = false;
         }
 
         #[cfg(windows)]
@@ -574,6 +607,13 @@ impl RadioApp {
                         if is_host {
                             t::badge(ui, "ХОСТ", t::GOLD);
                         }
+                        // Чат — в шапке эфира: в подвале бейдж непрочитанного
+                        // обрезался за нижним краем окна при размере по умолчанию.
+                        ui.add_space(8.0);
+                        let unread = self.unread_total();
+                        if chat_chip(ui, unread, self.chat_open).clicked() {
+                            open_chat = true;
+                        }
                     });
                 });
 
@@ -675,11 +715,6 @@ impl RadioApp {
                                     .monospace()
                                     .color(t::TEXT_MUTED),
                             );
-                            ui.add_space(8.0);
-                            let unread = self.unread_total();
-                            if chat_chip(ui, unread, self.chat_open).clicked() {
-                                open_chat = true;
-                            }
                         });
                     });
                 });
@@ -989,6 +1024,7 @@ impl RadioApp {
         // Как в макете: одна карточка на весь рейл, секции — волосяными
         // линиями во всю ширину, подвал прижат к низу внутри карточки.
         let footer_h = 28.0;
+        let mut do_leave = false;
 
         egui::Frame::none()
             .fill(t::SURFACE)
@@ -1006,14 +1042,17 @@ impl RadioApp {
 
                         let mut copy = false;
                         rail_section(ui, |ui| {
-                            crate::widgets::room_panel::draw_room_connect(
+                            if crate::widgets::room_panel::draw_room_connect(
                                 ui,
                                 &mut self.connect_ip_input,
                                 self.iroh.clone(),
                                 self.my_id,
                                 self.is_host.clone(),
                                 self.room.clone(),
-                            );
+                                &self.calls,
+                            ) {
+                                do_leave = true;
+                            }
                         });
                         rail_divider(ui);
 
@@ -1077,6 +1116,34 @@ impl RadioApp {
                     });
                 });
             });
+
+        if do_leave {
+            self.leave_voice();
+        }
+    }
+
+    /// «Выйти из эфира»: закрыть звонок, отпустить всех собеседников и не
+    /// пускать их обратно, пока не нажмут «Войти» или не позвонят снова.
+    fn leave_voice(&mut self) {
+        match self.calls.view() {
+            crate::calls::CallView::Active { .. } => self.calls.end_active(),
+            crate::calls::CallView::Outgoing { .. } => self.calls.cancel_outgoing(),
+            crate::calls::CallView::Incoming { .. } => {
+                self.calls.decline_incoming();
+            }
+            crate::calls::CallView::Idle => {}
+        }
+        self.mixer.set_ring_mode(self.calls.ring_mode());
+        // Флаг «вышли» ставится до обрыва соединений: иначе их последний
+        // IrohSync ещё успел бы вернуть собеседника в комнату.
+        self.room.leave();
+        self.is_host.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(p2p) = self.iroh.clone() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move { p2p.disconnect_all().await });
+            }
+        }
+        self.show_toast("Вы вышли из эфира");
     }
 
     fn draw_settings_overlay(&mut self, ctx: &egui::Context) {
@@ -1328,6 +1395,11 @@ impl RadioApp {
                     });
             });
 
+        // Открытый чат считается прочитанным: раньше счётчик копился вечно,
+        // и бейдж горел даже при уже просмотренной переписке.
+        self.chat_log.mark_read(&node_id);
+        self.seen_unread.insert(node_id.clone(), 0);
+
         if close {
             self.chat_open = false;
             self.chat_input.clear();
@@ -1349,6 +1421,16 @@ impl RadioApp {
         let mut decline = false;
         let mut cancel = false;
         let mut end = false;
+
+        // Esc работает как крупная кнопка: выйти из звонка, не целясь мышью.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            match view {
+                crate::calls::CallView::Incoming { .. } => decline = true,
+                crate::calls::CallView::Outgoing { .. } => cancel = true,
+                crate::calls::CallView::Active { .. } => end = true,
+                crate::calls::CallView::Idle => {}
+            }
+        }
 
         egui::Area::new(egui::Id::new("call_card"))
             .fixed_pos(pos)
@@ -1400,6 +1482,8 @@ impl RadioApp {
                                         accept = true;
                                     }
                                 });
+                                ui.add_space(4.0);
+                                t::micro(ui, "ESC — отклонить");
                             }
                             crate::calls::CallView::Outgoing { nick, elapsed } => {
                                 ui.horizontal(|ui| {
@@ -1429,9 +1513,25 @@ impl RadioApp {
                                     });
                                 });
                                 ui.add_space(10.0);
-                                if t::chip_button(ui, "Отменить", true).clicked() {
+                                let w = ui.available_width();
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(w, 30.0),
+                                        egui::Button::new(
+                                            egui::RichText::new("Отменить звонок")
+                                                .size(11.0)
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(t::REC)
+                                        .rounding(Rounding::same(8.0)),
+                                    )
+                                    .clicked()
+                                {
                                     cancel = true;
                                 }
+                                ui.add_space(4.0);
+                                t::micro(ui, "ESC — отменить");
                             }
                             crate::calls::CallView::Active { nick, elapsed } => {
                                 ui.horizontal(|ui| {
@@ -1461,9 +1561,25 @@ impl RadioApp {
                                     });
                                 });
                                 ui.add_space(10.0);
-                                if t::chip_button(ui, "Завершить", false).clicked() {
+                                let w = ui.available_width();
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(w, 32.0),
+                                        egui::Button::new(
+                                            egui::RichText::new("Завершить звонок")
+                                                .size(11.5)
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(t::REC)
+                                        .rounding(Rounding::same(8.0)),
+                                    )
+                                    .clicked()
+                                {
                                     end = true;
                                 }
+                                ui.add_space(4.0);
+                                t::micro(ui, "ESC — выйти из звонка");
                             }
                         }
                     });

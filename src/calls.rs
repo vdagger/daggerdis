@@ -20,8 +20,14 @@ const OUTGOING_TIMEOUT: Duration = Duration::from_secs(35);
 const INCOMING_TIMEOUT: Duration = Duration::from_secs(45);
 /// Датаграммы теряются: приглашение повторяем, пока не ответят
 const INVITE_RESEND: Duration = Duration::from_millis(1500);
-/// После отказа/отмены держим собеседника вне комнаты, пока рвётся соединение
-const BLOCK_AFTER: Duration = Duration::from_secs(45);
+/// После отказа/отмены/завершения держим собеседника вне комнаты. Долго, а не
+/// «пока рвётся соединение»: иначе через 45 с его IrohSync снова затаскивал
+/// нас в комнату, и завершённый звонок «возобновлялся» сам.
+/// Снимается явно: новым звонком или нажатием «Войти».
+const BLOCK_AFTER: Duration = Duration::from_secs(3600);
+/// Сколько отвечаем отказом на повторные Invite после того, как сами отказали:
+/// звонящий повторяет приглашение, пока не ответят.
+const DECLINED_AFTER: Duration = Duration::from_secs(45);
 /// Причина в CallDecline
 const REASON_DECLINED: u8 = 0;
 const REASON_BUSY: u8 = 1;
@@ -64,6 +70,8 @@ pub struct CallManager {
     phase: Mutex<CallPhase>,
     /// NodeID → до какого момента не пускать в комнату
     blocked: Mutex<HashMap<String, Instant>>,
+    /// NodeID → до какого момента отвечать отказом на повторные приглашения
+    declined: Mutex<HashMap<String, Instant>>,
     notice: Mutex<Option<String>>,
     my_nick: Mutex<String>,
     my_id: u64,
@@ -83,6 +91,7 @@ impl CallManager {
         Self {
             phase: Mutex::new(CallPhase::Idle),
             blocked: Mutex::new(HashMap::new()),
+            declined: Mutex::new(HashMap::new()),
             notice: Mutex::new(None),
             my_nick: Mutex::new(my_nick),
             my_id,
@@ -120,6 +129,15 @@ impl CallManager {
     fn blocked_now(&self, peer: &str) -> bool {
         let now = Instant::now();
         self.blocked
+            .lock()
+            .map(|m| m.get(peer).map(|until| now < *until).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// Мы сами отказали этому узлу недавно — его повторные Invite отклоняем
+    fn declined_now(&self, peer: &str) -> bool {
+        let now = Instant::now();
+        self.declined
             .lock()
             .map(|m| m.get(peer).map(|until| now < *until).unwrap_or(false))
             .unwrap_or(false)
@@ -185,6 +203,8 @@ impl CallManager {
                 last_invite: Instant::now(),
             };
         }
+        // Новый звонок — явное возвращение в эфир
+        self.room.join();
         self.unblock(peer);
         self.send_to(
             peer,
@@ -212,8 +232,9 @@ impl CallManager {
                     call_id,
                     started: Instant::now(),
                 });
-                // Согласие получено — снимаем блок и подтверждаем приём несколько
-                // раз: датаграмма с Accept может потеряться.
+                // Согласие получено — входим в эфир, снимаем блок и подтверждаем
+                // приём несколько раз: сообщение с Accept может потеряться.
+                self.room.join();
                 self.unblock(&peer);
                 self.send_accept_repeat(&peer, call_id);
                 true
@@ -230,6 +251,7 @@ impl CallManager {
         match self.take_phase() {
             Some(CallPhase::Incoming { peer, call_id, .. }) => {
                 self.send_decline(&peer, call_id, REASON_DECLINED);
+                self.mark_declined(&peer);
                 self.block(&peer, BLOCK_AFTER);
                 self.disconnect_later(&peer, 800);
                 true
@@ -256,6 +278,7 @@ impl CallManager {
                         call_id,
                     },
                 );
+                self.block(&peer, BLOCK_AFTER);
                 self.drop_from_room(&peer);
                 self.disconnect_later(&peer, 600);
             }
@@ -277,6 +300,10 @@ impl CallManager {
                         call_id,
                     },
                 );
+                // Завершили — собеседник больше не участник эфира, пока не
+                // позвонят или не нажмут «Войти». Иначе его Heartbeat/IrohSync
+                // через секунду возвращал его в комнату.
+                self.block(&peer, BLOCK_AFTER);
                 self.drop_from_room(&peer);
                 self.disconnect_later(&peer, 600);
             }
@@ -292,7 +319,7 @@ impl CallManager {
         };
         match current {
             CallPhase::Idle => {
-                if self.blocked_now(peer) {
+                if self.declined_now(peer) {
                     // Повторный Invite после отказа — отвечаем отказом снова
                     self.send_decline(peer, call_id, REASON_DECLINED);
                 } else {
@@ -353,6 +380,7 @@ impl CallManager {
                         started: Instant::now(),
                     });
                     println!("[ЗВОНКИ] Встречный звонок с {} — принимаем", short(peer));
+                    self.room.join();
                     self.unblock(peer);
                     self.send_accept_repeat(peer, call_id);
                 } else {
@@ -418,6 +446,7 @@ impl CallManager {
         };
         if activated {
             // Мы вошли в комнату собеседника, он — хост
+            self.room.join();
             self.is_host.store(false, Ordering::SeqCst);
             self.unblock(peer);
             println!("[ЗВОНКИ] {} принял звонок", short(peer));
@@ -481,7 +510,7 @@ impl CallManager {
         };
         if ended {
             self.set_notice("Звонок завершён".to_string());
-            self.block(peer, Duration::from_secs(5));
+            self.block(peer, BLOCK_AFTER);
             self.drop_from_room(peer);
             self.disconnect_later(peer, 100);
         }
@@ -549,6 +578,7 @@ impl CallManager {
             } else {
                 self.set_notice(format!("Пропущенный звонок: {nick}"));
                 self.send_decline(&peer, 0, REASON_TIMEOUT);
+                self.mark_declined(&peer);
                 self.block(&peer, BLOCK_AFTER);
                 self.disconnect_later(&peer, 400);
             }
@@ -671,10 +701,27 @@ impl CallManager {
         }
     }
 
+    /// Запомнили собственный отказ: повторы Invite от этого узла отклоняем
+    fn mark_declined(&self, peer: &str) {
+        if let Ok(mut m) = self.declined.lock() {
+            let now = Instant::now();
+            m.retain(|_, until| now < *until);
+            m.insert(peer.to_string(), now + DECLINED_AFTER);
+        }
+    }
+
     fn unblock(&self, peer: &str) {
         if let Ok(mut m) = self.blocked.lock() {
             m.remove(peer);
         }
+        if let Ok(mut m) = self.declined.lock() {
+            m.remove(peer);
+        }
+    }
+
+    /// Явный вход в комнату по NodeID снимает все ограничения с этого узла.
+    pub fn unblock_peer(&self, peer: &str) {
+        self.unblock(peer);
     }
 }
 

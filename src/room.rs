@@ -1,9 +1,14 @@
 use crate::types::Peer;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 pub struct RoomManager {
     my_id: u64,
     peers: Mutex<Vec<Peer>>,
+    /// Пользователь сам вышел из эфира: IrohSync/Heartbeat/AudioFrame от
+    /// собеседников игнорируются, иначе они за секунду вернули бы его в комнату.
+    /// Снимается явным «Войти» или принятым/начатым звонком.
+    left: AtomicBool,
 }
 
 impl RoomManager {
@@ -11,7 +16,23 @@ impl RoomManager {
         RoomManager {
             my_id,
             peers: Mutex::new(Vec::new()),
+            left: AtomicBool::new(false),
         }
+    }
+
+    /// Явно выйти из эфира: убрать всех и не пускать обратно до нового входа
+    pub fn leave(&self) {
+        self.left.store(true, Ordering::SeqCst);
+        self.peers.lock().unwrap().clear();
+    }
+
+    /// Вернуться в эфир (нажали «Войти» или начали/приняли звонок)
+    pub fn join(&self) {
+        self.left.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_left(&self) -> bool {
+        self.left.load(Ordering::SeqCst)
     }
 
     pub fn update_peer(&self, peer: Peer) {

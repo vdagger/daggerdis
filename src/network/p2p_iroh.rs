@@ -75,7 +75,10 @@ impl IrohP2pManager {
                             .lock()
                             .await
                             .insert(remote_id.clone(), conn.clone());
-                        Self::spawn_datagram_receiver(conn, remote_id, tx_accept.clone());
+                        Self::spawn_datagram_receiver(conn.clone(), remote_id.clone(), tx_accept.clone());
+                        // Надёжный путь для сообщений (чат, звонки): датаграм
+                        // может потеряться, поток — нет.
+                        Self::spawn_stream_receiver(conn, remote_id, tx_accept.clone());
                     }
                     Err(e) => {
                         eprintln!("[IROH] Ошибка входящего рукопожатия: {}", e);
@@ -110,7 +113,8 @@ impl IrohP2pManager {
             .lock()
             .await
             .insert(trimmed.to_string(), conn.clone());
-        Self::spawn_datagram_receiver(conn, trimmed.to_string(), self.incoming_tx.clone());
+        Self::spawn_datagram_receiver(conn.clone(), trimmed.to_string(), self.incoming_tx.clone());
+        Self::spawn_stream_receiver(conn, trimmed.to_string(), self.incoming_tx.clone());
         Ok(())
     }
 
@@ -136,6 +140,36 @@ impl IrohP2pManager {
                         println!("[IROH] P2P-соединение с {} разорвано.", remote_id);
                         break;
                     }
+                }
+            }
+        });
+    }
+
+    /// Читает надёжные uni-стримы: сюда приходит то, что не поместилось в
+    /// датаграм или потерялось бы в нём (чат, приглашения звонка).
+    fn spawn_stream_receiver(
+        conn: Connection,
+        remote_id: String,
+        tx: mpsc::Sender<IncomingPacket>,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                let Ok(mut recv) = conn.accept_uni().await else {
+                    break;
+                };
+                // Сообщения маленькие; больше 64 КиБ — точно мусор
+                let Ok(data) = recv.read_to_end(64 * 1024).await else {
+                    continue;
+                };
+                if data.is_empty() {
+                    continue;
+                }
+                let pkt = IncomingPacket {
+                    sender_id: remote_id.clone(),
+                    data,
+                };
+                if tx.send(pkt).await.is_err() {
+                    break;
                 }
             }
         });
@@ -177,18 +211,71 @@ impl IrohP2pManager {
         self.connections.lock().await.keys().cloned().collect()
     }
 
-    /// Отправляет сырые байты (Opus / NetworkMessage) указанному NodeID
+    /// Отправляет сырые байты (Opus / NetworkMessage) указанному NodeID.
+    ///
+    /// Датаграм уходит только в живое соединение. Раньше запись в закрытое
+    /// (пир перезапустился или соединение уснуло по idle timeout) молча
+    /// возвращала Ok, и «Позвонить» звонил в пустоту: у звонящего таймер шёл,
+    /// у собеседника — тишина. Теперь мёртвое соединение выбрасывается,
+    /// переподключение и повтор, а если датаграм так и не прошёл — надёжный
+    /// uni-стрим (для чата и звонков потеря недопустима).
     pub async fn send_bytes(
         &self,
         target_id_str: &str,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let conns = self.connections.lock().await;
-        if let Some(conn) = conns.get(target_id_str) {
-            let bytes = Bytes::copy_from_slice(data);
-            conn.send_datagram(bytes)?;
+        let bytes = Bytes::copy_from_slice(data);
+        let target = target_id_str.trim().to_string();
+
+        let mut stale = false;
+        {
+            let conns = self.connections.lock().await;
+            match conns.get(&target) {
+                Some(conn) if conn.close_reason().is_none() => {
+                    if conn.send_datagram(bytes.clone()).is_ok() {
+                        return Ok(());
+                    }
+                    stale = true;
+                }
+                Some(_) => stale = true,
+                None => {}
+            }
         }
+        if stale {
+            self.connections.lock().await.remove(&target);
+        }
+
+        let conn = {
+            let existing = self.connections.lock().await.get(&target).cloned();
+            match existing {
+                Some(conn) if conn.close_reason().is_none() => conn,
+                _ => {
+                    self.connect_to_peer(&target).await?;
+                    self.connections
+                        .lock()
+                        .await
+                        .get(&target)
+                        .cloned()
+                        .ok_or("соединение не установлено")?
+                }
+            }
+        };
+        if conn.send_datagram(bytes.clone()).is_ok() {
+            return Ok(());
+        }
+        let mut send = conn.open_uni().await?;
+        send.write_all(&bytes).await?;
+        let _ = send.finish();
         Ok(())
+    }
+
+    /// Закрывает все соединения — «выйти из эфира».
+    pub async fn disconnect_all(&self) {
+        let conns: Vec<(String, Connection)> = self.connections.lock().await.drain().collect();
+        for (node_id, conn) in conns {
+            println!("[IROH] Соединение с {} закрыто (выход из эфира).", node_id);
+            conn.close(0u32.into(), b"left room");
+        }
     }
 
     /// Принимает следующий входящий пакет

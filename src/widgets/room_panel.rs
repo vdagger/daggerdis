@@ -193,7 +193,8 @@ pub fn draw_participants(
     }
 }
 
-/// Комната: вход по NodeID
+/// Комната: вход по NodeID. Возвращает true, если пользователь попросил выйти
+/// из эфира (тогда gui закрывает звонок и рвёт соединения).
 pub fn draw_room_connect(
     ui: &mut egui::Ui,
     connect_ip: &mut String,
@@ -201,7 +202,9 @@ pub fn draw_room_connect(
     my_id: u64,
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
     room: std::sync::Arc<crate::room::RoomManager>,
-) {
+    calls: &Arc<crate::calls::CallManager>,
+) -> bool {
+    let mut leave = false;
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Комната")
@@ -243,9 +246,36 @@ pub fn draw_room_connect(
             });
 
         if t::primary_button(ui, "Войти", egui::vec2(btn_width, 44.0)).clicked() {
-            join_room(connect_ip, iroh.clone(), my_id, is_host.clone());
+            room.join();
+            join_room(connect_ip, iroh.clone(), my_id, is_host.clone(), room.clone(), calls);
         }
     });
+
+    // Выход из эфира: без него из активного звонка выбирались только закрытием
+    // приложения, а завершённый звонок через секунду «возобновлялся» сам.
+    if !room.get_all_peers().is_empty() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let width = ui.available_width();
+            if ui
+                .add_sized(
+                    egui::vec2(width, 28.0),
+                    egui::Button::new(
+                        egui::RichText::new("Выйти из эфира")
+                            .size(10.5)
+                            .strong()
+                            .color(t::REC),
+                    )
+                    .fill(t::with_alpha(t::REC, 0.10))
+                    .rounding(Rounding::same(8.0))
+                    .stroke(Stroke::new(1.0_f32, t::with_alpha(t::REC, 0.35))),
+                )
+                .clicked()
+            {
+                leave = true;
+            }
+        });
+    }
 
     let peers = room.get_all_peers();
     if !is_host.load(Ordering::Relaxed) {
@@ -261,6 +291,8 @@ pub fn draw_room_connect(
                 .color(t::TEXT_MUTED),
         );
     }
+
+    leave
 }
 
 /// Свой NodeID и копирование — одной строкой, как в макете.
@@ -328,6 +360,8 @@ fn join_room(
     iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    room: std::sync::Arc<crate::room::RoomManager>,
+    calls: &Arc<crate::calls::CallManager>,
 ) {
     let raw_addr = connect_ip.trim();
 
@@ -344,6 +378,10 @@ fn join_room(
     let target_node_id = raw_addr.to_string();
     let my_peer_id = my_id;
 
+    // Явный вход: возвращаемся в эфир и снимаем блокировку, оставшуюся после
+    // прошлого завершённого звонка.
+    room.join();
+    calls.unblock_peer(&target_node_id);
     is_host.store(false, Ordering::SeqCst);
     println!(
         "[СЕТЬ] Подключение к узлу (Iroh P2P). Цель: {}",

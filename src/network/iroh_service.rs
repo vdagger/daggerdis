@@ -71,7 +71,9 @@ pub fn spawn_iroh_receiver(
                             // Звонящий, которого ещё не приняли, в комнату не попадает:
                             // IrohSync рассылается раз в секунду и иначе добавлял бы
                             // его в участники в обход согласия на звонок.
-                            if calls_iroh.is_blocked(&pkt.sender_id) {
+                            // Пользователь вышел из эфира сам — не возвращаем его
+                            // туда авто-синхронизацией.
+                            if calls_iroh.is_blocked(&pkt.sender_id) || room_iroh.is_left() {
                                 continue;
                             }
 
@@ -134,7 +136,7 @@ pub fn spawn_iroh_receiver(
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            if calls_iroh.is_blocked(&pkt.sender_id) {
+                            if calls_iroh.is_blocked(&pkt.sender_id) || room_iroh.is_left() {
                                 continue;
                             }
                             let is_peer_host = room_iroh
@@ -161,7 +163,7 @@ pub fn spawn_iroh_receiver(
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            if calls_iroh.is_blocked(&pkt.sender_id) {
+                            if calls_iroh.is_blocked(&pkt.sender_id) || room_iroh.is_left() {
                                 continue;
                             }
                             room_iroh.update_peer(crate::types::Peer {
