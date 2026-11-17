@@ -279,6 +279,15 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   default config, and `build_playback<T>` is generic over the sample type (the
   jitter buffer and decoders stay in f32 and are converted at the end of the
   callback). The chosen format is printed with the device line.
+- **A multichannel endpoint gets the signal in two channels only.** On a
+  virtual 7.1 output (`Динамики (7.1 Surround Sound)`, 8 channels) writing the
+  same mono sample into all eight made the peer's speech a mush: the
+  virtualizer mixes those eight identical copies with different delays, so
+  comb filtering smears the voice. Candidates are now sorted by channel count
+  (f32 before i16, then fewer channels), and the callback writes only the
+  first two channels (`active_channels = channels.min(2)`), leaving the rest
+  silent. Feeding LFE/center/surround with a copy of the front pair is never
+  what a plain stereo signal should do.
 - **A silent "nothing plays" must be visible in the console.** `main.rs` used to
   swallow `create_playback_stream`/`create_input_stream` errors with `if let Ok`,
   so a failed stream looked like a working app that transmits but stays quiet.
