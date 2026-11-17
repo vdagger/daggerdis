@@ -216,6 +216,12 @@ video window. Peers who join mid-stream are not subscribed yet.
   taken from `StreamInfo.fps` — 30 or 60): preview and remote stream still push every
   frame through the decoder (a skipped P-frame breaks the chain) but only show that
   many per second, so a burst cannot flood the GPU readback and texture upload.
+- **Readback never blocks the GUI:** `Renderer` starts the GPU conversion
+  (`converter.convert`) and collects the result on a later update with
+  `read_back_nowait` (`D3D11_MAP_FLAG_DO_NOT_WAIT`; `DXGI_ERROR_WAS_STILL_DRAWING`
+  yields `Ok(None)` and the frame is retried next update). A blocking `Map` waits for
+  the video processor to finish — at 1080p that cost ~30 ms per frame and pinned the
+  preview at ~30 fps even though the stream ran at 60.
 - **Stream rate is a setting:** `video_fps=30|60` in `config.ini`, picked in the
   broadcast panel before starting (default 60); it threads through
   `VideoSession::start(fps)` → `ScreenPublisher::start(fps)` → capture, encoder and
