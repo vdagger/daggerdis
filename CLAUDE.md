@@ -85,7 +85,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/friends.rs` | `FriendsManager`: `friends.json` (node_id/name/date), incoming/outgoing requests |
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
 | `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
-| `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election |
+| `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate + AGC, per-peer mix bus |
 | `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
@@ -95,7 +95,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
 | `src/network/mod.rs` | Re-exports `NetworkMessage`; declares `broadcast`, `iroh_service`, `message`, `p2p_iroh` |
-| `src/network/p2p_iroh.rs` | `IrohP2pManager`: QUIC datagrams, connect by NodeID, `broadcast_bytes` |
+| `src/network/p2p_iroh.rs` | `IrohP2pManager`: QUIC datagrams + uni-стримы (`send_bytes` с переподключением, `spawn_stream_receiver`), connect by NodeID, `broadcast_bytes`, `disconnect_peer`/`disconnect_all` |
 | `src/network/iroh_service.rs` | `spawn_iroh_receiver`: Iroh listener, sender_id↔NodeID check, full-mesh, relay, friends, chat, звонки (гейт по `CallManager::is_blocked`) |
 | `src/network/broadcast.rs` | `spawn_audio_broadcast`: parallel voice fan-out over Iroh |
 | `src/network/message.rs` | `NetworkMessage` enum + hand-rolled binary (de)serialization |
@@ -265,13 +265,34 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   секунду и вычищают молчащих >12 с, поэтому согласие держится не состоянием, а
   гейтом: `CallManager::is_blocked` отбрасывает `IrohSync`/`Heartbeat`/`AudioFrame`
   от собеседника в состоянии Outgoing/Incoming (35/45 с), а отказ/таймаут/отмена/
-  завершение дополнительно закрывают QUIC-соединение (`disconnect_peer`) — иначе
-  следующий `IrohSync` вернул бы его в комнату. Приглашение переотправляется раз в
-  1.5 с, `CallAccept` — трижды; одновременный вызов с двух сторон разрешается
-  автоответом на встречное приглашение. Отклонение/«занято»/«не ответил» видны
-  тостом; шапка звонка — оверлей `draw_call_overlay`. Тон звонка синтезируется в
-  колбэке воспроизведения (`mixer.ring_mode`: 1 — входящий, 2 — исходящий) после
-  master gain и до миксового лимитера, поэтому не зависит от громкости собеседников.
+  завершение держат его вне комнаты `BLOCK_AFTER` = 1 час и дополнительно закрывают
+  QUIC-соединение (`disconnect_peer`) — 45 с хватало ровно до следующего `IrohSync`,
+  и завершённый звонок «возобновлялся» сам. Блок снимается явно: новым звонком
+  (`start_outgoing`/`accept_incoming`/`on_accept`), кнопкой «Войти» или «Выйти из
+  эфира». Свой отказ запоминается отдельно (`declined`, 45 с) и переживает блок:
+  другу после отказа можно позвонить снова, а повторы Invite ещё 45 с получают
+  `CallDecline`. Приглашение переотправляется раз в 1.5 с, `CallAccept` — трижды;
+  одновременный вызов с двух сторон разрешается автоответом на встречное
+  приглашение. Отклонение/«занято»/«не ответил» видны тостом; шапка звонка —
+  оверлей `draw_call_overlay` с крупной красной кнопкой «Завершить звонок»
+  («Отменить звонок» у исходящего), `Esc` делает то же самое. На входящем звонке
+  окно один раз запрашивает внимание панели задач
+  (`ViewportCommand::RequestUserAttention`), иначе свёрнутое приложение звонок
+  «просто не слышно». Тон звонка синтезируется в колбэке воспроизведения
+  (`mixer.ring_mode`: 1 — входящий, 2 — исходящий) после master gain и до
+  миксового лимитера, поэтому не зависит от громкости собеседников. Отдельная
+  причина «звонит у звонящего, у принимающего тишина» — `send_bytes`
+  раньше молча возвращал Ok при отсутствующем или мёртвом соединении: теперь он
+  выбрасывает закрытую запись (`Connection::close_reason`), переподключается и
+  повторяет, а если датаграм не прошёл — шлёт сообщение надёжным uni-стримом
+  (его читает `spawn_stream_receiver` рядом с приёмником датаграмм).
+- **«Выйти из эфира» (`RoomManager::leave`):** красная кнопка в секции «Комната»
+  (видна, когда в комнате есть собеседники) завершает/отменяет/отклоняет звонок,
+  очищает участников, ставит флаг `left` и рвёт все QUIC-соединения
+  (`disconnect_all`). Пока флаг стоит, `iroh_service` отбрасывает `IrohSync`,
+  `Heartbeat` и `AudioFrame` — иначе автосинхронизация mesh возвращает всех в
+  комнату за секунду. Снимается «Войти» или начатым/принятым звонком (`room.join`).
+  До этого из активного звонка можно было выйти только закрытием приложения.
 - **«Не запускается» = две разные причины.** exe несёт манифест
   `requireAdministrator`, поэтому из обычного терминала/без подтверждения UAC
   процесс получает «requires elevation» и молча не стартует. Если же UAC
@@ -287,9 +308,17 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   не поднять вовсе — приложение проверяется на обычной машине.
 - **Chat (DM):** session-only and in-memory (`src/chat.rs`, never persisted) — by
   design, so chat history cannot leak to disk. Friends-only: messages from non-friends
-  are dropped. Transport is iroh **datagrams** (same as friends/control), so delivery
-  is best-effort with no ack/retry; a dropped datagram loses the message. Text is
+  are dropped. Transport is iroh **datagrams** with a reliable uni-stream fallback in
+  `IrohP2pManager::send_bytes` (reconnect + retry when the map entry is dead or the
+  datagram fails), so a lost datagram no longer loses the message. Text is
   capped to 1024 bytes on send (QUIC datagram MTU).
+- **Unread chat:** `ChatLog` counts unread per NodeID. The badge lives on the
+  «Чат» chip in the **«Эфир» header row**, not in the console footer — at the default
+  window size the footer is clipped below the edge, so the badge was invisible.
+  An open chat overlay calls `mark_read` every frame (before, the counter only grew,
+  so the badge never cleared), and a rise in a friend's unread count while their
+  chat is closed also shows a toast «Новое сообщение · <ник>» — the badge alone is
+  easy to miss.
 - **Video pipeline (Windows):** DXGI capture (BGRA, GPU) → `ID3D11VideoProcessor`
   converts/scales to NV12 on the GPU → hardware H.264 MFT → iroh → decoder MFT →
   NV12 → Video Processor → BGRA → egui texture. Bitrate is `pixels × fps ×
