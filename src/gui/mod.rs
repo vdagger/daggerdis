@@ -560,6 +560,11 @@ impl RadioApp {
                         if running {
                             self.video = None;
                             self.video_fullscreen = false;
+                            // закрыть видео-соединения со зрителями: иначе
+                            // каждый следующий старт добавляет по соединению
+                            if let Some(link) = &self.video_link {
+                                link.stop_viewers();
+                            }
                         } else {
                             match video_session::VideoSession::start(fps) {
                                 Ok(v) => {

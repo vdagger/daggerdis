@@ -52,10 +52,22 @@ struct RemoteQueue {
     resync: bool,
 }
 
+/// Открытое видео-соединение к одному зрителю. Соединение живёт внутри
+/// задачи отправки; `stop` её будит, и вместе с задачей освобождается
+/// QUIC-соединение и его буферы.
+struct Viewer {
+    node: String,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
 pub struct VideoLink {
     p2p: Arc<IrohP2pManager>,
     outgoing: broadcast::Sender<Arc<Vec<u8>>>,
     remote: std::sync::Mutex<RemoteQueue>,
+    /// Активные зрители текущей трансляции. Раньше каждый старт добавлял
+    /// новое соединение на каждого зрителя и старое никто не закрывал —
+    /// память росла с каждым «стоп/старт».
+    viewers: std::sync::Mutex<Vec<Viewer>>,
 }
 
 impl VideoLink {
@@ -68,6 +80,7 @@ impl VideoLink {
                 frames: VecDeque::new(),
                 resync: false,
             }),
+            viewers: std::sync::Mutex::new(Vec::new()),
         });
         let l = link.clone();
         rt.spawn(async move { l.accept_loop().await });
@@ -92,6 +105,11 @@ impl VideoLink {
                         Some(frame) => me.push_remote(frame),
                         None => eprintln!("[ВИДЕО] Битый кадр от {}", from),
                     }
+                }
+                // трансляция кончилась — недоигранные кадры этого потока
+                // держать незачем (до 30 кадров на очередь)
+                if let Ok(mut q) = me.remote.lock() {
+                    q.frames.retain(|f| f.from != from);
                 }
                 println!("[ВИДЕО] Поток от {} завершён", from);
             });
@@ -128,27 +146,64 @@ impl VideoLink {
             eprintln!("[ВИДЕО] Некорректный NodeID зрителя: {trimmed}");
             return;
         };
+
+        // этому зрителю уже раздаём — второе соединение не нужно
+        if let Ok(mut viewers) = self.viewers.lock() {
+            viewers.retain(|v| !*v.stop.borrow());
+            if viewers.iter().any(|v| v.node == trimmed) {
+                return;
+            }
+        }
+
         match self.p2p.endpoint().connect(target, VIDEO_ALPN).await {
             Ok(conn) => {
                 println!("[ВИДЕО] Зритель подключён: {}", trimmed);
                 let mut rx = self.outgoing.subscribe();
+                let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+                if let Ok(mut viewers) = self.viewers.lock() {
+                    viewers.push(Viewer {
+                        node: trimmed.clone(),
+                        stop,
+                    });
+                }
                 tokio::spawn(async move {
                     loop {
-                        match rx.recv().await {
-                            Ok(frame) => match conn.open_uni().await {
-                                Ok(mut send) => {
-                                    let _ = send.write_all(&frame).await;
-                                    let _ = send.finish();
+                        // остановка трансляции рвёт и задачу, и соединение:
+                        // задроченные копии переживали «Стоп» предыдущей версии
+                        tokio::select! {
+                            changed = stop_rx.changed() => {
+                                if changed.is_err() || *stop_rx.borrow() {
+                                    break;
                                 }
+                            }
+                            frame = rx.recv() => match frame {
+                                Ok(frame) => match conn.open_uni().await {
+                                    Ok(mut send) => {
+                                        let _ = send.write_all(&frame).await;
+                                        let _ = send.finish();
+                                    }
+                                    Err(_) => break,
+                                },
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
                                 Err(_) => break,
                             },
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(_) => break,
                         }
                     }
+                    drop(conn);
                 });
             }
             Err(e) => eprintln!("[ВИДЕО] Не удалось подключиться к {trimmed}: {e}"),
+        }
+    }
+
+    /// Закрывает все видео-соединения: трансляция остановлена. Без этого
+    /// каждый следующий старт добавлял по соединению на зрителя, а старые
+    /// оставались висеть и держали память.
+    pub fn stop_viewers(&self) {
+        if let Ok(mut viewers) = self.viewers.lock() {
+            for v in viewers.drain(..) {
+                let _ = v.stop.send(true);
+            }
         }
     }
 
