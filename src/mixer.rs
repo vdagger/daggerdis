@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
+/// Порог лимитера: −1.0 dBFS = 0.891
+const LIMIT_THRESHOLD: f32 = 0.891;
+
 /// Преобразует значение ползунка 0..=300 в логарифмический коэффициент усиления
 fn slider_to_gain(val: u32) -> f32 {
     let v = val as f32;
@@ -13,6 +16,108 @@ fn slider_to_gain(val: u32) -> f32 {
         let boost_ratio = (v - 100.0) / 200.0; // 0.0 .. 1.0
         let db = boost_ratio * 18.0; // 0.0 .. +18.0 dB
         10.0f32.powf(db / 20.0)
+    }
+}
+
+/// Подпись ползунка в дБ (для UI громкости участника)
+pub fn slider_to_db(val: u32) -> f32 {
+    if val == 0 {
+        return -30.0;
+    }
+    20.0 * slider_to_gain(val).log10()
+}
+
+/// Обратное преобразование: дБ -> значение ползунка 0..=300
+pub fn db_to_slider(db: f32) -> u32 {
+    if db <= 0.0 {
+        ((10.0f32.powf(db / 20.0)) * 100.0).round().clamp(0.0, 100.0) as u32
+    } else {
+        (100.0 + (db / 18.0) * 200.0).round().clamp(100.0, 300.0) as u32
+    }
+}
+
+/// Лимитер без задержки: атака мгновенная (гейн применяется к тому же семплу,
+/// поэтому выброса выше порога не бывает), восстановление плавное (~150 мс).
+/// Ставится один раз на общий микс — сколько бы собеседников ни говорило
+/// одновременно, на выходе не больше −1 dBFS.
+pub struct Limiter {
+    threshold: f32,
+    release_coef: f32,
+    gain: f32,
+}
+
+impl Limiter {
+    pub fn new(sample_rate: u32) -> Self {
+        let release_coef = 1.0 - (-1.0f32 / (0.15 * sample_rate as f32)).exp();
+        Self {
+            threshold: LIMIT_THRESHOLD,
+            release_coef,
+            gain: 1.0,
+        }
+    }
+
+    pub fn process(&mut self, buf: &mut [f32]) {
+        for sample in buf.iter_mut() {
+            let peak = sample.abs();
+            let needed = if peak > self.threshold {
+                self.threshold / peak
+            } else {
+                1.0
+            };
+            if needed < self.gain {
+                self.gain = needed;
+            } else {
+                self.gain += (needed - self.gain) * self.release_coef;
+            }
+            *sample *= self.gain;
+        }
+    }
+}
+
+/// Автоматическая регулировка усиления микрофона: тихий голос подтягивается
+/// до цели по RMS, громкий осаживается — как AGC в Discord. Без него тихий
+/// микрофон уходил в эфир тихим, и громкость приходилось добирать уже у
+/// собеседника на приёме.
+pub struct TransmitAgc {
+    env_rms: f32,
+    gain: f32,
+}
+
+impl TransmitAgc {
+    /// Цель по RMS: −20 dBFS. Это речь с пиками около −8 dBFS.
+    const TARGET_RMS: f32 = 0.10;
+    /// Ниже этого RMS не считаем сигнал речью и не трогаем усиление
+    /// (шум в паузах не должен разгонять AGC).
+    const FLOOR_RMS: f32 = 0.002;
+    /// Диапазон усиления: −12 .. +24 дБ
+    const MIN_GAIN: f32 = 0.25;
+    const MAX_GAIN: f32 = 15.85;
+
+    pub fn new() -> Self {
+        Self {
+            env_rms: 0.0,
+            gain: 1.0,
+        }
+    }
+
+    pub fn process(&mut self, buf: &mut [f32]) {
+        if buf.is_empty() {
+            return;
+        }
+        let rms = (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt();
+        if rms > Self::FLOOR_RMS {
+            // Огибающая RMS: быстрый захват, медленный спад
+            let coef = if rms > self.env_rms { 0.4 } else { 0.1 };
+            self.env_rms += (rms - self.env_rms) * coef;
+            let desired =
+                (Self::TARGET_RMS / self.env_rms.max(1e-4)).clamp(Self::MIN_GAIN, Self::MAX_GAIN);
+            // Вниз — быстрее, вверх — медленнее: так нет «выдоха» между слогами
+            let coef = if desired < self.gain { 0.3 } else { 0.05 };
+            self.gain += (desired - self.gain) * coef;
+        }
+        for sample in buf.iter_mut() {
+            *sample *= self.gain;
+        }
     }
 }
 
@@ -70,29 +175,16 @@ impl AudioMixer {
         }
     }
 
-    /// Обрабатывает выходной аудио-буфер с логарифмическим бустом и студийным лимитером (-1 dBFS)
+    /// Применяет громкость участника к его декодированному буферу и замеряет пик.
+    /// Общий лимитер здесь не нужен: голоса складываются в один микс-буфер,
+    /// ограничивает уже его `Limiter` в конце колбэка вывода — иначе персональный
+    /// буст упирался в лимитер собственного голоса и +18 дБ было не слышно.
     pub fn process_output(&self, peer_id: u64, buffer: &mut [f32]) {
-        let volume_gain = slider_to_gain(self.output_volume.load(Ordering::Relaxed));
         let peer_gain = slider_to_gain(self.get_peer_volume(peer_id));
-        let combined_gain = volume_gain * peer_gain;
-
-        // Порог лимитера: -1.0 dBFS = 0.891
-        const THRESHOLD: f32 = 0.891;
 
         let mut peak = 0.0f32;
         for sample in buffer.iter_mut() {
-            let boosted = *sample * combined_gain;
-            let abs_val = boosted.abs();
-
-            if abs_val <= THRESHOLD {
-                // В рабочем диапазоне звук остается 100% прозрачным, без искажений
-                *sample = boosted;
-            } else {
-                // Мягкое компрессионное колено: пики сглаживаются до 0.99 без треска и клиппинга
-                let excess = abs_val - THRESHOLD;
-                let compressed = THRESHOLD + (1.0 - THRESHOLD) * (excess / (1.0 + excess));
-                *sample = boosted.signum() * compressed.min(0.99);
-            }
+            *sample *= peer_gain;
             peak = peak.max(sample.abs());
         }
 
@@ -106,6 +198,11 @@ impl AudioMixer {
                 meter.peak *= 0.35;
             }
         }
+    }
+
+    /// Общая громкость собеседников (коэффициент для сведённого микса)
+    pub fn master_gain(&self) -> f32 {
+        slider_to_gain(self.output_volume.load(Ordering::Relaxed))
     }
 
     /// Пиковый уровень собеседника для мини-индикатора (0..=1)

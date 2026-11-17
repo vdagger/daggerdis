@@ -156,16 +156,25 @@ pub fn draw_participants(
                     ui,
                     popup_id,
                     &speaker,
-                    egui::popup::PopupCloseBehavior::CloseOnClick,
+                    // CloseOnClick закрывал попап от любого клика, включая
+                    // клик по самому слайдеру: тянуть его было невозможно.
+                    egui::popup::PopupCloseBehavior::CloseOnClickOutside,
                     |ui| {
-                        ui.set_min_width(150.0);
-                        ui.spacing_mut().slider_width = 96.0;
-                        let mut volume = mixer.get_peer_volume(peer.id);
+                        ui.set_min_width(170.0);
+                        ui.spacing_mut().slider_width = 110.0;
+                        // Шкала в дБ: −30 .. +18, шаг 0.5 — прибавлять/убавлять
+                        // человека на понятное число децибел, а не на проценты.
+                        let mut db = crate::mixer::slider_to_db(mixer.get_peer_volume(peer.id));
                         if ui
-                            .add(egui::Slider::new(&mut volume, 0..=300).suffix("%"))
+                            .add(
+                                egui::Slider::new(&mut db, -30.0..=18.0)
+                                    .step_by(0.5)
+                                    .suffix(" дБ")
+                                    .fixed_decimals(1),
+                            )
                             .changed()
                         {
-                            mixer.set_peer_volume(peer.id, volume);
+                            mixer.set_peer_volume(peer.id, crate::mixer::db_to_slider(db));
                         }
                     },
                 );

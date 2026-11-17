@@ -93,6 +93,8 @@ impl UniversalAudioCapture {
         let mut mono_chunk: Vec<f32> = Vec::with_capacity(960);
         let mut resample_pos: f64 = 0.0;
         let mut gate_gain: f32 = 0.0;
+        let mut tx_agc = crate::mixer::TransmitAgc::new();
+        let mut tx_limiter = crate::mixer::Limiter::new(48000);
 
         let stream = input_device.build_input_stream(
             &best_config,
@@ -163,6 +165,13 @@ impl UniversalAudioCapture {
                     }
                     *sample *= gate_gain;
                 }
+
+                // AGC: тихий микрофон подтягивается до цели по RMS, громкий
+                // осаживается — без этого свой голос уходил в эфир заметно тише,
+                // чем в Discord, и громкость добиралась уже у собеседника.
+                // Следом страховочный лимитер: в Opus уходит не громче −1 dBFS.
+                tx_agc.process(&mut processed_chunk);
+                tx_limiter.process(&mut processed_chunk);
 
                 // Нарезаем ровно по 960 сэмплов (20 мс при 48 кГц) для Opus
                 if ptt_flag.load(Ordering::Relaxed) {
@@ -345,13 +354,24 @@ impl UniversalAudioCapture {
             queue: std::collections::BTreeMap<u32, Vec<u8>>,
             stale: u32,
             last_pcm: Vec<f32>,
+            /// Декодированный (уже с персональной громкостью) поток этого
+            /// собеседника, ещё не сведённый в общий микс.
+            pcm: Vec<f32>,
+            /// Набрался ли предбуфер: до этого голос молчит, чтобы поток
+            /// не дёргался на первых пакетах.
+            started: bool,
+            /// Когда пришёл последний кадр: по нему отличаем провал буфера
+            /// посреди реплики от нормального конца (PTT отпущен).
+            last_fill: std::time::Instant,
         }
 
         let mut mono_decoded = [0.0f32; 960];
-        let mut pcm_buffer: Vec<f32> = Vec::with_capacity(3840);
         // кадр для карты: сначала собираем в f32, в конце переводим в её тип
         let mut out_scratch: Vec<f32> = Vec::new();
-        let mut prebuffered = false;
+        // один лимитер на весь микс: сколько бы голосов ни сложилось, на выходе
+        // не больше −1 dBFS. Персональный +18 дБ при этом доходит до слуха —
+        // раньше его съедал лимитер каждого отдельного голоса.
+        let mut mix_limiter = crate::mixer::Limiter::new(sample_rate);
         let mut peers: std::collections::HashMap<u64, Peer> = std::collections::HashMap::new();
         // диагностика приёма: по этим числам видно, что именно рвёт звук
         let (mut underruns, mut concealed, mut stale_resets, mut burst_drops) =
@@ -377,6 +397,9 @@ impl UniversalAudioCapture {
                                     queue: std::collections::BTreeMap::new(),
                                     stale: 0,
                                     last_pcm: Vec::new(),
+                                    pcm: Vec::new(),
+                                    started: false,
+                                    last_fill: std::time::Instant::now(),
                                 },
                             );
                         }
@@ -411,8 +434,7 @@ impl UniversalAudioCapture {
                                 if missing <= 3 && !peer.last_pcm.is_empty() {
                                     for r in 0..missing {
                                         let fade = 1.0 - (r as f32 + 1.0) / (missing as f32 + 1.0);
-                                        pcm_buffer
-                                            .extend(peer.last_pcm.iter().map(|s| s * fade));
+                                        peer.pcm.extend(peer.last_pcm.iter().map(|s| s * fade));
                                         concealed += 1;
                                     }
                                 }
@@ -449,20 +471,11 @@ impl UniversalAudioCapture {
                             } else {
                                 mono_decoded[..len].to_vec()
                             };
-                            pcm_buffer.extend_from_slice(&chunk);
+                            peer.pcm.extend_from_slice(&chunk);
+                            peer.last_fill = std::time::Instant::now();
                             peer.last_pcm = chunk;
                         }
                     }
-                }
-
-                // Сброс хвоста джиттер-буфера при лагах сети: держим до 200 мс,
-                // а лишнее убираем до 80 мс — большую пачку выкидывать больнее,
-                // чем небольшую (это слышно как провал).
-                let max_buffer = (sample_rate as usize * 20) / 100; // 200 мс
-                if pcm_buffer.len() > max_buffer {
-                    let keep = (sample_rate as usize * 8) / 100; // 80 мс
-                    let excess = pcm_buffer.len().saturating_sub(keep);
-                    pcm_buffer.drain(..excess);
                 }
 
                 // Раз в 10 с пишем в консоль, если на приёме что-то терялось:
@@ -481,26 +494,55 @@ impl UniversalAudioCapture {
                     last_report = std::time::Instant::now();
                 }
 
-                // Кадр собираем в f32 (нули — тишина) и в конце переводим в тип
-                // карты: у i16-устройства данные приходят другим типом.
+                // ————— Сведение —————
+                // Раньше куски всех собеседников дописывались в один буфер
+                // подряд: когда говорили двое, кадры шли друг за другом во
+                // времени, а не поверх — очередь росла и её хвост выбрасывался,
+                // то есть речь одного человека глушила другого. Теперь у каждого
+                // свой буфер, кадры складываются поверх, а лишнее режется по
+                // каждому собеседнику отдельно.
                 let num_frames = data.len() / output_channels;
                 out_scratch.clear();
                 out_scratch.resize(num_frames, 0.0);
-                let min_prebuffer = (sample_rate as usize * 6) / 100; // 60 мс
 
-                if !prebuffered && pcm_buffer.len() >= min_prebuffer {
-                    prebuffered = true;
+                let min_prebuffer = (sample_rate as usize * 6) / 100; // 60 мс
+                let max_buffer = (sample_rate as usize * 20) / 100; // 200 мс
+                let keep_buffer = (sample_rate as usize * 8) / 100; // 80 мс
+
+                for peer in peers.values_mut() {
+                    if peer.pcm.len() > max_buffer {
+                        let excess = peer.pcm.len() - keep_buffer;
+                        peer.pcm.drain(..excess);
+                        burst_drops += 1;
+                    }
+                    if !peer.started {
+                        if peer.pcm.len() >= min_prebuffer {
+                            peer.started = true;
+                        } else {
+                            continue;
+                        }
+                    }
+                    if peer.pcm.is_empty() {
+                        peer.started = false;
+                        // Провал посреди реплики — это потеря; отпущенный PTT
+                        // так же оставляет буфер пустым, но это норма.
+                        if peer.last_fill.elapsed() < std::time::Duration::from_millis(300) {
+                            underruns += 1;
+                        }
+                        continue;
+                    }
+                    let n = peer.pcm.len().min(num_frames);
+                    for (dst, src) in out_scratch.iter_mut().zip(peer.pcm.drain(..n)) {
+                        *dst += src;
+                    }
                 }
-                if prebuffered && pcm_buffer.is_empty() {
-                    prebuffered = false;
-                    underruns += 1;
+
+                // Общая громкость и один лимитер на готовый микс
+                let master_gain = mixer.master_gain();
+                for sample in out_scratch.iter_mut() {
+                    *sample *= master_gain;
                 }
-                if prebuffered {
-                    let available_frames = pcm_buffer.len().min(num_frames);
-                    out_scratch[..available_frames]
-                        .copy_from_slice(&pcm_buffer[..available_frames]);
-                    pcm_buffer.drain(..available_frames);
-                }
+                mix_limiter.process(&mut out_scratch);
 
                 let silence = T::from_sample(0.0);
                 for (i, frame) in out_scratch.iter().enumerate() {
