@@ -35,6 +35,8 @@ pub struct MfEncoder {
     transform: IMFTransform,
     events: IMFMediaEventGenerator,
     output_info: MFT_OUTPUT_STREAM_INFO,
+    /// Образец под выход энкодера: создаётся один раз и переиспользуется.
+    out_sample: Option<IMFSample>,
     frame_duration: i64,
     next_pts: i64,
     need_input: bool,
@@ -187,6 +189,7 @@ impl MfEncoder {
             transform,
             events,
             output_info,
+            out_sample: None,
             frame_duration: 10_000_000 / target.fps.max(1) as i64,
             next_pts: 0,
             need_input: false,
@@ -313,42 +316,57 @@ impl MfEncoder {
         }
     }
 
-    fn pull_output(&mut self) -> Result<Vec<EncodedUnit>, String> {
+    /// Образец под выходной буфер энкодера. Создаётся один раз: при
+    /// `MF_E_TRANSFORM_NEED_MORE_INPUT` MFT обнуляет `pSample`, и буфер,
+    /// выделенный под каждый вызов, утекал бы целиком.
+    fn output_sample(&mut self) -> Result<Option<IMFSample>, String> {
+        let provides_samples =
+            self.output_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
+        if provides_samples {
+            return Ok(None);
+        }
+        if let Some(sample) = &self.out_sample {
+            return Ok(Some(sample.clone()));
+        }
         unsafe {
-            let provides_samples =
-                self.output_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
-            let sample = if provides_samples {
-                None
-            } else {
-                let buf = MFCreateMemoryBuffer(self.output_info.cbSize.max(64 * 1024))
-                    .map_err(|e| e.to_string())?;
-                let s = MFCreateSample().map_err(|e| e.to_string())?;
-                s.AddBuffer(&buf).map_err(|e| e.to_string())?;
-                Some(s)
-            };
+            let buf = MFCreateMemoryBuffer(self.output_info.cbSize.max(64 * 1024))
+                .map_err(|e| e.to_string())?;
+            let sample = MFCreateSample().map_err(|e| e.to_string())?;
+            sample.AddBuffer(&buf).map_err(|e| e.to_string())?;
+            self.out_sample = Some(sample.clone());
+            Ok(Some(sample))
+        }
+    }
 
+    fn pull_output(&mut self) -> Result<Vec<EncodedUnit>, String> {
+        // клон живёт в буфере вызова, оригинал остаётся в self
+        let pass = self.output_sample()?;
+        unsafe {
             let mut data = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
-                pSample: ManuallyDrop::new(sample),
+                pSample: ManuallyDrop::new(pass),
                 dwStatus: 0,
                 pEvents: ManuallyDrop::new(None),
             };
             let mut status = 0u32;
-            match self
+            let res = self
                 .transform
-                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status)
-            {
+                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status);
+            // забираем то, что положили: без этого буфер остаётся висеть
+            let returned = ManuallyDrop::take(&mut data.pSample);
+            drop(ManuallyDrop::take(&mut data.pEvents));
+            match res {
                 Ok(()) => {}
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(Vec::new()),
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    self.out_sample = None;
                     self.apply_stream_change()?;
                     return Ok(Vec::new());
                 }
                 Err(e) => return Err(format!("ProcessOutput: {e}")),
             }
 
-            let sample = ManuallyDrop::take(&mut data.pSample);
-            let sample = match sample {
+            let sample = match returned {
                 Some(s) => s,
                 None => return Ok(Vec::new()),
             };

@@ -18,9 +18,10 @@
 //! [SPS/PPS][H.264 Annex-B]
 //! ```
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use super::p2p_iroh::IrohP2pManager;
 use crate::video::{EncodedUnit, StreamInfo};
@@ -29,6 +30,10 @@ pub const VIDEO_ALPN: &[u8] = b"discordrf-video/1";
 
 /// Верхняя граница одного кадра: 1440p-кейфрейм с запасом.
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+/// Сколько кадров зритель держит в очереди на декодирование (~0.5 с при 60 fps).
+/// Очередь без границы — это рост памяти на гигабайты за минуту, если GUI не успевает.
+const MAX_QUEUE: usize = 30;
 
 /// Пришедший по сети кадр.
 pub struct RemoteFrame {
@@ -40,22 +45,29 @@ pub struct RemoteFrame {
     pub unit: EncodedUnit,
 }
 
+/// Очередь пришедших кадров для GUI зрителя.
+struct RemoteQueue {
+    frames: VecDeque<RemoteFrame>,
+    /// Часть P-кадров потеряна: декодировать нечего, ждём ключевой кадр.
+    resync: bool,
+}
+
 pub struct VideoLink {
     p2p: Arc<IrohP2pManager>,
     outgoing: broadcast::Sender<Arc<Vec<u8>>>,
-    events_tx: mpsc::UnboundedSender<RemoteFrame>,
-    events_rx: std::sync::Mutex<mpsc::UnboundedReceiver<RemoteFrame>>,
+    remote: std::sync::Mutex<RemoteQueue>,
 }
 
 impl VideoLink {
     pub fn spawn(p2p: Arc<IrohP2pManager>, rt: tokio::runtime::Handle) -> Arc<Self> {
         let (outgoing, _) = broadcast::channel(8);
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
         let link = Arc::new(Self {
             p2p: p2p.clone(),
             outgoing,
-            events_tx,
-            events_rx: std::sync::Mutex::new(events_rx),
+            remote: std::sync::Mutex::new(RemoteQueue {
+                frames: VecDeque::new(),
+                resync: false,
+            }),
         });
         let l = link.clone();
         rt.spawn(async move { l.accept_loop().await });
@@ -63,11 +75,11 @@ impl VideoLink {
     }
 
     /// Принимает входящие видео-соединения и читает кадры из uni-стримов.
-    async fn accept_loop(&self) {
+    async fn accept_loop(self: Arc<Self>) {
         while let Some(conn) = self.p2p.recv_video_conn().await {
             let from = conn.remote_id().to_string();
             println!("[ВИДЕО] Входящее видео-соединение от {}", from);
-            let tx = self.events_tx.clone();
+            let me = self.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok(mut recv) = conn.accept_uni().await else {
@@ -77,17 +89,36 @@ impl VideoLink {
                         continue;
                     };
                     match parse_frame(&data, &from) {
-                        Some(frame) => {
-                            if tx.send(frame).is_err() {
-                                break;
-                            }
-                        }
+                        Some(frame) => me.push_remote(frame),
                         None => eprintln!("[ВИДЕО] Битый кадр от {}", from),
                     }
                 }
                 println!("[ВИДЕО] Поток от {} завершён", from);
             });
         }
+    }
+
+    /// Кладёт кадр в очередь зрителя, не давая ей расти без предела.
+    fn push_remote(&self, frame: RemoteFrame) {
+        let Ok(mut q) = self.remote.lock() else {
+            return;
+        };
+        if frame.unit.keyframe {
+            q.resync = false;
+        } else if q.resync {
+            return;
+        }
+        if q.frames.len() >= MAX_QUEUE {
+            // Зритель не успевает декодировать. Выбрасываем всю очередь:
+            // P-кадры без предыдущих дают мусор, поэтому ждём ключевой кадр.
+            q.frames.clear();
+            q.resync = true;
+            if !frame.unit.keyframe {
+                return;
+            }
+            q.resync = false;
+        }
+        q.frames.push_back(frame);
     }
 
     /// Открывает видео-соединение к зрителю и шлёт ему все публикуемые кадры.
@@ -129,9 +160,9 @@ impl VideoLink {
         let _ = self.outgoing.send(Arc::new(encode_frame(unit, info)));
     }
 
-    /// Забирает пришедшие кадры (для GUI, без блокировки).
+    /// Забирает следующий пришедший кадр (для GUI, без блокировки).
     pub fn try_recv_remote(&self) -> Option<RemoteFrame> {
-        self.events_rx.lock().ok()?.try_recv().ok()
+        self.remote.lock().ok()?.frames.pop_front()
     }
 }
 

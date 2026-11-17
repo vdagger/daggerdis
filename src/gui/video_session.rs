@@ -3,6 +3,8 @@
 //! `VideoSession` — своя трансляция (захват + превью), `RemoteView` — чужой
 //! поток, пришедший по сети. Оба используют общий `Renderer`.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui;
 
 use crate::video::publisher::{ScreenPublisher, StreamInfo};
@@ -21,7 +23,9 @@ pub struct Renderer {
     texture: Option<egui::TextureHandle>,
     width: u32,
     height: u32,
-    frames: u64,
+    fps_window_start: Instant,
+    fps_window_frames: u32,
+    fps: f32,
     pub last_error: Option<String>,
 }
 
@@ -49,7 +53,9 @@ impl Renderer {
             texture: None,
             width: info.width,
             height: info.height,
-            frames: 0,
+            fps_window_start: Instant::now(),
+            fps_window_frames: 0,
+            fps: 0.0,
             last_error: None,
         })
     }
@@ -61,7 +67,6 @@ impl Renderer {
                 Ok(frames) => {
                     if let Some(frame) = frames.into_iter().last() {
                         latest = Some(frame);
-                        self.frames += 1;
                     }
                 }
                 Err(e) => {
@@ -72,6 +77,17 @@ impl Renderer {
         }
 
         let Some(nv12) = latest else { return };
+        // Короткий кадр (ошибка декодера) нельзя отдавать в D3D: UpdateSubresource
+        // прочитает за концом буфера. Лучше пропустить кадр.
+        let need = self.width as usize * self.height as usize * 3 / 2;
+        if nv12.len() < need {
+            self.last_error = Some(format!(
+                "короткий NV12-кадр: {} из {} байт",
+                nv12.len(),
+                need
+            ));
+            return;
+        }
         upload_nv12(&self.d3d.context, &self.nv12_tex, self.width, &nv12);
         let bgra = match self.converter.convert_and_read(&self.nv12_tex) {
             Ok(b) => b,
@@ -91,6 +107,15 @@ impl Renderer {
                 ));
             }
         }
+
+        // настоящий fps: кадры за последнюю секунду, а не суммарный счётчик
+        self.fps_window_frames += 1;
+        let dt = self.fps_window_start.elapsed();
+        if dt >= Duration::from_secs(1) {
+            self.fps = self.fps_window_frames as f32 / dt.as_secs_f32();
+            self.fps_window_start = Instant::now();
+            self.fps_window_frames = 0;
+        }
     }
 
     pub fn texture(&self) -> Option<&egui::TextureHandle> {
@@ -101,8 +126,9 @@ impl Renderer {
         (self.width, self.height)
     }
 
-    pub fn frames(&self) -> u64 {
-        self.frames
+    /// Кадров в секунду за последнее окно измерения.
+    pub fn fps(&self) -> f32 {
+        self.fps
     }
 }
 
@@ -156,8 +182,8 @@ impl VideoSession {
         self.renderer.size()
     }
 
-    pub fn frames(&self) -> u64 {
-        self.renderer.frames()
+    pub fn fps(&self) -> f32 {
+        self.renderer.fps()
     }
 
     pub fn last_error(&self) -> Option<&String> {
@@ -191,8 +217,8 @@ impl RemoteView {
         self.renderer.size()
     }
 
-    pub fn frames(&self) -> u64 {
-        self.renderer.frames()
+    pub fn fps(&self) -> f32 {
+        self.renderer.fps()
     }
 
     pub fn last_error(&self) -> Option<&String> {

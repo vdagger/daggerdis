@@ -240,9 +240,15 @@ impl eframe::App for RadioApp {
                 }
             }
 
-            // чужие кадры из сети
+            // чужие кадры из сети; за один апдейт не больше нескольких,
+            // чтобы очередь декодирования не растягивала кадр GUI
             if let Some(link) = &self.video_link {
-                while let Some(frame) = link.try_recv_remote() {
+                let mut budget = 4;
+                while budget > 0 {
+                    let Some(frame) = link.try_recv_remote() else {
+                        break;
+                    };
+                    budget -= 1;
                     if self.remote.is_none() {
                         let info = crate::video::StreamInfo {
                             width: frame.width,
@@ -573,9 +579,9 @@ impl RadioApp {
                     if let Some(v) = &self.video {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} · {} кадров",
+                                "{} · {:.0} FPS",
                                 v.source,
-                                v.frames()
+                                v.fps()
                             ))
                             .size(10.0)
                             .color(t::TEXT_MUTED),
@@ -634,9 +640,9 @@ impl RadioApp {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(format!(
-                            "Смотрит: {} · {} кадров",
+                            "Смотрит: {} · {:.0} FPS",
                             remote.peer,
-                            remote.frames()
+                            remote.fps()
                         ))
                         .size(10.0)
                         .color(t::TEXT_MUTED),
@@ -709,9 +715,9 @@ impl RadioApp {
                             if let Some(remote) = &self.remote {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "Смотрит: {} · {} кадров",
+                                        "Смотрит: {} · {:.0} FPS",
                                         remote.peer,
-                                        remote.frames()
+                                        remote.fps()
                                     ))
                                     .size(10.0)
                                     .color(t::TEXT_MUTED),
@@ -719,9 +725,9 @@ impl RadioApp {
                             } else if let Some(video) = &self.video {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{} · {} кадров",
+                                        "{} · {:.0} FPS",
                                         video.source,
-                                        video.frames()
+                                        video.fps()
                                     ))
                                     .size(10.0)
                                     .color(t::TEXT_MUTED),
