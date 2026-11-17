@@ -87,7 +87,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate |
 | `src/mixer.rs` | `AudioMixer`: dB boost (0..300%), soft-knee limiter, mute, volume, per-peer gain |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
-| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume) |
+| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume, `video_fps`) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
@@ -109,7 +109,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/video/win_d3d.rs` | D3D11 device + `ID3D11VideoProcessor` BGRA↔NV12 conversion/scaling, staging readback |
 | `src/video/win_mf.rs` | Async hardware H.264 MFT encoder (NVENC/AMF/QSV), CBR/GOP via `ICodecAPI` |
 | `src/video/win_decode.rs` | H.264 decoder MFT — both async and sync paths; NV12 repack 1088→1080 |
-| `src/video/publisher.rs` | `video-publisher` thread: capture 60 fps → NV12 → encode → mpsc of `EncodedUnit` |
+| `src/video/publisher.rs` | `video-publisher` thread: capture at the chosen fps (30/60) → NV12 → encode → mpsc of `EncodedUnit`; `encode_fps` counter for diagnostics |
 | `src/network/video_link.rs` | `discordrf-video/1`: incoming video connections, one uni-stream per frame, fan-out to viewers |
 | `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
 | `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
@@ -178,7 +178,7 @@ video window. Peers who join mid-stream are not subscribed yet.
 - **Settings persistence:** `src/config.rs` reads/writes `%APPDATA%\Albus\config.ini`
   (plain `key=value`; a broken file is ignored). Devices are matched by **name** (cpal
   indices shift). Per-peer volume is stored as `peer_<id>_volume` keyed by the stable
-  `my_id`. `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
+  `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
   written on change with a 400 ms throttle, never on exit.
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
@@ -212,10 +212,16 @@ video window. Peers who join mid-stream are not subscribed yet.
   (`MAX_QUEUE`); on overflow it drops the queue and waits for the next keyframe —
   P-frames without their references decode to garbage. The GUI decodes at most
   4 frames per update so one slow frame cannot stall the UI.
-- **Display is capped at 60 fps** (`MAX_FPS` in `video_session.rs`): preview and
-  remote stream still push every frame through the decoder (a skipped P-frame
-  breaks the chain) but only show up to 60 per second, so a burst cannot flood
-  the GPU readback and texture upload.
+- **Display is capped at the stream's own fps** (`show_period` in `video_session.rs`,
+  taken from `StreamInfo.fps` — 30 or 60): preview and remote stream still push every
+  frame through the decoder (a skipped P-frame breaks the chain) but only show that
+  many per second, so a burst cannot flood the GPU readback and texture upload.
+- **Stream rate is a setting:** `video_fps=30|60` in `config.ini`, picked in the
+  broadcast panel before starting (default 60); it threads through
+  `VideoSession::start(fps)` → `ScreenPublisher::start(fps)` → capture, encoder and
+  pacing. The panel shows both numbers — "показ N · захват M FPS": a low *захват*
+  means the capture/encode loop cannot keep up, a low *показ* with a healthy *захват*
+  means the per-frame GPU readback + `bgra_to_image` + texture upload is the limit.
 - **Decoder output is 1088 rows** (height aligned to 16) and its UV plane starts
   below; `repack_nv12()` strips the padding to exactly w×h before upload.
 - **The Microsoft H.264 decoder MFT is synchronous** (no
