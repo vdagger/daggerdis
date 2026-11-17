@@ -13,17 +13,22 @@ fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32, position: &mut f
 
     let ratio = from_rate as f64 / to_rate as f64;
     let mut output = Vec::with_capacity((input.len() as f64 / ratio).ceil() as usize + 2);
+    let last = input.len() - 1;
 
-    while *position < input.len() as f64 - 1.0 {
-        let idx = *position as usize;
+    // Позиция переносится на следующий буфер как смещение ОТ ЕГО НАЧАЛА.
+    // Раньше вычиталось `len - 1`, и на каждой границе фаза съезжала на один
+    // семпл: кусок сигнала терялся, а звук на каждом буфере получал тик
+    // (чем меньше буфер, тем заметнее). За последним семплом держим его же.
+    while *position < input.len() as f64 {
+        let idx = (*position as usize).min(last);
         let frac = (*position - idx as f64) as f32;
         let s0 = input[idx];
-        let s1 = input[idx + 1];
+        let s1 = input.get(idx + 1).copied().unwrap_or(s0);
         output.push(s0 + frac * (s1 - s0));
         *position += ratio;
     }
 
-    *position -= (input.len().saturating_sub(1)) as f64;
+    *position -= input.len() as f64;
     output
 }
 
