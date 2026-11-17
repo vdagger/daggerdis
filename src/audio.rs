@@ -213,15 +213,28 @@ impl UniversalAudioCapture {
             output_channels
         );
 
-        let mut decoder = rusty_opus::OpusDecoder::new(48000, 1)?;
+        // Приём ведётся отдельно на каждого собеседника: у Opus своё
+        // внутреннее состояние (SILK/CELT), и один общий декодер на всех
+        // смешивал потоки — как только в комнате звучал второй голос, речь
+        // превращалась в «робота». Своими у каждого и позиция ресэмплера, и
+        // порядок seq, и последний кадр (им маскируются потери).
+        struct Peer {
+            decoder: rusty_opus::OpusDecoder,
+            resample_pos: f64,
+            next: u32,
+            queue: std::collections::BTreeMap<u32, Vec<u8>>,
+            stale: u32,
+            last_pcm: Vec<f32>,
+        }
+
         let mut mono_decoded = [0.0f32; 960];
         let mut pcm_buffer: Vec<f32> = Vec::with_capacity(3840);
-        let mut resample_pos: f64 = 0.0;
         let mut prebuffered = false;
-        let mut reorder: std::collections::HashMap<
-            u64,
-            (u32, std::collections::BTreeMap<u32, Vec<u8>>),
-        > = std::collections::HashMap::new();
+        let mut peers: std::collections::HashMap<u64, Peer> = std::collections::HashMap::new();
+        // диагностика приёма: по этим числам видно, что именно рвёт звук
+        let (mut underruns, mut concealed, mut stale_resets, mut burst_drops) =
+            (0u32, 0u32, 0u32, 0u32);
+        let mut last_report = std::time::Instant::now();
 
         let stream = output_device.build_output_stream(
             &best_config,
@@ -229,68 +242,125 @@ impl UniversalAudioCapture {
                 // Принимаем входящие пакеты, переупорядочиваем по seq и декодируем
                 if let Ok(mut rx_lock) = rx.try_lock() {
                     while let Ok((sender_id, seq, packet)) = rx_lock.try_recv() {
-                        let entry = reorder
-                            .entry(sender_id)
-                            .or_insert_with(|| (seq, std::collections::BTreeMap::new()));
-
-                        // Отбрасываем устаревшие/дублированные кадры
-                        if seq.wrapping_sub(entry.0) >= 0x8000_0000 {
-                            continue;
+                        if !peers.contains_key(&sender_id) {
+                            let Ok(decoder) = rusty_opus::OpusDecoder::new(48000, 1) else {
+                                continue;
+                            };
+                            peers.insert(
+                                sender_id,
+                                Peer {
+                                    decoder,
+                                    resample_pos: 0.0,
+                                    next: seq,
+                                    queue: std::collections::BTreeMap::new(),
+                                    stale: 0,
+                                    last_pcm: Vec::new(),
+                                },
+                            );
                         }
-                        entry.1.insert(seq, packet);
+                        let peer = peers.get_mut(&sender_id).unwrap();
+
+                        // Отбрасываем устаревшие/дублированные кадры. Отправитель,
+                        // перезапустивший приложение, начинает seq с нуля: замечаем
+                        // это по пачке «устаревших» подряд и заводим его заново —
+                        // иначе, пока говорят другие, его не слышно вообще.
+                        if seq.wrapping_sub(peer.next) >= 0x8000_0000 {
+                            peer.stale += 1;
+                            if peer.stale < 25 {
+                                continue;
+                            }
+                            peer.next = seq;
+                            peer.queue.clear();
+                            peer.stale = 0;
+                            stale_resets += 1;
+                        }
+                        peer.stale = 0;
+                        peer.queue.insert(seq, packet);
 
                         // Дырка в нумерации: один потерянный датаграм не должен
                         // останавливать воспроизведение. Иначе звук замирает, пока
                         // не наберётся полный буфер, и выплёвывается пачкой — на слух
                         // это «робот». Если впереди уже несколько пакетов, ждать
-                        // потерянный бессмысленно: считаем его потерянным.
-                        if !entry.1.contains_key(&entry.0) && entry.1.len() >= 3 {
-                            if let Some(&lowest) = entry.1.keys().next() {
-                                entry.0 = lowest;
+                        // потерянный бессмысленно: считаем его потерянным и
+                        // маскируем: повторяем последний кадр с затуханием.
+                        if !peer.queue.contains_key(&peer.next) && peer.queue.len() >= 3 {
+                            if let Some(&lowest) = peer.queue.keys().next() {
+                                let missing = lowest.wrapping_sub(peer.next) as usize;
+                                if missing <= 3 && !peer.last_pcm.is_empty() {
+                                    for r in 0..missing {
+                                        let fade = 1.0 - (r as f32 + 1.0) / (missing as f32 + 1.0);
+                                        pcm_buffer
+                                            .extend(peer.last_pcm.iter().map(|s| s * fade));
+                                        concealed += 1;
+                                    }
+                                }
+                                peer.next = lowest;
                             }
                         }
 
                         // Не даём буферу переупорядочивания расти при большой дыре в потоке
-                        while entry.1.len() > 32 {
-                            let oldest = *entry.1.keys().next().unwrap();
-                            entry.1.remove(&oldest);
-                            entry.0 = oldest.wrapping_add(1);
+                        while peer.queue.len() > 32 {
+                            let oldest = *peer.queue.keys().next().unwrap();
+                            peer.queue.remove(&oldest);
+                            peer.next = oldest.wrapping_add(1);
+                            burst_drops += 1;
                         }
 
                         // Выдаём все кадры строго по порядку
-                        while let Some(packet) = entry.1.remove(&entry.0) {
-                            entry.0 = entry.0.wrapping_add(1);
-                            if let Ok(len) = decoder.decode(&packet, 960, &mut mono_decoded) {
-                                mixer.process_output(sender_id, &mut mono_decoded[..len]);
+                        while let Some(packet) = peer.queue.remove(&peer.next) {
+                            peer.next = peer.next.wrapping_add(1);
+                            let Ok(len) = peer.decoder.decode(&packet, 960, &mut mono_decoded)
+                            else {
+                                continue;
+                            };
+                            mixer.process_output(sender_id, &mut mono_decoded[..len]);
 
-                                // Если звуковая карта работает не на 48 кГц (например 44.1 или 96 кГц),
-                                // ресэмплируем декодированный звук строго под частоту звуковой карты!
-                                if sample_rate != 48000 {
-                                    let resampled = resample_linear(
-                                        &mono_decoded[..len],
-                                        48000,
-                                        sample_rate,
-                                        &mut resample_pos,
-                                    );
-                                    pcm_buffer.extend_from_slice(&resampled);
-                                } else {
-                                    pcm_buffer.extend_from_slice(&mono_decoded[..len]);
-                                }
-                            }
+                            // Если звуковая карта работает не на 48 кГц (например 44.1 или 96 кГц),
+                            // ресэмплируем декодированный звук строго под частоту звуковой карты!
+                            let chunk: Vec<f32> = if sample_rate != 48000 {
+                                resample_linear(
+                                    &mono_decoded[..len],
+                                    48000,
+                                    sample_rate,
+                                    &mut peer.resample_pos,
+                                )
+                            } else {
+                                mono_decoded[..len].to_vec()
+                            };
+                            pcm_buffer.extend_from_slice(&chunk);
+                            peer.last_pcm = chunk;
                         }
                     }
                 }
 
-                // Сброс хвоста джиттер-буфера при лагах сети
-                let max_buffer = (sample_rate as usize * 12) / 100; // 120 мс
+                // Сброс хвоста джиттер-буфера при лагах сети: держим до 200 мс,
+                // а лишнее убираем до 80 мс — большую пачку выкидывать больнее,
+                // чем небольшую (это слышно как провал).
+                let max_buffer = (sample_rate as usize * 20) / 100; // 200 мс
                 if pcm_buffer.len() > max_buffer {
-                    let keep = (sample_rate as usize * 4) / 100; // 40 мс
+                    let keep = (sample_rate as usize * 8) / 100; // 80 мс
                     let excess = pcm_buffer.len().saturating_sub(keep);
                     pcm_buffer.drain(..excess);
                 }
 
+                // Раз в 10 с пишем в консоль, если на приёме что-то терялось:
+                // по этим числам видно, из-за чего у собеседника «робот» —
+                // дырки в сети, перезапуск отправителя или провалы звуковой карты.
+                if last_report.elapsed() >= std::time::Duration::from_secs(10) {
+                    if underruns + concealed + stale_resets + burst_drops > 0 {
+                        eprintln!(
+                            "[АУДИО] приём: провалов буфера {underruns}, маскировано кадров {concealed}, перезапусков потока {stale_resets}, выброшено пачкой {burst_drops}"
+                        );
+                        underruns = 0;
+                        concealed = 0;
+                        stale_resets = 0;
+                        burst_drops = 0;
+                    }
+                    last_report = std::time::Instant::now();
+                }
+
                 let num_frames = data.len() / output_channels;
-                let min_prebuffer = (sample_rate as usize * 4) / 100; // 40 мс
+                let min_prebuffer = (sample_rate as usize * 6) / 100; // 60 мс
 
                 if !prebuffered {
                     if pcm_buffer.len() >= min_prebuffer {
@@ -303,11 +373,7 @@ impl UniversalAudioCapture {
 
                 if pcm_buffer.is_empty() {
                     prebuffered = false;
-                    // После перезапуска отправителя его seq сбрасывается в 0, а старый
-                    // reorder-буфер считает такие кадры «устаревшими» и дропает их —
-                    // собеседника перестаёт быть слышно. Сброс по недобору буфера
-                    // лечит это и ускоряет восстановление после потерь.
-                    reorder.clear();
+                    underruns += 1;
                     data.fill(0.0);
                     return;
                 }
