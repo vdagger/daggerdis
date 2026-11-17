@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub input1_channel: Option<u32>,
     pub input2_channel: Option<u32>,
     pub continuous_mode: Option<bool>,
+    /// Частота трансляции экрана (30 или 60 fps); по умолчанию 60.
+    pub video_fps: Option<u32>,
     pub nick: Option<String>,
     pub peer_volumes: HashMap<u64, u32>,
 }
@@ -89,6 +91,7 @@ impl AppConfig {
                 "input1_channel" => cfg.input1_channel = value.parse().ok(),
                 "input2_channel" => cfg.input2_channel = value.parse().ok(),
                 "continuous_mode" => cfg.continuous_mode = value.parse().ok(),
+                "video_fps" => cfg.video_fps = value.parse().ok(),
                 "nick" => cfg.nick = Some(value.to_string()),
                 _ => {}
             }
@@ -124,6 +127,9 @@ impl AppConfig {
         }
         if let Some(value) = self.continuous_mode {
             out.push_str(&format!("continuous_mode={}\n", value));
+        }
+        if let Some(value) = self.video_fps {
+            out.push_str(&format!("video_fps={}\n", value));
         }
         if let Some(value) = &self.nick {
             out.push_str(&format!("nick={}\n", value));

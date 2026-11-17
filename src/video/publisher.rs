@@ -3,7 +3,7 @@
 //! Всё тяжёлое живёт в отдельном потоке, а GUI получает готовые
 //! закодированные кадры и локально их же декодирует для превью.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -22,6 +22,8 @@ pub struct ScreenPublisher {
     pub info: StreamInfo,
     /// С какого адаптера и в каком размере идёт захват (диагностика).
     pub source: String,
+    /// Фактическая частота кодирования за последнюю секунду (диагностика).
+    pub encode_fps: Arc<AtomicU32>,
 }
 
 impl ScreenPublisher {
@@ -30,11 +32,13 @@ impl ScreenPublisher {
         let (frame_tx, frame_rx) = channel::<EncodedUnit>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let encode_fps = Arc::new(AtomicU32::new(0));
+        let encode_fps_thread = encode_fps.clone();
 
         let handle = std::thread::Builder::new()
             .name("video-publisher".into())
             .spawn(move || {
-                if let Err(e) = run(&stop_thread, fps, &frame_tx, &init_tx) {
+                if let Err(e) = run(&stop_thread, fps, &frame_tx, &init_tx, &encode_fps_thread) {
                     eprintln!("[ВИДЕО] Публикация остановлена: {e}");
                 }
             })
@@ -48,6 +52,7 @@ impl ScreenPublisher {
                 rx: frame_rx,
                 info,
                 source,
+                encode_fps,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -72,6 +77,7 @@ fn run(
     fps: u32,
     tx: &Sender<EncodedUnit>,
     init: &Sender<Result<(StreamInfo, String), String>>,
+    encode_fps: &AtomicU32,
 ) -> Result<(), String> {
     // целимся в нативное разрешение экрана: апскейл тратит битрейт зря
     let mut capture = match ScreenCapture::new(None, fps) {
@@ -106,6 +112,10 @@ fn run(
 
     let period = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut next = Instant::now();
+    // фактическая скорость кодирования: нужно понять, упирается ли пайплайн
+    // в целевой fps или в захват/энкодер
+    let mut fps_window = Instant::now();
+    let mut fps_frames = 0u32;
 
     while !stop.load(Ordering::Relaxed) {
         let frame = match capture.next_nv12(50) {
@@ -116,12 +126,19 @@ fn run(
         match encoder.push_nv12(&frame) {
             Ok(units) => {
                 for unit in units {
+                    fps_frames += 1;
                     if tx.send(unit).is_err() {
                         return Ok(()); // получатель закрылся
                     }
                 }
             }
             Err(e) => return Err(e),
+        }
+        let dt = fps_window.elapsed();
+        if dt >= Duration::from_secs(1) {
+            encode_fps.store((fps_frames as f32 / dt.as_secs_f32()).round() as u32, Ordering::Relaxed);
+            fps_window = Instant::now();
+            fps_frames = 0;
         }
 
         // не кодируем чаще целевого fps, даже если экран обновляется быстрее

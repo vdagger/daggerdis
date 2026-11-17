@@ -14,9 +14,6 @@ use crate::video::win_d3d::{
 use crate::video::win_decode::MfDecoder;
 use crate::video::EncodedUnit;
 
-/// Потолок показа: и превью, и чужой поток идут не чаще 60 кадров в секунду.
-const MAX_FPS: f32 = 60.0;
-
 /// Декод кадров и обновление текстуры egui.
 pub struct Renderer {
     decoder: MfDecoder,
@@ -29,6 +26,8 @@ pub struct Renderer {
     fps_window_start: Instant,
     fps_window_frames: u32,
     fps: f32,
+    /// Потолок показа = частота самого потока (30 или 60 fps).
+    show_period: Duration,
     last_shown: Option<Instant>,
     pub last_error: Option<String>,
 }
@@ -60,6 +59,7 @@ impl Renderer {
             fps_window_start: Instant::now(),
             fps_window_frames: 0,
             fps: 0.0,
+            show_period: Duration::from_secs_f64(1.0 / info.fps.max(1) as f64),
             last_shown: None,
             last_error: None,
         })
@@ -83,11 +83,10 @@ impl Renderer {
 
         let Some(nv12) = latest else { return };
 
-        // Потолок 60 кадров в секунду. Кадр всё равно проходит декодер (иначе
+        // Показ не чаще частоты потока. Кадр всё равно проходит декодер (иначе
         // порвётся цепочка P-кадров), но в D3D и на экран не идёт.
-        let period = Duration::from_secs_f32(1.0 / MAX_FPS);
         if let Some(last) = self.last_shown {
-            if last.elapsed() < period {
+            if last.elapsed() < self.show_period {
                 return;
             }
         }
@@ -156,8 +155,8 @@ pub struct VideoSession {
 }
 
 impl VideoSession {
-    pub fn start() -> Result<Self, String> {
-        let publisher = ScreenPublisher::start(60)?;
+    pub fn start(fps: u32) -> Result<Self, String> {
+        let publisher = ScreenPublisher::start(fps)?;
         let renderer = Renderer::new(&publisher.info)?;
         Ok(Self {
             source: publisher.source.clone(),
@@ -200,6 +199,13 @@ impl VideoSession {
 
     pub fn fps(&self) -> f32 {
         self.renderer.fps()
+    }
+
+    /// Фактическая частота кодирования (не показа).
+    pub fn encode_fps(&self) -> u32 {
+        self.publisher
+            .encode_fps
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn last_error(&self) -> Option<&String> {

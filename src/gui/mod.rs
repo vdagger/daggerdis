@@ -534,6 +534,11 @@ impl RadioApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let running = self.video.is_some();
+                // 30 или 60 fps; меняется только до старта трансляции
+                let fps = match self.config.video_fps {
+                    Some(30) => 30,
+                    _ => 60,
+                };
 
                 ui.horizontal(|ui| {
                     let label = if running {
@@ -552,7 +557,7 @@ impl RadioApp {
                             self.video = None;
                             self.video_fullscreen = false;
                         } else {
-                            match video_session::VideoSession::start() {
+                            match video_session::VideoSession::start(fps) {
                                 Ok(v) => {
                                     self.video = Some(v);
                                     self.video_error = None;
@@ -576,16 +581,36 @@ impl RadioApp {
                         }
                     }
 
-                    if let Some(v) = &self.video {
+                    if running {
+                        if let Some(v) = &self.video {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · показ {:.0} · захват {} FPS",
+                                    v.source,
+                                    v.fps(),
+                                    v.encode_fps()
+                                ))
+                                .size(10.0)
+                                .color(t::TEXT_MUTED),
+                            );
+                        }
+                    } else {
+                        ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {:.0} FPS",
-                                v.source,
-                                v.fps()
-                            ))
-                            .size(10.0)
-                            .color(t::TEXT_MUTED),
+                            egui::RichText::new("Кадров/с").size(10.0).color(t::TEXT_MUTED),
                         );
+                        let mut new_fps = fps;
+                        egui::ComboBox::from_id_source("video_fps_combo")
+                            .width(64.0)
+                            .selected_text(format!("{fps}"))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut new_fps, 30, "30");
+                                ui.selectable_value(&mut new_fps, 60, "60");
+                            });
+                        if new_fps != fps {
+                            self.config.video_fps = Some(new_fps);
+                            self.pending_save = true;
+                        }
                     }
                 });
 
