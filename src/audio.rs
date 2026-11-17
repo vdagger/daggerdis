@@ -229,6 +229,13 @@ impl UniversalAudioCapture {
                 }
             }
         }
+        // Меньше каналов — лучше: стерео на виртуальном 7.1-устройстве звучит
+        // как обычные динамики, а восьмиканальный поток та же виртуализация
+        // размазывает по комнате, и речь превращается в кашу.
+        candidates.sort_by_key(|(format, _, channels)| {
+            (*format != cpal::SampleFormat::F32, *channels)
+        });
+
         // Последний шанс — формат устройства по умолчанию, на какой бы частоте
         // он ни был: ресэмплер ниже приведёт звук к нему.
         if let Ok(default) = output_device.default_output_config() {
@@ -291,6 +298,10 @@ impl UniversalAudioCapture {
     {
         let sample_rate = config.sample_rate.0;
         let output_channels = config.channels as usize;
+        // На многоканальном устройстве пишем только в первые два канала:
+        // одинаковый сигнал во всех восьми виртуальный 7.1 размазывает и
+        // добавляет кашу. Остальные каналы держим в нуле.
+        let active_channels = output_channels.min(2);
 
         // Приём ведётся отдельно на каждого собеседника: у Opus своё
         // внутреннее состояние (SILK/CELT), и один общий декодер на всех
@@ -461,11 +472,15 @@ impl UniversalAudioCapture {
                     pcm_buffer.drain(..available_frames);
                 }
 
+                let silence = T::from_sample(0.0);
                 for (i, frame) in out_scratch.iter().enumerate() {
                     let value = T::from_sample(*frame);
                     let base = i * output_channels;
-                    for ch in 0..output_channels {
+                    for ch in 0..active_channels {
                         data[base + ch] = value;
+                    }
+                    for ch in active_channels..output_channels {
+                        data[base + ch] = silence;
                     }
                 }
             },
