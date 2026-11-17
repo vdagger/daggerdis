@@ -1,0 +1,6 @@
+[package]
+name = "pollster"
+version = "0.3.0"
+edition = "2021"
+description = "Локальная замена крейта pollster: блокирующее выполнение future (нужна только eframe/wgpu)"
+license = "MIT OR Apache-2.0"

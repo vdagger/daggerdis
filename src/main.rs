@@ -185,6 +185,17 @@ fn main() {
     let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
 
     let mut native_options = eframe::NativeOptions::default();
+    // По умолчанию — glow (OpenGL), как и раньше: на обычной машине он легче.
+    // В виртуалках и RDP OpenGL 2.0 может отсутствовать; там есть wgpu,
+    // включаемый переменной ALBUS_RENDERER=wgpu. Без явного указания eframe
+    // при включённой feature wgpu выбрал бы wgpu сам.
+    native_options.renderer = eframe::Renderer::Glow;
+    if std::env::var("ALBUS_RENDERER")
+        .map(|v| v.eq_ignore_ascii_case("wgpu"))
+        .unwrap_or(false)
+    {
+        native_options.renderer = eframe::Renderer::Wgpu;
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1120.0, 700.0])
         .with_min_inner_size([980.0, 620.0]);
@@ -206,7 +217,7 @@ fn main() {
 
     let _guard = rt.enter();
     let _runtime_guard = rt;
-    eframe::run_native(
+    let result = eframe::run_native(
         "Albus Audio",
         native_options,
         Box::new(move |_cc| {
@@ -242,6 +253,44 @@ fn main() {
 
             Ok(Box::new(app))
         }),
-    )
-    .unwrap();
+    );
+    // Без этого любая ошибка окна (нет OpenGL, нет GPU) выглядела как
+    // «программа не запускается»: процесс умирал молча.
+    if let Err(e) = result {
+        let msg = format!(
+            "Окно не открылось: {e}\n\nЕсли это виртуалка или RDP без OpenGL 2.0, \
+             запустите с переменной окружения ALBUS_RENDERER=wgpu."
+        );
+        eprintln!("{msg}");
+        show_fatal(&msg);
+        std::process::exit(1);
+    }
+}
+
+/// Ошибка старта видна пользователю, даже когда консоли нет.
+#[cfg(windows)]
+fn show_fatal(message: &str) {
+    const MB_OK: u32 = 0x0;
+    const MB_ICONERROR: u32 = 0x10;
+    extern "system" {
+        fn MessageBoxW(hwnd: *mut core::ffi::c_void, text: *const u16, caption: *const u16, utype: u32) -> i32;
+    }
+    let to_utf16 = |s: &str| -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    };
+    let text = to_utf16(message);
+    let caption = to_utf16("Albus Audio");
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_fatal(message: &str) {
+    eprintln!("{message}");
 }
