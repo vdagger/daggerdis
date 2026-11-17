@@ -12,9 +12,11 @@ servers — every client is a full mesh node. End-to-end-encrypted voice over
 - Primary platform: **Windows 10/11** (admin manifest). Also builds on Linux/WSL2 and
   macOS (GitHub Actions "Build macOS Universal").
 - Stack: `eframe`/`egui` 0.28, `cpal` 0.15, `rusty-opus` 1.0 (Opus 64 kbps),
-  `iroh` 1.4 (QUIC), `tokio` (full), `serde` + `serde_json`, `bytes`.
-  Windows-only: `windows` 0.62 (DXGI Desktop Duplication, D3D11, Media Foundation)
-  for screen streaming; other platforms build without it (`src/video` is gated).
+  `iroh` 1.4 (QUIC), `tokio` (full), `serde` + `serde_json`, `bytes`,
+  `raw-window-handle` 0.6 (HWND для тёмного заголовка).
+  Windows-only: `windows` 0.62 (DXGI Desktop Duplication, D3D11, Media Foundation,
+  `Win32_Graphics_Dwm` для `DwmSetWindowAttribute`); other platforms build without
+  it (`src/video` is gated).
 
 ## Build & run
 
@@ -96,7 +98,9 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/network/iroh_service.rs` | `spawn_iroh_receiver`: Iroh listener, sender_id↔NodeID check, full-mesh, relay, friends |
 | `src/network/broadcast.rs` | `spawn_audio_broadcast`: parallel voice fan-out over Iroh |
 | `src/network/message.rs` | `NetworkMessage` enum + hand-rolled binary (de)serialization |
-| `src/gui/mod.rs` | `RadioApp`: eframe window, "Cyber Slate" theme, 60 FPS, network-error banner |
+| `src/gui/mod.rs` | `RadioApp`: eframe window, "Cyber Slate" theme, 60 FPS, network-error banner; console layout bottom-up, rail as one card, settings/chat overlays |
+| `src/gui/theme.rs` | Tokens (PAGE/SURFACE/INNER/INSET, BRAND, LIVE, STROKE_SOFT), `draw_icon`, `avatar`, `primary_button`, `chip_button`, radial fills/rings, level bars |
+| `src/widgets/hero.rs` | Диск рации (шкала, дуга уровня, кольцо с точкой), заголовок эфира, полоса «линия» |
 | `src/gui/stream_control.rs` | Hot-swap audio devices at runtime |
 | `src/widgets/audio_settings.rs` | Settings grid: VU meter, sliders, device lists |
 | `src/widgets/info_panel.rs` | Header: logo, user ID, copyable NodeID, settings entry |
@@ -113,7 +117,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/network/video_link.rs` | `discordrf-video/1`: incoming video connections, one uni-stream per frame, fan-out to viewers |
 | `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
 | `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
-| `src/widgets/room_panel.rs` | NodeID input (connect), participant cards, per-peer volume |
+| `src/widgets/room_panel.rs` | Секции рейла: вход по NodeID, «Мой NodeID» + копирование, участники плоскими строками, громкость собеседника |
 | `assets/icon.png`, `assets/logo.png` | Embedded via `include_bytes!` (monolithic binary) |
 | `.github/workflows/macos.yml` | macOS Universal 2 build |
 
@@ -169,6 +173,38 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
 
 ## Key implementation details & gotchas
 
+- **GUI-оболочка (макет `albus-mockup/slide-desktop.png`):** тёмное окно без
+  разделителей между колонками; консоль слева, рейл справа. Рейл — **одна
+  карточка** на всю высоту: секции (`rail_section`, отступы 14/11) разделены
+  линиями во всю ширину (`rail_divider`), подвал «Сквозное шифрование · v0.1»
+  прижат к низу внутри карточки, список в `ScrollArea` с `max_height = available
+  − 28`.
+- **`with_layout(right_to_left)` в вертикальном UI съедает всю оставшуюся высоту
+  ячейки.** Из-за этого карточка «Комната» когда-то растянулась и вытолкнула
+  участников из вида. Строку с правым элементом всегда оборачивать в
+  `ui.horizontal`.
+- **Геометрия консоли считается снизу вверх** (`draw_console`): сначала полоса
+  «линия» (56), затем PTT-пилюля (54), затем подвал (26), остаток — эфир;
+  ширина диска = `width * 0.46` в диапазоне 230..330. Так PTT и подвал всегда
+  прижаты к низу при любом размере окна.
+- **Тёмный системный заголовок окна:** `RadioApp::apply_dark_titlebar` берёт
+  `eframe::Frame::window_handle()` (raw-window-handle 0.6), достаёт `HWND` и
+  вызывает `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE)` один раз
+  (`self.title_dark`). Без этого белая полоса ломает тёмный макет. Нужны
+  зависимости `raw-window-handle` и feature `Win32_Graphics_Dwm`.
+- **Подсказка PTT на пилюле — из настроек:** `keybind::shortcut_label(vk)` берёт
+  реально назначенную кнопку (`Option<PttBind>` / `CURRENT_VK`), а не хардкод
+  «ПРОБЕЛ»; меняется вместе с хоткеем в настройках.
+- **Поле NODE ID и кнопка «Войти»** — 44 px высоты, радиус 10; поле — `Frame`
+  с `fill(INSET)`, подпись 7.5 и `TextEdit` без рамки. Кнопки `primary_button`
+  — 12 px, радиус 10.
+- **Диск рации (`widgets/hero.rs`):** радиус `side * 0.40`; шкала — базовое
+  кольцо + короткие насечки снаружи (крупные каждые 8-й), промежуточное кольцо
+  0.84R, зелёная дуга уровня с точкой на конце, диск 0.68R со ступенчатым
+  верхним светом (26 уменьшающихся кругов со сдвигом вверх), внутри — фиолетовое
+  кольцо 0.30 диска, точка и скобка справа, «P2P» моноширинным ниже. Дымка в
+  кольце рисуется `radial_ring` от 0 (уходит под диск) — иначе у края диска
+  видна резкая кромка и диск читается «мишенью».
 - **Git ownership (critical):** the checkout is owned by `vPC\mcdag`, but Claude runs
   over SSH as `vPC\Claude-Worker`, so plain `git` fails with "dubious ownership". Always
   prefix: `git -c safe.directory=C:/Claude-Exchange/DISCORDRF <cmd>`.
