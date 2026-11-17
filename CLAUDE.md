@@ -215,7 +215,10 @@ video window. Peers who join mid-stream are not subscribed yet.
 - **Display is capped at the stream's own fps** (`show_period` in `video_session.rs`,
   taken from `StreamInfo.fps` — 30 or 60): preview and remote stream still push every
   frame through the decoder (a skipped P-frame breaks the chain) but only show that
-  many per second, so a burst cannot flood the GPU readback and texture upload.
+  many per second, so a burst cannot flood the GPU readback and texture upload. The
+  threshold is 75% of the period on purpose: at a 75 Hz repaint (13.3 ms per update) a
+  hard 16.7 ms period skipped every second update and pinned the preview at ~32 fps
+  even though each frame cost only ~4 ms.
 - **Readback never blocks the GUI:** `Renderer` runs the GPU conversion
   (`converter.convert` → `copy_to_staging`, which also calls `Flush`) and collects the
   result on a later update with `read_back_nowait` (`D3D11_MAP_FLAG_DO_NOT_WAIT`;
