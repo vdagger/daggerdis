@@ -204,11 +204,10 @@ video window. Peers who join mid-stream are not subscribed yet.
 - **DXGI capture needs an interactive desktop.** Over SSH `ScreenCapture::new`
   returns "не найден экран"; use `tools/video_probe --capture` in the user's
   session (it reports the adapter and effective fps).
-- **MFT output sample must be reused:** handing a freshly allocated `IMFSample`
-  to `ProcessOutput` leaks it whenever the MFT answers
-  `MF_E_TRANSFORM_NEED_MORE_INPUT` (it nulls `pSample`), i.e. once per frame —
-  gigabytes per minute. `win_decode.rs` and `win_mf.rs` keep one persistent
-  sample (`out_sample`) and always reclaim `pSample`/`pEvents` after the call.
+- **A fresh output sample per `ProcessOutput` call:** `win_decode.rs` and
+  `win_mf.rs` allocate a new `IMFSample` for every call. Reusing one persistent
+  sample makes the Microsoft H.264 decoder fail every frame with
+  `ProcessOutput: CopyDecodedFrame failed (0x80004005)`.
 - **Viewer queue is bounded:** `video_link.rs` holds at most 30 frames
   (`MAX_QUEUE`); on overflow it drops the queue and waits for the next keyframe —
   P-frames without their references decode to garbage. The GUI decodes at most
