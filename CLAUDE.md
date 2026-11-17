@@ -263,6 +263,13 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   talk. Every 10 s the callback prints reception counters (buffer underruns,
   concealed frames, stream restarts, burst drops) — that log is what tells which
   side "robots": our playback or their link.
+- **The resampler position must carry over as an offset from the next chunk's
+  start** (`*position -= input.len()`, not `len - 1`). Subtracting one sample
+  less shifted the phase by a sample on every audio callback, so a piece of the
+  signal was dropped at each buffer boundary (an audible tick/buzz; worse with
+  small buffers). This path runs constantly on 44.1 kHz cards — the QUAD-CAPTURE
+  rig is 44100 in and out. The last sample is held past the end of a chunk
+  instead of reading past the slice.
 - **Stream rate is a setting:** `video_fps=30|60` in `config.ini`, picked in the
   broadcast panel before starting (default 60); it threads through
   `VideoSession::start(fps)` → `ScreenPublisher::start(fps)` → capture, encoder and
