@@ -9,7 +9,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, DXGI_ERROR_WAS_STILL_DRAWING};
 
 /// Форматы, с которыми работает конвейер (чтобы не тянуть windows в служебный крейт).
 pub const FORMAT_BGRA: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -254,36 +254,73 @@ impl Converter {
                 .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|e| format!("Map: {e}"))?;
 
-            let w = self.width as usize;
-            let h = self.height as usize;
-            let pitch = mapped.RowPitch as usize;
-            let base = mapped.pData as *const u8;
-            let copy_rows = |dst: &mut [u8], src_row: usize, rows: usize, row_bytes: usize, dst_off: usize| {
-                for y in 0..rows {
+            let buf = self.gather(&mapped);
+            self.context.Unmap(&staging_res, 0);
+            Ok(buf)
+        }
+    }
+
+    /// То же, но без ожидания GPU: `Ok(None)` — результат ещё не готов.
+    /// Блокирующий `Map` ждёт окончания конверсии и отнимает у GUI десятки
+    /// миллисекунд на кадр (превью 1080p показывало ~30 fps при 60 в потоке),
+    /// поэтому пайплайн показа читает кадр этим вариантом.
+    pub fn read_back_nowait(&mut self) -> Result<Option<Vec<u8>>, String> {
+        unsafe {
+            let out_res: ID3D11Resource = self.out_tex.cast().map_err(|e| e.to_string())?;
+            let staging_res: ID3D11Resource =
+                self.staging.cast().map_err(|e| e.to_string())?;
+            self.context.CopyResource(&staging_res, &out_res);
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            match self.context.Map(
+                &staging_res,
+                0,
+                D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                Some(&mut mapped),
+            ) {
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_WAS_STILL_DRAWING => return Ok(None),
+                Err(e) => return Err(format!("Map: {e}")),
+            }
+
+            let buf = self.gather(&mapped);
+            self.context.Unmap(&staging_res, 0);
+            Ok(Some(buf))
+        }
+    }
+
+    /// Плотная копия отображённых строк (staging → системная память).
+    fn gather(&self, mapped: &D3D11_MAPPED_SUBRESOURCE) -> Vec<u8> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let pitch = mapped.RowPitch as usize;
+        let base = mapped.pData as *const u8;
+        let copy_rows = |dst: &mut [u8], src_row: usize, rows: usize, row_bytes: usize, dst_off: usize| {
+            for y in 0..rows {
+                unsafe {
                     std::ptr::copy_nonoverlapping(
                         base.add((src_row + y) * pitch),
                         dst.as_mut_ptr().add(dst_off + y * row_bytes),
                         row_bytes,
                     );
                 }
-            };
+            }
+        };
 
-            let buf = match self.layout {
-                Layout::Nv12 => {
-                    let mut out = vec![0u8; w * h * 3 / 2];
-                    copy_rows(&mut out, 0, h, w, 0);
-                    copy_rows(&mut out, h, h / 2, w, w * h);
-                    out
-                }
-                Layout::Rgba32 => {
-                    let row = w * 4;
-                    let mut out = vec![0u8; row * h];
-                    copy_rows(&mut out, 0, h, row, 0);
-                    out
-                }
-            };
-            self.context.Unmap(&staging_res, 0);
-            Ok(buf)
+        match self.layout {
+            Layout::Nv12 => {
+                let mut out = vec![0u8; w * h * 3 / 2];
+                copy_rows(&mut out, 0, h, w, 0);
+                copy_rows(&mut out, h, h / 2, w, w * h);
+                out
+            }
+            Layout::Rgba32 => {
+                let row = w * 4;
+                let mut out = vec![0u8; row * h];
+                copy_rows(&mut out, 0, h, row, 0);
+                out
+            }
         }
     }
 }

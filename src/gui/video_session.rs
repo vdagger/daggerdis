@@ -29,6 +29,8 @@ pub struct Renderer {
     /// Потолок показа = частота самого потока (30 или 60 fps).
     show_period: Duration,
     last_shown: Option<Instant>,
+    /// Конверсия на GPU запущена, кадр ещё не забран в память.
+    pending: bool,
     pub last_error: Option<String>,
 }
 
@@ -61,6 +63,7 @@ impl Renderer {
             fps: 0.0,
             show_period: Duration::from_secs_f64(1.0 / info.fps.max(1) as f64),
             last_shown: None,
+            pending: false,
             last_error: None,
         })
     }
@@ -81,6 +84,9 @@ impl Renderer {
             }
         }
 
+        // кадр от прошлой конверсии — если GPU уже досчитал
+        self.poll_readback(ctx);
+
         let Some(nv12) = latest else { return };
 
         // Показ не чаще частоты потока. Кадр всё равно проходит декодер (иначе
@@ -90,7 +96,10 @@ impl Renderer {
                 return;
             }
         }
-        self.last_shown = Some(Instant::now());
+        // предыдущая конверсия ещё не забрана — второй раз на GPU не отправляем
+        if self.pending {
+            return;
+        }
 
         // Короткий кадр (ошибка декодера) нельзя отдавать в D3D: UpdateSubresource
         // прочитает за концом буфера. Лучше пропустить кадр.
@@ -104,13 +113,35 @@ impl Renderer {
             return;
         }
         upload_nv12(&self.d3d.context, &self.nv12_tex, self.width, &nv12);
-        let bgra = match self.converter.convert_and_read(&self.nv12_tex) {
-            Ok(b) => b,
+        if let Err(e) = self.converter.convert(&self.nv12_tex) {
+            self.last_error = Some(e);
+            return;
+        }
+        self.pending = true;
+        self.last_shown = Some(Instant::now());
+    }
+
+    /// Забирает готовый кадр, не дожидаясь GPU (блокирующий `Map` стоит
+    /// десятки миллисекунд на кадр — из-за него превью шло ~30 fps).
+    pub fn tick(&mut self, ctx: &egui::Context) {
+        self.poll_readback(ctx);
+    }
+
+    fn poll_readback(&mut self, ctx: &egui::Context) {
+        if !self.pending {
+            return;
+        }
+        let bgra = match self.converter.read_back_nowait() {
+            Ok(Some(b)) => b,
+            Ok(None) => return, // GPU ещё считает
             Err(e) => {
+                self.pending = false;
                 self.last_error = Some(e);
                 return;
             }
         };
+        self.pending = false;
+
         let image = bgra_to_image(&bgra, self.width, self.height);
         match &mut self.texture {
             Some(t) => t.set(image, egui::TextureOptions::LINEAR),
@@ -172,6 +203,7 @@ impl VideoSession {
     /// Забирает закодированные кадры, показывает последний.
     /// Возвращённые кадры уходят в сеть.
     pub fn poll(&mut self, ctx: &egui::Context) -> Vec<EncodedUnit> {
+        self.renderer.tick(ctx);
         let mut units = Vec::new();
         let mut budget = 4;
         while budget > 0 {
@@ -229,6 +261,11 @@ impl RemoteView {
 
     pub fn feed(&mut self, unit: EncodedUnit, ctx: &egui::Context) {
         self.renderer.feed(std::slice::from_ref(&unit), ctx);
+    }
+
+    /// Забрать готовый кадр, не дожидаясь GPU.
+    pub fn tick(&mut self, ctx: &egui::Context) {
+        self.renderer.tick(ctx);
     }
 
     pub fn texture(&self) -> Option<&egui::TextureHandle> {

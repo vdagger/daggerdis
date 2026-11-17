@@ -270,6 +270,10 @@ impl eframe::App for RadioApp {
                     }
                 }
             }
+            // забрать готовый кадр, даже если новых не пришло
+            if let Some(remote) = &mut self.remote {
+                remote.tick(ctx);
+            }
         }
 
         let current_input_index = self
