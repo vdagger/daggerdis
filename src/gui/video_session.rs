@@ -38,6 +38,10 @@ pub struct Renderer {
     last_shown: Option<Instant>,
     /// Конверсия на GPU запущена, кадр ещё не забран в память.
     pending_since: Option<Instant>,
+    /// Свежий декодированный кадр, ещё не отправленный в D3D. Держим один:
+    /// если кадр пришёл, пока GPU занят, он не теряется, а ждёт следующего
+    /// апдейта; более новый просто заменяет его.
+    queued: Option<Vec<u8>>,
     pub last_error: Option<String>,
 }
 
@@ -83,6 +87,7 @@ impl Renderer {
             show_period: Duration::from_secs_f64(1.0 / info.fps.max(1) as f64),
             last_shown: None,
             pending_since: None,
+            queued: None,
             last_error: None,
         })
     }
@@ -108,11 +113,41 @@ impl Renderer {
             self.decode_ms = t_decode.elapsed().as_secs_f32() * 1000.0;
         }
 
+        // Короткий кадр (ошибка декодера) нельзя отдавать в D3D: UpdateSubresource
+        // прочитает за концом буфера. Лучше пропустить кадр.
+        if let Some(nv12) = latest {
+            let need = self.width as usize * self.height as usize * 3 / 2;
+            if nv12.len() < need {
+                self.last_error = Some(format!(
+                    "короткий NV12-кадр: {} из {} байт",
+                    nv12.len(),
+                    need
+                ));
+            } else {
+                self.queued = Some(nv12);
+            }
+        }
+
+        self.pump(ctx);
+    }
+
+    /// Забирает готовый кадр, не дожидаясь GPU (блокирующий `Map` стоит
+    /// десятки миллисекунд на кадр — из-за него превью шло ~30 fps).
+    pub fn tick(&mut self, ctx: &egui::Context) {
+        self.pump(ctx);
+    }
+
+    /// Отправляет на GPU самый свежий отложенный кадр, если тот готов и показ
+    /// не упёрся в частоту потока. Вызывается каждый апдейт: даже без новых
+    /// кадров из сети отложенный кадр должен дойти до экрана.
+    fn pump(&mut self, ctx: &egui::Context) {
         // кадр от прошлой конверсии — если GPU уже досчитал
         self.poll_readback(ctx);
 
-        let Some(nv12) = latest else { return };
-
+        // предыдущая конверсия ещё не забрана — второй раз на GPU не отправляем
+        if self.pending_since.is_some() {
+            return;
+        }
         // Показ не чаще частоты потока. Кадр всё равно проходит декодер (иначе
         // порвётся цепочка P-кадров), но в D3D и на экран не идёт.
         //
@@ -125,22 +160,10 @@ impl Renderer {
                 return;
             }
         }
-        // предыдущая конверсия ещё не забрана — второй раз на GPU не отправляем
-        if self.pending_since.is_some() {
-            return;
-        }
 
-        // Короткий кадр (ошибка декодера) нельзя отдавать в D3D: UpdateSubresource
-        // прочитает за концом буфера. Лучше пропустить кадр.
-        let need = self.width as usize * self.height as usize * 3 / 2;
-        if nv12.len() < need {
-            self.last_error = Some(format!(
-                "короткий NV12-кадр: {} из {} байт",
-                nv12.len(),
-                need
-            ));
+        let Some(nv12) = self.queued.take() else {
             return;
-        }
+        };
         upload_nv12(&self.d3d.context, &self.nv12_tex, self.width, &nv12);
         if let Err(e) = self.converter.convert(&self.nv12_tex) {
             self.last_error = Some(e);
@@ -152,12 +175,6 @@ impl Renderer {
         }
         self.pending_since = Some(Instant::now());
         self.last_shown = Some(Instant::now());
-    }
-
-    /// Забирает готовый кадр, не дожидаясь GPU (блокирующий `Map` стоит
-    /// десятки миллисекунд на кадр — из-за него превью шло ~30 fps).
-    pub fn tick(&mut self, ctx: &egui::Context) {
-        self.poll_readback(ctx);
     }
 
     fn poll_readback(&mut self, ctx: &egui::Context) {
