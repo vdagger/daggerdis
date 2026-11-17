@@ -238,16 +238,31 @@ impl Converter {
     /// Конверсия и чтение результата в память одним вызовом.
     pub fn convert_and_read(&mut self, src: &ID3D11Texture2D) -> Result<Vec<u8>, String> {
         self.convert(src)?;
+        self.copy_to_staging()?;
         self.read_back()
     }
 
-    /// Копирует результат конверсии в staging и возвращает плотный буфер.
-    pub fn read_back(&mut self) -> Result<Vec<u8>, String> {
+    /// Переносит результат конверсии в staging-текстуру.
+    /// Копия отделена от чтения специально: с `DO_NOT_WAIT` нельзя копировать
+    /// перед каждой попыткой — свежая копия снова занимает ресурс, `Map`
+    /// вечно отвечает «ещё рисуется», и кадр не доходит до экрана.
+    pub fn copy_to_staging(&mut self) -> Result<(), String> {
         unsafe {
             let out_res: ID3D11Resource = self.out_tex.cast().map_err(|e| e.to_string())?;
             let staging_res: ID3D11Resource =
                 self.staging.cast().map_err(|e| e.to_string())?;
             self.context.CopyResource(&staging_res, &out_res);
+            // без Flush копия может так и лежать в очереди драйвера
+            self.context.Flush();
+        }
+        Ok(())
+    }
+
+    /// Блокирующее чтение staging-текстуры в плотный буфер.
+    pub fn read_back(&mut self) -> Result<Vec<u8>, String> {
+        unsafe {
+            let staging_res: ID3D11Resource =
+                self.staging.cast().map_err(|e| e.to_string())?;
 
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
@@ -262,14 +277,11 @@ impl Converter {
 
     /// То же, но без ожидания GPU: `Ok(None)` — результат ещё не готов.
     /// Блокирующий `Map` ждёт окончания конверсии и отнимает у GUI десятки
-    /// миллисекунд на кадр (превью 1080p показывало ~30 fps при 60 в потоке),
-    /// поэтому пайплайн показа читает кадр этим вариантом.
+    /// миллисекунд на кадр (превью 1080p показывало ~30 fps при 60 в потоке).
     pub fn read_back_nowait(&mut self) -> Result<Option<Vec<u8>>, String> {
         unsafe {
-            let out_res: ID3D11Resource = self.out_tex.cast().map_err(|e| e.to_string())?;
             let staging_res: ID3D11Resource =
                 self.staging.cast().map_err(|e| e.to_string())?;
-            self.context.CopyResource(&staging_res, &out_res);
 
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             match self.context.Map(

@@ -30,7 +30,7 @@ pub struct Renderer {
     show_period: Duration,
     last_shown: Option<Instant>,
     /// Конверсия на GPU запущена, кадр ещё не забран в память.
-    pending: bool,
+    pending_since: Option<Instant>,
     pub last_error: Option<String>,
 }
 
@@ -63,7 +63,7 @@ impl Renderer {
             fps: 0.0,
             show_period: Duration::from_secs_f64(1.0 / info.fps.max(1) as f64),
             last_shown: None,
-            pending: false,
+            pending_since: None,
             last_error: None,
         })
     }
@@ -97,7 +97,7 @@ impl Renderer {
             }
         }
         // предыдущая конверсия ещё не забрана — второй раз на GPU не отправляем
-        if self.pending {
+        if self.pending_since.is_some() {
             return;
         }
 
@@ -117,7 +117,11 @@ impl Renderer {
             self.last_error = Some(e);
             return;
         }
-        self.pending = true;
+        if let Err(e) = self.converter.copy_to_staging() {
+            self.last_error = Some(e);
+            return;
+        }
+        self.pending_since = Some(Instant::now());
         self.last_shown = Some(Instant::now());
     }
 
@@ -128,19 +132,24 @@ impl Renderer {
     }
 
     fn poll_readback(&mut self, ctx: &egui::Context) {
-        if !self.pending {
+        let Some(since) = self.pending_since else {
+            return;
+        };
+        // страховка: если GPU так и не отдал кадр, не залипаем навсегда
+        if since.elapsed() > Duration::from_millis(500) {
+            self.pending_since = None;
             return;
         }
         let bgra = match self.converter.read_back_nowait() {
             Ok(Some(b)) => b,
             Ok(None) => return, // GPU ещё считает
             Err(e) => {
-                self.pending = false;
+                self.pending_since = None;
                 self.last_error = Some(e);
                 return;
             }
         };
-        self.pending = false;
+        self.pending_since = None;
 
         let image = bgra_to_image(&bgra, self.width, self.height);
         match &mut self.texture {
