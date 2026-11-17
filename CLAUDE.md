@@ -87,7 +87,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate + AGC, per-peer mix bus |
-| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
+| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
 | `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume, `video_fps`) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
@@ -102,7 +102,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/gui/theme.rs` | Tokens (PAGE/SURFACE/INNER/INSET, BRAND, LIVE, STROKE_SOFT), `draw_icon`, `avatar`, `primary_button`, `chip_button`, radial fills/rings, level bars |
 | `src/widgets/hero.rs` | Диск рации (шкала, дуга уровня, кольцо с точкой), заголовок эфира, полоса «линия» |
 | `src/gui/stream_control.rs` | Hot-swap audio devices at runtime |
-| `src/widgets/audio_settings.rs` | Settings grid: VU meter, sliders, device lists |
+| `src/widgets/audio_settings.rs` | Settings grid: VU meter, sliders, device lists, тумблер прослушивания тракта |
 | `src/widgets/info_panel.rs` | Header: logo, user ID, copyable NodeID, settings entry |
 | `src/widgets/identity.rs` | "Мой NodeID" block: full ID + copy button/click-to-copy |
 | `src/widgets/friends_panel.rs` | Friends list, incoming requests, add-friend, call/remove, chat button + unread |
@@ -227,6 +227,15 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   −20 dBFS уходил в эфир на −20 dBFS, и громкость добиралась уже у собеседника.
   Ниже −66 dBFS RMS усиление не трогается — тихая речь этого порога достигает,
   а шум в паузах до AGC не доходит вовсе: гейт обнуляет его раньше.
+- **Прослушивание своего тракта (self-monitor):** тумблер «Слышать свой тракт» в
+  настройках звука. В `AudioMixer.monitor_buf` кладётся звук **после** гейта, AGC и
+  лимитера — то есть ровно то, что уйдёт в Opus, но до нарезки на кадры, поэтому
+  прослушивание не зависит от PTT. В колбэке воспроизведения он подмешивается к
+  миксу **после** master gain (уровень монитора не зависит от громкости собеседников)
+  и **до** миксового лимитера, с ресэмплингом 48 кГц → частота карты. Буфер ограничен
+  400 мс, при включении чистится. Состояние сессионное, в `config.ini` не пишется.
+  Задумано для баланса микрофона и гитары до созвона; через колонки микрофон
+  поймает свой же голос — только наушники.
 - **Микс-буфер у каждого собеседника свой:** `Peer.pcm` в `audio.rs`, кадры
   складываются поверх при выводе. Раньше все куски дописывались подряд в один
   `pcm_buffer` — когда говорили двое, речь шла друг за другом во времени, буфер рос,
