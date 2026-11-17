@@ -337,10 +337,16 @@ impl MfEncoder {
                 pEvents: ManuallyDrop::new(None),
             };
             let mut status = 0u32;
-            match self
+            let result = self
                 .transform
-                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status)
-            {
+                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status);
+
+            // Забираем сэмпл из `ManuallyDrop` до разбора результата: иначе на
+            // ветке NEED_MORE_INPUT выделенный выходной буфер оставался висеть
+            // (та же утечка, что была в декодере).
+            let sample = ManuallyDrop::take(&mut data.pSample);
+
+            match result {
                 Ok(()) => {}
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(Vec::new()),
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
@@ -349,8 +355,6 @@ impl MfEncoder {
                 }
                 Err(e) => return Err(format!("ProcessOutput: {e}")),
             }
-
-            let sample = ManuallyDrop::take(&mut data.pSample);
             let sample = match sample {
                 Some(s) => s,
                 None => return Ok(Vec::new()),

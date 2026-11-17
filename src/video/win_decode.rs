@@ -350,10 +350,18 @@ impl MfDecoder {
                 pEvents: ManuallyDrop::new(None),
             };
             let mut status = 0u32;
-            match self
+            let result = self
                 .transform
-                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status)
-            {
+                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status);
+
+            // Сэмпл в `pSample` — в `ManuallyDrop`, чтобы его не тронул drop
+            // структуры. Забираем его всегда, до разбора результата: иначе на
+            // штатной ветке NEED_MORE_INPUT (конец каждого кадра) выделенный
+            // под выход буфер NV12 (3 МБ на 1080p) оставался висеть — память
+            // росла на кадр, ~180 МБ/с при 60 fps.
+            let sample = ManuallyDrop::take(&mut data.pSample);
+
+            match result {
                 Ok(()) => {}
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
                     return Ok(Output::NeedInput)
@@ -365,7 +373,6 @@ impl MfDecoder {
                 Err(e) => return Err(format!("ProcessOutput: {e}")),
             }
 
-            let sample = ManuallyDrop::take(&mut data.pSample);
             let sample = match sample {
                 Some(s) => s,
                 None => return Ok(Output::NeedInput),
