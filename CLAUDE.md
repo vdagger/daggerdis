@@ -213,6 +213,10 @@ video window. Peers who join mid-stream are not subscribed yet.
   (`MAX_QUEUE`); on overflow it drops the queue and waits for the next keyframe —
   P-frames without their references decode to garbage. The GUI decodes at most
   4 frames per update so one slow frame cannot stall the UI.
+- **Display is capped at 60 fps** (`MAX_FPS` in `video_session.rs`): preview and
+  remote stream still push every frame through the decoder (a skipped P-frame
+  breaks the chain) but only show up to 60 per second, so a burst cannot flood
+  the GPU readback and texture upload.
 - **Decoder output is 1088 rows** (height aligned to 16) and its UV plane starts
   below; `repack_nv12()` strips the padding to exactly w×h before upload.
 - **The Microsoft H.264 decoder MFT is synchronous** (no
