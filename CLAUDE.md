@@ -159,6 +159,14 @@ When a broadcast starts, `VideoLink::add_viewer` opens a connection to every
 peer already in the room; viewers accept automatically and the GUI opens the
 video window. Peers who join mid-stream are not subscribed yet.
 
+Stopping a broadcast must call `VideoLink::stop_viewers()` (the GUI does it in
+the same click that drops `self.video`). Each viewer connection lives inside a
+send task that selects on a `watch` stop signal; when it fires, the task ends and
+with it the QUIC connection. Without this every stop/start cycle left the old
+connections alive and added a fresh one per peer — pinned memory that grew with
+every restart, plus duplicated video traffic. `add_viewer` also de-duplicates by
+NodeID. On the receiving side a finished stream drops that sender's queued frames.
+
 ## Key implementation details & gotchas
 
 - **Git ownership (critical):** the checkout is owned by `vPC\mcdag`, but Claude runs
