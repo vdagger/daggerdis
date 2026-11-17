@@ -86,8 +86,8 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
-| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate |
-| `src/mixer.rs` | `AudioMixer`: dB boost (0..300%), soft-knee limiter, mute, volume, per-peer gain |
+| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate + AGC, per-peer mix bus |
+| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
 | `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume, `video_fps`) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
@@ -214,9 +214,22 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
 - **Anti-impersonation:** `iroh_service.rs` recomputes `hash(QUIC NodeID)` for every
   received packet and drops any message whose `sender_id` doesn't match. The QUIC NodeID
   is authenticated by iroh's TLS.
-- **DSP chain:** adaptive noise gate (−44 dBFS) → linear resampler (`resample_linear`,
-  preserves pitch across any card rate) → Opus 64 kbps → soft-knee limiter (−1.0 dBFS) →
-  +18 dB logarithmic boost.
+- **DSP chain, передача:** noise gate (−44 dBFS) → linear resampler (`resample_linear`,
+  preserves pitch across any card rate) → `TransmitAgc` (цель −20 dBFS RMS, усиление
+  −12…+24 дБ) → `Limiter` (−1 dBFS) → Opus 64 kbps.
+- **DSP chain, приём:** `Limiter` на каждый голос **не ставится** — персональная
+  громкость (слайдер в дБ, −30…+18) умножается на декодированный буфер, голоса
+  складываются в общий микс, и уже микс проходит master gain + один `Limiter` (−1 dBFS).
+  Порог пика у каждого голоса отдельно съедал персональный буст: при пиках 0.3 из
+  +18 дБ оставалось ~+10, при 0.5 — ~+5.7, а если общая громкость уже стояла на 300%,
+  персональная не добавляла почти ничего.
+- **AGC на передаче — это и есть «как в Discord»:** без него микрофон с речью на
+  −20 dBFS уходил в эфир на −20 dBFS, и громкость добиралась уже у собеседника.
+  Порог −50 dBFS RMS: тише этого усиление не растёт, чтобы шум в паузах не разгонялся.
+- **Микс-буфер у каждого собеседника свой:** `Peer.pcm` в `audio.rs`, кадры
+  складываются поверх при выводе. Раньше все куски дописывались подряд в один
+  `pcm_buffer` — когда говорили двое, речь шла друг за другом во времени, буфер рос,
+  и его хвост выбрасывался: один голос глушил другого.
 - **Default PTT key:** Mouse 4 (side button); global via `GetAsyncKeyState`, works in
   fullscreen games / minimized window.
 - **Settings persistence:** `src/config.rs` reads/writes `%APPDATA%\Albus\config.ini`
