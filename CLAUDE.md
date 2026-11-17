@@ -251,6 +251,18 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   packets are queued. Waiting for the missing seq froze the playback until the buffer
   filled up and then dumped it in a burst — that is the "robot voice" one peer hears
   when its link drops datagrams.
+- **Every peer needs its own Opus decoder, resampler position and reorder queue.**
+  `create_playback_stream` used to feed all senders through one `OpusDecoder`;
+  Opus is stateful (SILK/CELT), so interleaving two people's packets corrupted
+  that state and the speech turned "robotic" as soon as a second voice joined.
+  The receive state is now a per-sender `Peer` struct in `audio.rs`. Gaps are
+  concealed by repeating the sender's last frame with a fade (up to 3 frames =
+  60 ms), the prebuffer is 60 ms, and an overflowing jitter buffer is trimmed to
+  80 ms out of 200 ms. A sender that restarts (seq back to 0) is re-armed on its
+  own after ~25 consecutive "stale" packets, so it stays audible while others
+  talk. Every 10 s the callback prints reception counters (buffer underruns,
+  concealed frames, stream restarts, burst drops) — that log is what tells which
+  side "robots": our playback or their link.
 - **Stream rate is a setting:** `video_fps=30|60` in `config.ini`, picked in the
   broadcast panel before starting (default 60); it threads through
   `VideoSession::start(fps)` → `ScreenPublisher::start(fps)` → capture, encoder and
