@@ -36,8 +36,6 @@ pub struct MfDecoder {
     /// `None` — MFT синхронный, работаем через ProcessInput/ProcessOutput.
     events: Option<IMFMediaEventGenerator>,
     output_info: MFT_OUTPUT_STREAM_INFO,
-    /// Образец под выход декодера: создаётся один раз и переиспользуется.
-    out_sample: Option<IMFSample>,
     frame_duration: i64,
     next_pts: i64,
     need_input: bool,
@@ -165,7 +163,6 @@ impl MfDecoder {
             transform,
             events,
             output_info,
-            out_sample: None,
             frame_duration: 10_000_000 / info.fps.max(1) as i64,
             next_pts: 0,
             need_input: false,
@@ -327,64 +324,49 @@ impl MfDecoder {
         }
     }
 
-    /// Образец под выходной буфер. Декодеру нужен буфер от клиента, но MFT
-    /// при `MF_E_TRANSFORM_NEED_MORE_INPUT` обнуляет `pSample` — свежесозданный
-    /// на каждый вызов буфер (w×h×1.5, для 1080p это 3 МБ) утекал бы целиком.
-    /// Поэтому создаём его один раз и переиспользуем.
-    fn output_sample(&mut self) -> Result<Option<IMFSample>, String> {
-        let provides_samples =
-            self.output_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
-        if provides_samples {
-            return Ok(None);
-        }
-        if let Some(sample) = &self.out_sample {
-            return Ok(Some(sample.clone()));
-        }
-        unsafe {
-            let size = self
-                .output_info
-                .cbSize
-                .max(self.width * self.height * 3 / 2);
-            let buf = MFCreateMemoryBuffer(size).map_err(|e| e.to_string())?;
-            let sample = MFCreateSample().map_err(|e| e.to_string())?;
-            sample.AddBuffer(&buf).map_err(|e| e.to_string())?;
-            self.out_sample = Some(sample.clone());
-            Ok(Some(sample))
-        }
-    }
-
     fn process_output_once(&mut self) -> Result<Output, String> {
-        // клон живёт в буфере вызова, оригинал остаётся в self
-        let pass = self.output_sample()?;
         unsafe {
+            // Свежий сэмпл на каждый вызов. Переиспользовать один нельзя:
+            // декодер Microsoft отвечает `CopyDecodedFrame failed (0x80004005)`.
+            let provides_samples =
+                self.output_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
+            let sample = if provides_samples {
+                None
+            } else {
+                let size = self
+                    .output_info
+                    .cbSize
+                    .max(self.width * self.height * 3 / 2);
+                let buf = MFCreateMemoryBuffer(size).map_err(|e| e.to_string())?;
+                let s = MFCreateSample().map_err(|e| e.to_string())?;
+                s.AddBuffer(&buf).map_err(|e| e.to_string())?;
+                Some(s)
+            };
+
             let mut data = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
-                pSample: ManuallyDrop::new(pass),
+                pSample: ManuallyDrop::new(sample),
                 dwStatus: 0,
                 pEvents: ManuallyDrop::new(None),
             };
             let mut status = 0u32;
-            let res = self
+            match self
                 .transform
-                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status);
-            // забираем то, что положили: без этого буфер остаётся висеть
-            let returned = ManuallyDrop::take(&mut data.pSample);
-            drop(ManuallyDrop::take(&mut data.pEvents));
-            match res {
+                .ProcessOutput(0, std::slice::from_mut(&mut data), &mut status)
+            {
                 Ok(()) => {}
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
                     return Ok(Output::NeedInput)
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    // после смены формата старый буфер может быть мал
-                    self.out_sample = None;
                     self.apply_stream_change()?;
                     return Ok(Output::StreamChanged);
                 }
                 Err(e) => return Err(format!("ProcessOutput: {e}")),
             }
 
-            let sample = match returned {
+            let sample = ManuallyDrop::take(&mut data.pSample);
+            let sample = match sample {
                 Some(s) => s,
                 None => return Ok(Output::NeedInput),
             };
