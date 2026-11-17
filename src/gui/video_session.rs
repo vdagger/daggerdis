@@ -23,9 +23,16 @@ pub struct Renderer {
     texture: Option<egui::TextureHandle>,
     width: u32,
     height: u32,
+    /// Размер кадра после GPU-конверсии (превью — вдвое меньше потока).
+    out_width: u32,
+    out_height: u32,
     fps_window_start: Instant,
     fps_window_frames: u32,
     fps: f32,
+    /// Стоимость последнего кадра по этапам, мс (диагностика).
+    decode_ms: f32,
+    readback_ms: f32,
+    image_ms: f32,
     /// Потолок показа = частота самого потока (30 или 60 fps).
     show_period: Duration,
     last_shown: Option<Instant>,
@@ -35,7 +42,14 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(info: &StreamInfo) -> Result<Self, String> {
+    /// `out_scale` — во сколько раз уменьшить кадр после конверсии (1 = как в
+    /// потоке). Превью показывает картинку в маленьком окне, и readback +
+    /// конвертация в `ColorImage` + загрузка текстуры на полном 1080p стоят
+    /// дороже, чем даёт видимая разница.
+    pub fn new(info: &StreamInfo, out_scale: u32) -> Result<Self, String> {
+        let scale = out_scale.max(1);
+        let out_w = (info.width / scale) & !1;
+        let out_h = (info.height / scale) & !1;
         let decoder = MfDecoder::new(info)?;
         let d3d = create_device(None)?;
         let nv12_tex = nv12_texture(&d3d.device, info.width, info.height)?;
@@ -46,8 +60,8 @@ impl Renderer {
             info.width,
             info.height,
             FORMAT_BGRA,
-            info.width,
-            info.height,
+            out_w,
+            out_h,
             info.fps,
         )?;
         Ok(Self {
@@ -58,9 +72,14 @@ impl Renderer {
             texture: None,
             width: info.width,
             height: info.height,
+            out_width: out_w,
+            out_height: out_h,
             fps_window_start: Instant::now(),
             fps_window_frames: 0,
             fps: 0.0,
+            decode_ms: 0.0,
+            readback_ms: 0.0,
+            image_ms: 0.0,
             show_period: Duration::from_secs_f64(1.0 / info.fps.max(1) as f64),
             last_shown: None,
             pending_since: None,
@@ -69,6 +88,7 @@ impl Renderer {
     }
 
     pub fn feed(&mut self, units: &[EncodedUnit], ctx: &egui::Context) {
+        let t_decode = Instant::now();
         let mut latest: Option<Vec<u8>> = None;
         for unit in units {
             match self.decoder.push(unit) {
@@ -82,6 +102,10 @@ impl Renderer {
                     break;
                 }
             }
+        }
+
+        if !units.is_empty() {
+            self.decode_ms = t_decode.elapsed().as_secs_f32() * 1000.0;
         }
 
         // кадр от прошлой конверсии — если GPU уже досчитал
@@ -140,6 +164,7 @@ impl Renderer {
             self.pending_since = None;
             return;
         }
+        let t_read = Instant::now();
         let bgra = match self.converter.read_back_nowait() {
             Ok(Some(b)) => b,
             Ok(None) => return, // GPU ещё считает
@@ -149,9 +174,11 @@ impl Renderer {
                 return;
             }
         };
+        self.readback_ms = t_read.elapsed().as_secs_f32() * 1000.0;
         self.pending_since = None;
 
-        let image = bgra_to_image(&bgra, self.width, self.height);
+        let t_image = Instant::now();
+        let image = bgra_to_image(&bgra, self.out_width, self.out_height);
         match &mut self.texture {
             Some(t) => t.set(image, egui::TextureOptions::LINEAR),
             None => {
@@ -162,6 +189,7 @@ impl Renderer {
                 ));
             }
         }
+        self.image_ms = t_image.elapsed().as_secs_f32() * 1000.0;
 
         // настоящий fps: кадры за последнюю секунду, а не суммарный счётчик
         self.fps_window_frames += 1;
@@ -178,12 +206,17 @@ impl Renderer {
     }
 
     pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
+        (self.out_width, self.out_height)
     }
 
     /// Кадров в секунду за последнее окно измерения.
     pub fn fps(&self) -> f32 {
         self.fps
+    }
+
+    /// Стоимость этапов последнего кадра: декод, чтение с GPU, картинка+текстура.
+    pub fn timings(&self) -> (f32, f32, f32) {
+        (self.decode_ms, self.readback_ms, self.image_ms)
     }
 }
 
@@ -197,7 +230,9 @@ pub struct VideoSession {
 impl VideoSession {
     pub fn start(fps: u32) -> Result<Self, String> {
         let publisher = ScreenPublisher::start(fps)?;
-        let renderer = Renderer::new(&publisher.info)?;
+        // превью — в половинном разрешении: на экране оно всё равно мелкое,
+        // а полный 1080p readback не даёт держать 60 кадров в секунду
+        let renderer = Renderer::new(&publisher.info, 2)?;
         Ok(Self {
             source: publisher.source.clone(),
             publisher,
@@ -242,6 +277,10 @@ impl VideoSession {
         self.renderer.fps()
     }
 
+    pub fn timings(&self) -> (f32, f32, f32) {
+        self.renderer.timings()
+    }
+
     /// Фактическая частота кодирования (не показа).
     pub fn encode_fps(&self) -> u32 {
         self.publisher
@@ -263,7 +302,8 @@ pub struct RemoteView {
 impl RemoteView {
     pub fn new(info: &StreamInfo, peer: String) -> Result<Self, String> {
         Ok(Self {
-            renderer: Renderer::new(info)?,
+            // чужой поток — в полном разрешении: его смотрят в отдельном окне
+            renderer: Renderer::new(info, 1)?,
             peer,
         })
     }

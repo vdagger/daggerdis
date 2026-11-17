@@ -618,6 +618,18 @@ impl RadioApp {
                     }
                 });
 
+                // этапы кадра: видно, что именно не даёт держать целевые fps
+                if let Some(v) = &self.video {
+                    let (d, r, i) = v.timings();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "декод {d:.1} · чтение с GPU {r:.1} · картинка {i:.1} мс"
+                        ))
+                        .size(9.0)
+                        .color(t::TEXT_MUTED),
+                    );
+                }
+
                 if let Some(err) = &self.video_error {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(err).size(10.5).color(t::REC));

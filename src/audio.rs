@@ -239,8 +239,19 @@ impl UniversalAudioCapture {
                         }
                         entry.1.insert(seq, packet);
 
+                        // Дырка в нумерации: один потерянный датаграм не должен
+                        // останавливать воспроизведение. Иначе звук замирает, пока
+                        // не наберётся полный буфер, и выплёвывается пачкой — на слух
+                        // это «робот». Если впереди уже несколько пакетов, ждать
+                        // потерянный бессмысленно: считаем его потерянным.
+                        if !entry.1.contains_key(&entry.0) && entry.1.len() >= 3 {
+                            if let Some(&lowest) = entry.1.keys().next() {
+                                entry.0 = lowest;
+                            }
+                        }
+
                         // Не даём буферу переупорядочивания расти при большой дыре в потоке
-                        while entry.1.len() > 64 {
+                        while entry.1.len() > 32 {
                             let oldest = *entry.1.keys().next().unwrap();
                             entry.1.remove(&oldest);
                             entry.0 = oldest.wrapping_add(1);
