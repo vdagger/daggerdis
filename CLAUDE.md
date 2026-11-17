@@ -262,6 +262,14 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
 - **The Microsoft H.264 decoder MFT is synchronous** (no
   `IMFMediaEventGenerator`); `win_decode.rs` detects both sync and async MFTs and
   drives them accordingly.
+- **Take `pSample` out of `MFT_OUTPUT_DATA_BUFFER` before matching the
+  `ProcessOutput` result.** The struct is built with `ManuallyDrop`, so an early
+  `return` on `MF_E_TRANSFORM_NEED_MORE_INPUT` — the normal end of every frame —
+  leaked the output buffer that was allocated for that attempt. For the decoder
+  that is w×h×3/2 (3 MB at 1080p) per frame: private bytes grew ~180 MB/s while
+  streaming (sampled with `PrivateMemorySize64`, did not show in the working set
+  until Windows made the pages resident). Both `win_decode.rs` and `win_mf.rs`
+  now take the sample first and let it drop on every early return.
 - **Probe crate:** `tools/video_probe` is a separate package because `build.rs`
   link args (the requireAdministrator manifest) leak into examples and such a
   process cannot start in an SSH session. Build with
