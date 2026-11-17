@@ -1140,7 +1140,13 @@ impl RadioApp {
         self.is_host.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(p2p) = self.iroh.clone() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move { p2p.disconnect_all().await });
+                // Отказ/отмена/завершение шлются отдельной таской — даём им
+                // уйти до обрыва, иначе собеседник ждёт таймаута вместо
+                // мгновенного «звонок отклонён/завершён».
+                handle.spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                    p2p.disconnect_all().await;
+                });
             }
         }
         self.show_toast("Вы вышли из эфира");
