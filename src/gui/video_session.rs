@@ -14,6 +14,9 @@ use crate::video::win_d3d::{
 use crate::video::win_decode::MfDecoder;
 use crate::video::EncodedUnit;
 
+/// Потолок показа: и превью, и чужой поток идут не чаще 60 кадров в секунду.
+const MAX_FPS: f32 = 60.0;
+
 /// Декод кадров и обновление текстуры egui.
 pub struct Renderer {
     decoder: MfDecoder,
@@ -26,6 +29,7 @@ pub struct Renderer {
     fps_window_start: Instant,
     fps_window_frames: u32,
     fps: f32,
+    last_shown: Option<Instant>,
     pub last_error: Option<String>,
 }
 
@@ -56,6 +60,7 @@ impl Renderer {
             fps_window_start: Instant::now(),
             fps_window_frames: 0,
             fps: 0.0,
+            last_shown: None,
             last_error: None,
         })
     }
@@ -77,6 +82,17 @@ impl Renderer {
         }
 
         let Some(nv12) = latest else { return };
+
+        // Потолок 60 кадров в секунду. Кадр всё равно проходит декодер (иначе
+        // порвётся цепочка P-кадров), но в D3D и на экран не идёт.
+        let period = Duration::from_secs_f32(1.0 / MAX_FPS);
+        if let Some(last) = self.last_shown {
+            if last.elapsed() < period {
+                return;
+            }
+        }
+        self.last_shown = Some(Instant::now());
+
         // Короткий кадр (ошибка декодера) нельзя отдавать в D3D: UpdateSubresource
         // прочитает за концом буфера. Лучше пропустить кадр.
         let need = self.width as usize * self.height as usize * 3 / 2;
