@@ -288,6 +288,14 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   first two channels (`active_channels = channels.min(2)`), leaving the rest
   silent. Feeding LFE/center/surround with a copy of the front pair is never
   what a plain stereo signal should do.
+- **Razer's virtual "7.1 Surround Sound" endpoint mangles `f32`.** This is a
+  known cpal problem ([RustAudio/cpal#892](https://github.com/RustAudio/cpal/issues/892)):
+  every cpal app (rodio, kira, Bevy) plays heavily distorted sound on that
+  device while other outputs are clean, and Razer's own surround toggle makes no
+  difference — the same stream in `i32` plays fine. So `i32` is a candidate
+  format too, and on endpoints with more than two channels it is tried before
+  `f32`; stereo endpoints keep `f32` first. The order is printed per attempt
+  (`формат … не подошёл`), so the log shows which format the device did accept.
 - **A silent "nothing plays" must be visible in the console.** `main.rs` used to
   swallow `create_playback_stream`/`create_input_stream` errors with `if let Ok`,
   so a failed stream looked like a working app that transmits but stays quiet.
