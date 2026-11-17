@@ -1,4 +1,4 @@
-//! Графический интерфейс: тёмная тема с акцентом на эфир
+//! Графический интерфейс: компактная эфирная консоль с оверлеями
 
 pub mod theme;
 
@@ -8,7 +8,7 @@ mod stream_control;
 mod video_session;
 
 use eframe::egui;
-use egui::{FontFamily, FontId, Rounding, Stroke, TextStyle};
+use egui::{Align, FontFamily, FontId, Layout, Order, Rounding, Stroke, TextStyle};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -40,6 +40,8 @@ pub struct RadioApp {
     continuous_mode: bool,
     theme_configured: bool,
     settings_open: bool,
+    chat_open: bool,
+    toast: Option<(String, Instant)>,
     wave: VecDeque<f32>,
     config: crate::config::AppConfig,
     friends: Arc<crate::friends::FriendsManager>,
@@ -53,6 +55,8 @@ pub struct RadioApp {
     reset_note: Option<String>,
     pending_save: bool,
     last_save: Instant,
+    #[cfg(windows)]
+    title_dark: bool,
     #[cfg(windows)]
     video: Option<video_session::VideoSession>,
     #[cfg(windows)]
@@ -70,6 +74,7 @@ pub struct RadioApp {
 }
 
 impl RadioApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mixer: Arc<crate::mixer::AudioMixer>,
         room: Arc<crate::room::RoomManager>,
@@ -120,6 +125,8 @@ impl RadioApp {
             continuous_mode: config.continuous_mode.unwrap_or(false),
             theme_configured: false,
             settings_open: false,
+            chat_open: false,
+            toast: None,
             wave: VecDeque::new(),
             config,
             friends,
@@ -133,6 +140,8 @@ impl RadioApp {
             reset_note: None,
             pending_save: false,
             last_save: Instant::now(),
+            #[cfg(windows)]
+            title_dark: false,
             #[cfg(windows)]
             video: None,
             #[cfg(windows)]
@@ -169,64 +178,137 @@ impl RadioApp {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = t::BG;
         visuals.window_fill = t::SURFACE;
-        visuals.extreme_bg_color = egui::Color32::from_rgb(12, 14, 18);
+        visuals.extreme_bg_color = t::INSET;
         visuals.faint_bg_color = t::SURFACE_HI;
-        visuals.window_stroke = Stroke::new(1.0_f32, t::STROKE);
-        visuals.window_rounding = Rounding::same(14.0);
+        visuals.window_stroke = Stroke::new(1.0_f32, t::STROKE_SOFT);
+        visuals.window_rounding = Rounding::same(16.0);
         visuals.menu_rounding = Rounding::same(10.0);
         visuals.window_shadow = egui::epaint::Shadow {
-            offset: egui::vec2(0.0, 10.0),
-            blur: 28.0,
+            offset: egui::vec2(0.0, 16.0),
+            blur: 44.0,
             spread: 0.0,
-            color: egui::Color32::from_black_alpha(140),
+            color: egui::Color32::from_black_alpha(170),
         };
         visuals.popup_shadow = visuals.window_shadow;
 
-        visuals.widgets.inactive.bg_fill = t::SURFACE_HI;
+        visuals.widgets.inactive.bg_fill = t::with_alpha(egui::Color32::WHITE, 0.04);
         visuals.widgets.inactive.weak_bg_fill = t::SURFACE;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, t::STROKE);
-        visuals.widgets.inactive.rounding = Rounding::same(9.0);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, t::STROKE_SOFT);
+        visuals.widgets.inactive.rounding = Rounding::same(8.0);
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, t::TEXT_DIM);
 
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(36, 40, 48);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, t::with_alpha(t::BRAND, 0.45));
-        visuals.widgets.hovered.rounding = Rounding::same(9.0);
+        visuals.widgets.hovered.bg_fill = t::with_alpha(egui::Color32::WHITE, 0.07);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, t::with_alpha(t::BRAND, 0.40));
+        visuals.widgets.hovered.rounding = Rounding::same(8.0);
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, t::TEXT);
 
-        visuals.widgets.active.bg_fill = t::with_alpha(t::BRAND, 0.22);
+        visuals.widgets.active.bg_fill = t::with_alpha(t::BRAND, 0.20);
         visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, t::BRAND);
-        visuals.widgets.active.rounding = Rounding::same(9.0);
+        visuals.widgets.active.rounding = Rounding::same(8.0);
         visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, t::TEXT);
 
-        visuals.selection.bg_fill = t::with_alpha(t::BRAND, 0.35);
+        visuals.selection.bg_fill = t::with_alpha(t::BRAND, 0.32);
         visuals.selection.stroke = Stroke::new(1.0_f32, t::TEXT);
         visuals.override_text_color = Some(t::TEXT);
         visuals.hyperlink_color = t::BRAND;
+        visuals.slider_trailing_fill = true;
 
         ctx.set_visuals(visuals);
 
         let mut style = (*ctx.style()).clone();
         style.text_styles = [
             (TextStyle::Heading, FontId::new(18.0, FontFamily::Proportional)),
-            (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(12.5, FontFamily::Proportional)),
-            (TextStyle::Small, FontId::new(10.5, FontFamily::Proportional)),
-            (TextStyle::Monospace, FontId::new(11.5, FontFamily::Monospace)),
+            (TextStyle::Body, FontId::new(12.5, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(11.5, FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(10.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(10.5, FontFamily::Monospace)),
         ]
         .into();
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.item_spacing = egui::vec2(7.0, 6.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
         style.spacing.slider_width = 140.0;
         style.spacing.window_margin = egui::Margin::same(14.0);
+        style.spacing.interact_size.y = 22.0;
         ctx.set_style(style);
 
         self.theme_configured = true;
     }
+
+    /// Тёмный системный заголовок окна — иначе белая полоса ломает тёмный макет
+    #[cfg(windows)]
+    fn apply_dark_titlebar(&mut self, frame: &eframe::Frame) {
+        if self.title_dark {
+            return;
+        }
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(w) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = windows::Win32::Foundation::HWND(w.hwnd.get() as *mut std::ffi::c_void);
+        let on: i32 = 1;
+        let res = unsafe {
+            windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd,
+                windows::Win32::Graphics::Dwm::DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &on as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        self.title_dark = res.is_ok();
+    }
+
+    fn show_toast(&mut self, text: &str) {
+        self.toast = Some((text.to_string(), Instant::now()));
+    }
+
+    fn copy_node_id(&mut self, ctx: &egui::Context) {
+        ctx.output_mut(|o| o.copied_text = self.my_node_id.clone());
+        self.show_toast("NodeID скопирован — отправьте другу");
+    }
+
+    fn unread_total(&self) -> usize {
+        self.friends
+            .friends()
+            .iter()
+            .map(|f| self.chat_log.unread(&f.node_id))
+            .sum()
+    }
+
+    fn open_chat(&mut self) {
+        if self.active_chat.is_none() {
+            self.active_chat = self.friends.friends().first().map(|f| f.node_id.clone());
+        }
+        self.chat_open = self.active_chat.is_some();
+        self.settings_open = false;
+    }
+}
+
+/// Секция рейла со стандартными внутренними отступами
+fn rail_section(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(14.0, 11.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui);
+        });
+}
+
+/// Волосяная линия секций во всю ширину карточки рейла
+fn rail_divider(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, t::STROKE_SOFT);
 }
 
 impl eframe::App for RadioApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
+
+        #[cfg(windows)]
+        self.apply_dark_titlebar(frame);
 
         #[cfg(windows)]
         {
@@ -341,32 +423,98 @@ impl eframe::App for RadioApp {
         let wave: Vec<f32> = self.wave.iter().copied().collect();
 
         egui::TopBottomPanel::top("top_bar")
+            .exact_height(54.0)
             .frame(
                 egui::Frame::none()
                     .fill(t::BG)
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+                    .inner_margin(egui::Margin::symmetric(22.0, 10.0)),
             )
             .show(ctx, |ui| {
+                let mut copy = false;
                 crate::widgets::info_panel::draw_top_bar(
                     ui,
-                    self.my_id,
+                    &self.my_node_id,
+                    &self.nick,
                     &mut self.settings_open,
+                    &mut copy,
                 );
+                if copy {
+                    self.copy_node_id(ctx);
+                }
             });
 
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
                     .fill(t::BG)
-                    .inner_margin(egui::Margin::symmetric(16.0, 6.0)),
+                    .inner_margin(egui::Margin {
+                        left: 18.0,
+                        right: 18.0,
+                        top: 4.0,
+                        bottom: 12.0,
+                    }),
             )
             .show(ctx, |ui| {
-                if self.settings_open {
-                    self.draw_settings(ui);
+                if let Some(err) = self.network_error.clone() {
+                    egui::Frame::none()
+                        .fill(t::with_alpha(t::REC, 0.10))
+                        .rounding(Rounding::same(8.0))
+                        .stroke(Stroke::new(1.0_f32, t::with_alpha(t::REC, 0.30)))
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new(err).size(10.5).color(t::REC));
+                        });
+                    ui.add_space(6.0);
+                }
+
+                let wide = ui.available_width() >= 900.0;
+                if wide {
+                    let rail_w = 330.0;
+                    let gap = 12.0;
+                    let left_w = (ui.available_width() - rail_w - gap).max(400.0);
+                    let height = ui.available_height();
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_w, height),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                self.draw_console(ui, level, transmitting, &wave);
+                            },
+                        );
+                        ui.add_space(gap);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(rail_w, height),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                self.draw_rail(ui);
+                            },
+                        );
+                    });
                 } else {
-                    self.draw_main(ui, level, transmitting, &wave);
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            self.draw_console(ui, level, transmitting, &wave);
+                            ui.add_space(10.0);
+                            self.draw_rail(ui);
+                            ui.add_space(10.0);
+                        });
                 }
             });
+
+        // одновременно открыт только один оверлей
+        if self.settings_open && self.chat_open {
+            self.chat_open = false;
+        }
+        if self.settings_open {
+            self.draw_settings_overlay(ctx);
+        }
+        if self.chat_open {
+            self.draw_chat_overlay(ctx);
+        }
+        self.draw_toast(ctx);
 
         #[cfg(windows)]
         self.draw_video_window(ctx);
@@ -378,344 +526,837 @@ impl eframe::App for RadioApp {
 }
 
 impl RadioApp {
-    fn draw_main(&mut self, ui: &mut egui::Ui, level: f32, transmitting: bool, wave: &[f32]) {
-        if let Some(active) = self.active_chat.clone() {
-            self.chat_log.mark_read(&active);
-        }
+    fn draw_console(&mut self, ui: &mut egui::Ui, level: f32, transmitting: bool, wave: &[f32]) {
+        let peers = self.room.get_all_peers();
+        let is_host = self.is_host.load(std::sync::atomic::Ordering::Relaxed);
 
-        // Мягкий градиент и брендовое свечение вместо плоской заливки
-        let full = ui.max_rect();
-        let mut mesh = egui::Mesh::default();
-        let top = egui::Color32::from_rgb(17, 19, 25);
-        mesh.colored_vertex(full.left_top(), top);
-        mesh.colored_vertex(full.right_top(), top);
-        mesh.colored_vertex(full.right_bottom(), t::BG);
-        mesh.colored_vertex(full.left_bottom(), t::BG);
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(0, 2, 3);
-        ui.painter().add(egui::Shape::mesh(mesh));
+        let total_h = (ui.available_height() - 2.0).max(420.0);
+        let mut open_chat = false;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                let peer_count = self.room.get_all_peers().len();
-                let is_host = self.is_host.load(std::sync::atomic::Ordering::Relaxed);
-
-                if let Some(err) = &self.network_error {
-                    egui::Frame::none()
-                        .fill(t::with_alpha(t::REC, 0.12))
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0_f32, t::with_alpha(t::REC, 0.4)))
-                        .inner_margin(egui::Margin::same(10.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new(err).size(11.0).color(t::REC));
-                        });
-                    ui.add_space(10.0);
-                }
-
-                crate::widgets::hero::draw_hero(ui, level, transmitting, is_host, wave, peer_count);
-
-                ui.add_space(12.0);
-
-                #[cfg(windows)]
-                {
-                    self.draw_video_panel(ui);
-                    ui.add_space(12.0);
-                }
-
-                crate::widgets::ptt_button::draw_ptt_button(
-                    ui,
-                    &self.ptt_flag,
-                    &mut self.continuous_mode,
-                    &self.mixer,
-                );
-
-                ui.add_space(16.0);
-
-                egui::Frame::none()
-                    .fill(t::SURFACE)
-                    .rounding(Rounding::same(12.0))
-                    .stroke(Stroke::new(1.0_f32, t::STROKE))
-                    .inner_margin(egui::Margin::same(12.0))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        crate::widgets::identity::draw_my_node_id(ui, &self.my_node_id);
-                    });
-
-                ui.add_space(10.0);
-
-                crate::widgets::room_panel::draw_participants(
-                    ui,
-                    self.room.clone(),
-                    &self.mixer,
-                    self.my_id,
-                    self.is_host.clone(),
-                    transmitting,
-                );
-
-                ui.add_space(10.0);
-
-                egui::Frame::none()
-                    .fill(t::SURFACE)
-                    .rounding(Rounding::same(12.0))
-                    .stroke(Stroke::new(1.0_f32, t::STROKE))
-                    .inner_margin(egui::Margin::same(12.0))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        crate::widgets::room_panel::draw_room_panel(
-                            ui,
-                            &mut self.connect_ip_input,
-                            self.iroh.clone(),
-                            self.my_id,
-                            self.is_host.clone(),
-                            self.room.clone(),
-                        );
-                    });
-
-                ui.add_space(10.0);
-
-                if let Some(active) = self.active_chat.clone() {
-                    ui.add_space(10.0);
-                    let mut close = false;
-                    egui::Frame::none()
-                        .fill(t::SURFACE)
-                        .rounding(Rounding::same(12.0))
-                        .stroke(Stroke::new(1.0_f32, t::STROKE))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            crate::widgets::chat_panel::draw_chat_panel(
-                                ui,
-                                &self.chat_log,
-                                &self.friends,
-                                &active,
-                                &mut self.chat_input,
-                                self.iroh.clone(),
-                                self.my_id,
-                                &mut close,
-                            );
-                        });
-                    if close {
-                        self.active_chat = None;
-                    }
-                }
-
-                egui::Frame::none()
-                    .fill(t::SURFACE)
-                    .rounding(Rounding::same(12.0))
-                    .stroke(Stroke::new(1.0_f32, t::STROKE))
-                    .inner_margin(egui::Margin::same(12.0))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        crate::widgets::friends_panel::draw_friends_panel(
-                            ui,
-                            &self.friends,
-                            self.iroh.clone(),
-                            self.my_id,
-                            &self.my_node_id,
-                            &self.nick,
-                            self.is_host.clone(),
-                            &mut self.add_friend_node,
-                            &self.chat_log,
-                            &mut self.active_chat,
-                        );
-                    });
-
-                ui.add_space(10.0);
-            });
-    }
-
-    /// Трансляция экрана: запуск/остановка и локальное превью.
-    #[cfg(windows)]
-    fn draw_video_panel(&mut self, ui: &mut egui::Ui) {
-        let mut open_window = false;
         egui::Frame::none()
             .fill(t::SURFACE)
-            .rounding(Rounding::same(12.0))
-            .stroke(Stroke::new(1.0_f32, t::STROKE))
-            .inner_margin(egui::Margin::same(12.0))
+            .rounding(Rounding::same(14.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let running = self.video.is_some();
-                // 30 или 60 fps; меняется только до старта трансляции
-                let fps = match self.config.video_fps {
-                    Some(30) => 30,
-                    _ => 60,
-                };
+                ui.set_height(total_h - 24.0);
 
+                // Заголовок эфира — внутри панели, как в макете
                 ui.horizontal(|ui| {
-                    let label = if running {
-                        "Остановить трансляцию"
-                    } else {
-                        "Транслировать экран"
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new(label).size(11.0).strong())
-                                .rounding(Rounding::same(8.0)),
-                        )
-                        .clicked()
-                    {
-                        if running {
-                            self.video = None;
-                            self.video_fullscreen = false;
-                            // закрыть видео-соединения со зрителями: иначе
-                            // каждый следующий старт добавляет по соединению
-                            if let Some(link) = &self.video_link {
-                                link.stop_viewers();
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.5, t::LIVE);
+                    ui.label(
+                        egui::RichText::new("Эфир")
+                            .size(14.0)
+                            .strong()
+                            .color(t::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(members_label(peers.len() + 1))
+                            .size(9.5)
+                            .color(t::TEXT_MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if is_host {
+                            t::badge(ui, "ХОСТ", t::GOLD);
+                        }
+                    });
+                });
+
+                // Геометрия снизу вверх, как в макете: футер прижат к низу
+                // карточки, над ним PTT, полоса линии и центральный блок.
+                let wave_h = 56.0;
+                let ptt_h = 54.0;
+                let footer_h = 26.0;
+
+                let full = ui.max_rect();
+                let bottom = full.bottom();
+                let footer_top = bottom - footer_h;
+                let ptt_top = footer_top - 24.0 - ptt_h;
+                let wave_top = ptt_top - 8.0 - wave_h;
+                let mid_top = ui.cursor().top() + 4.0;
+                let mid_bottom = (wave_top - 8.0).max(mid_top + 200.0);
+                let mid_h = mid_bottom - mid_top;
+
+                let dial_w = (full.width() * 0.46).clamp(230.0, 330.0);
+
+                let mid_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left(), mid_top),
+                    egui::pos2(full.right(), mid_bottom),
+                );
+                ui.allocate_ui_at_rect(mid_rect, |ui| {
+                    ui.horizontal_top(|ui| {
+                        // Герой в макете сидит ближе к низу блока
+                        let pad = (mid_h - 315.0 - 12.0).max(0.0);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(dial_w, mid_h),
+                            Layout::top_down(Align::Center),
+                            |ui| {
+                                ui.add_space(pad);
+                                crate::widgets::hero::draw_hero(
+                                    ui,
+                                    level,
+                                    transmitting,
+                                    is_host,
+                                    wave,
+                                    peers.len(),
+                                    &self.nick,
+                                );
+                            },
+                        );
+
+                        ui.add_space(4.0);
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(full.width() - dial_w - 20.0, mid_h),
+                            Layout::top_down(Align::Min),
+                            |ui| {
+                                ui.add_space(pad);
+                                self.draw_stream_card(ui);
+                                ui.add_space(8.0);
+                                self.draw_mixer_card(ui);
+                            },
+                        );
+                    });
+                });
+
+                let wave_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left(), wave_top),
+                    egui::pos2(full.right(), wave_top + wave_h),
+                );
+                ui.allocate_ui_at_rect(wave_rect, |ui| {
+                    crate::widgets::hero::draw_wave_strip(ui, wave, transmitting, wave_h);
+                });
+
+                let ptt_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left(), ptt_top),
+                    egui::pos2(full.right(), ptt_top + ptt_h),
+                );
+                ui.allocate_ui_at_rect(ptt_rect, |ui| {
+                    crate::widgets::ptt_button::draw_ptt_button(
+                        ui,
+                        &self.ptt_flag,
+                        &mut self.continuous_mode,
+                        &self.mixer,
+                        self.ptt_bind,
+                    );
+                });
+
+                let footer_rect = egui::Rect::from_min_max(
+                    egui::pos2(full.left(), footer_top),
+                    egui::pos2(full.right(), bottom),
+                );
+                ui.allocate_ui_at_rect(footer_rect, |ui| {
+                    ui.horizontal(|ui| {
+                        crate::widgets::ptt_button::draw_continuous_toggle(
+                            ui,
+                            &self.ptt_flag,
+                            &mut self.continuous_mode,
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new("60 FPS")
+                                    .size(9.0)
+                                    .monospace()
+                                    .color(t::TEXT_MUTED),
+                            );
+                            ui.add_space(8.0);
+                            let unread = self.unread_total();
+                            if chat_chip(ui, unread, self.chat_open).clicked() {
+                                open_chat = true;
                             }
+                        });
+                    });
+                });
+            });
+
+        if open_chat {
+            self.open_chat();
+        }
+    }
+
+    /// Карточка трансляции: миниатюра слева, данные и управление справа
+    #[cfg(windows)]
+    fn draw_stream_card(&mut self, ui: &mut egui::Ui) {
+        let running = self.video.is_some();
+        let mut open_window = false;
+
+        egui::Frame::none()
+            .fill(t::INNER)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .inner_margin(egui::Margin::symmetric(9.0, 9.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                ui.horizontal_top(|ui| {
+                    let size = egui::vec2(128.0, 72.0);
+                    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    let resp = resp
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Открыть окно трансляции");
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, Rounding::same(6.0), t::INSET);
+                    painter.rect_stroke(
+                        rect,
+                        Rounding::same(6.0),
+                        Stroke::new(1.0_f32, t::STROKE_SOFT),
+                    );
+
+                    let preview = self
+                        .remote
+                        .as_ref()
+                        .map(|r| (r.texture(), r.size()))
+                        .or_else(|| self.video.as_ref().map(|v| (v.texture(), v.size())));
+                    let mut has_frame = false;
+                    if let Some((Some(tex), (w, h))) = preview {
+                        // вписываем кадр в миниатюру, сохраняя пропорции
+                        let src_ratio = w.max(1) as f32 / h.max(1) as f32;
+                        let box_ratio = rect.width() / rect.height();
+                        let target = if src_ratio > box_ratio {
+                            egui::vec2(rect.width(), rect.width() / src_ratio)
                         } else {
-                            match video_session::VideoSession::start(fps) {
-                                Ok(v) => {
-                                    self.video = Some(v);
-                                    self.video_error = None;
-                                    // раздаём поток всем, кто уже в комнате
-                                    if let (Some(link), Some(rt)) =
-                                        (self.video_link.clone(), self.video_rt.clone())
-                                    {
-                                        for peer in self.room.get_all_peers() {
-                                            if peer.address != self.my_node_id {
-                                                let link = link.clone();
-                                                let target = peer.address.clone();
-                                                rt.spawn(async move {
-                                                    link.add_viewer(target).await;
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => self.video_error = Some(e),
-                            }
+                            egui::vec2(rect.height() * src_ratio, rect.height())
+                        };
+                        let frame = egui::Rect::from_center_size(rect.center(), target);
+                        painter.image(
+                            tex.id(),
+                            frame,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                        has_frame = true;
+                    }
+                    if !has_frame {
+                        // Заглушка окна: без активного потока превью пустое
+                        let inner = rect.shrink(8.0);
+                        painter.rect_filled(
+                            inner,
+                            Rounding::same(4.0),
+                            egui::Color32::from_rgb(19, 19, 23),
+                        );
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                inner.min,
+                                egui::vec2(inner.width(), 6.0),
+                            ),
+                            Rounding::same(4.0),
+                            egui::Color32::from_rgb(31, 31, 37),
+                        );
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(inner.right() - 26.0, inner.top() + 12.0),
+                                egui::vec2(18.0, inner.height() - 20.0),
+                            ),
+                            Rounding::same(2.0),
+                            egui::Color32::from_rgb(40, 34, 62),
+                        );
+                        let mut y = inner.top() + 13.0;
+                        for w in [0.52_f32, 0.38, 0.46] {
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(inner.left() + 7.0, y),
+                                    egui::vec2((inner.width() - 44.0) * w, 3.0),
+                                ),
+                                Rounding::same(1.5),
+                                egui::Color32::from_rgb(38, 38, 45),
+                            );
+                            y += 9.0;
                         }
                     }
 
                     if running {
-                        if let Some(v) = &self.video {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} · показ {:.0} · захват {} FPS",
-                                    v.source,
-                                    v.fps(),
-                                    v.encode_fps()
-                                ))
-                                .size(10.0)
-                                .color(t::TEXT_MUTED),
-                            );
-                        }
-                    } else {
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new("Кадров/с").size(10.0).color(t::TEXT_MUTED),
+                        let pill = egui::Rect::from_min_size(
+                            rect.left_top() + egui::vec2(6.0, 6.0),
+                            egui::vec2(38.0, 15.0),
                         );
-                        let mut new_fps = fps;
-                        egui::ComboBox::from_id_source("video_fps_combo")
-                            .width(64.0)
-                            .selected_text(format!("{fps}"))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut new_fps, 30, "30");
-                                ui.selectable_value(&mut new_fps, 60, "60");
-                            });
-                        if new_fps != fps {
-                            self.config.video_fps = Some(new_fps);
-                            self.pending_save = true;
-                        }
+                        painter.rect_filled(
+                            pill,
+                            Rounding::same(4.0),
+                            egui::Color32::from_black_alpha(170),
+                        );
+                        painter.circle_filled(
+                            egui::pos2(pill.left() + 8.0, pill.center().y),
+                            2.5,
+                            t::LIVE,
+                        );
+                        painter.text(
+                            egui::pos2(pill.left() + 14.0, pill.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "LIVE",
+                            egui::FontId::proportional(7.5),
+                            t::TEXT,
+                        );
                     }
-                });
-
-                // этапы кадра: видно, что именно не даёт держать целевые fps
-                if let Some(v) = &self.video {
-                    let (d, r, i) = v.timings();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "декод {d:.1} · чтение с GPU {r:.1} · картинка {i:.1} мс"
-                        ))
-                        .size(9.0)
-                        .color(t::TEXT_MUTED),
-                    );
-                }
-
-                if let Some(err) = &self.video_error {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(err).size(10.5).color(t::REC));
-                }
-
-                if let Some(v) = &self.video {
-                    ui.add_space(6.0);
-                    if let Some(err) = v.last_error() {
-                        ui.label(egui::RichText::new(err).size(10.0).color(t::REC));
+                    if resp.clicked() {
+                        open_window = true;
                     }
-                    match v.texture() {
-                        Some(tex) => {
-                            let (w, h) = v.size();
-                            let avail = ui.available_width();
-                            let scale = (avail / w as f32).min(1.0);
-                            let size = egui::vec2(w as f32 * scale, h as f32 * scale);
-                            let img = egui::Image::new(egui::load::SizedTexture::new(
-                                tex.id(),
-                                size,
-                            ))
-                            .rounding(Rounding::same(8.0))
-                            .sense(egui::Sense::click());
-                            let resp = ui.add(img);
-                            if resp.hovered() {
-                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            }
-                            if resp.clicked() {
-                                open_window = true;
-                            }
-                        }
-                        None => {
+
+                    ui.add_space(10.0);
+
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
+
+                        ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("Жду первый кадр…")
-                                    .size(10.5)
+                                egui::RichText::new("ТРАНСЛЯЦИЯ")
+                                    .size(8.5)
+                                    .strong()
                                     .color(t::TEXT_MUTED),
                             );
-                        }
-                    }
-                    ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new("Клик по кадру открывает окно просмотра")
-                            .size(9.5)
-                            .color(t::TEXT_MUTED),
-                    );
-                }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let fps = self
+                                    .video
+                                    .as_ref()
+                                    .map(|v| v.fps().round() as u32)
+                                    .unwrap_or_else(|| match self.config.video_fps {
+                                        Some(30) => 30,
+                                        _ => 60,
+                                    });
+                                let label = ui.label(
+                                    egui::RichText::new(format!("{} FPS", fps))
+                                        .size(8.0)
+                                        .monospace()
+                                        .color(t::TEXT_MUTED),
+                                );
+                                if let Some(v) = &self.video {
+                                    let (d, r, i) = v.timings();
+                                    label.on_hover_text(format!(
+                                        "захват {} FPS\nдекод {:.1} · чтение GPU {:.1} · картинка {:.1} мс",
+                                        v.encode_fps(),
+                                        d,
+                                        r,
+                                        i
+                                    ));
+                                }
+                            });
+                        });
 
-                // чужой поток: смотрим, что транслирует собеседник
-                if let Some(remote) = &self.remote {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Смотрит: {} · {:.0} FPS",
-                            remote.peer,
-                            remote.fps()
-                        ))
-                        .size(10.0)
-                        .color(t::TEXT_MUTED),
-                    );
-                    if let Some(err) = remote.last_error() {
-                        ui.label(egui::RichText::new(err).size(10.0).color(t::REC));
-                    }
-                    if let Some(tex) = remote.texture() {
-                        let (w, h) = remote.size();
-                        let avail = ui.available_width();
-                        let scale = (avail / w as f32).min(1.0);
-                        let size = egui::vec2(w as f32 * scale, h as f32 * scale);
-                        let img = egui::Image::new(egui::load::SizedTexture::new(
-                            tex.id(),
-                            size,
-                        ))
-                        .rounding(Rounding::same(8.0))
-                        .sense(egui::Sense::click());
-                        if ui.add(img).clicked() {
-                            open_window = true;
-                        }
-                    }
-                }
+                        let title = self
+                            .video
+                            .as_ref()
+                            .map(|v| v.source.clone())
+                            .or_else(|| self.remote.as_ref().map(|r| format!("Смотрит: {}", r.peer)))
+                            .unwrap_or_else(|| "Экран 1".to_string());
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(12.0)
+                                .strong()
+                                .color(if running { t::TEXT } else { t::TEXT_DIM }),
+                        );
+
+                        let subtitle = if let Some(v) = &self.video {
+                            let (w, h) = v.size();
+                            format!(
+                                "{}×{} · {} FPS · {} зрит.",
+                                w,
+                                h,
+                                v.encode_fps(),
+                                self.room.get_all_peers().len()
+                            )
+                        } else {
+                            "Не запущена".to_string()
+                        };
+                        ui.label(
+                            egui::RichText::new(subtitle)
+                                .size(8.0)
+                                .color(t::TEXT_MUTED),
+                        );
+
+                        ui.add_space(6.0);
+
+                        ui.horizontal(|ui| {
+                            let label = if running { "Стоп" } else { "Запустить" };
+                            if t::chip_button(ui, label, running).clicked() {
+                                if running {
+                                    self.video = None;
+                                    self.video_fullscreen = false;
+                                    if let Some(link) = &self.video_link {
+                                        link.stop_viewers();
+                                    }
+                                } else {
+                                    let fps = match self.config.video_fps {
+                                        Some(30) => 30,
+                                        _ => 60,
+                                    };
+                                    match video_session::VideoSession::start(fps) {
+                                        Ok(v) => {
+                                            self.video = Some(v);
+                                            self.video_error = None;
+                                            if let (Some(link), Some(rt)) =
+                                                (self.video_link.clone(), self.video_rt.clone())
+                                            {
+                                                for peer in self.room.get_all_peers() {
+                                                    if peer.address != self.my_node_id {
+                                                        let link = link.clone();
+                                                        let target = peer.address.clone();
+                                                        rt.spawn(async move {
+                                                            link.add_viewer(target).await;
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => self.video_error = Some(e),
+                                    }
+                                }
+                            }
+
+                            if self.remote.is_some()
+                                && t::chip_button(ui, "Смотреть", false).clicked()
+                            {
+                                open_window = true;
+                            }
+
+                            if let Some(err) = self.video_error.clone() {
+                                ui.label(egui::RichText::new(err).size(8.0).color(t::REC));
+                            }
+                        });
+                    });
+                });
             });
+
         if open_window {
             self.video_window = true;
         }
+    }
+
+    #[cfg(not(windows))]
+    fn draw_stream_card(&mut self, _ui: &mut egui::Ui) {}
+
+    /// Микшер: микрофон, гитара и громкость собеседников
+    fn draw_mixer_card(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(t::INNER)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("ГРОМКОСТЬ")
+                            .size(8.5)
+                            .strong()
+                            .color(t::TEXT_MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Как в макете: значок микшера вместо подписи
+                        if t::icon_button(ui, t::Icon::Sliders, 18.0, false)
+                            .on_hover_text("Настройки звука")
+                            .clicked()
+                        {
+                            self.settings_open = true;
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+
+                let mut mic = self.mixer.ch1_volume();
+                let mut guitar = self.mixer.ch2_volume();
+                let mut peers = self.mixer.output_volume();
+
+                mixer_row(ui, "МИКРОФОН", &mut mic, self.mixer.input1_peak());
+                mixer_row(ui, "ГИТАРА", &mut guitar, self.mixer.input2_peak());
+                mixer_row(ui, "СОБЕСЕДНИКИ", &mut peers, 0.0);
+
+                self.mixer.set_ch1_volume(mic);
+                self.mixer.set_ch2_volume(guitar);
+                self.mixer.set_output_volume(peers);
+            });
+    }
+
+    fn draw_rail(&mut self, ui: &mut egui::Ui) {
+        // Как в макете: одна карточка на весь рейл, секции — волосяными
+        // линиями во всю ширину, подвал прижат к низу внутри карточки.
+        let footer_h = 28.0;
+
+        egui::Frame::none()
+            .fill(t::SURFACE)
+            .rounding(Rounding::same(t::RADIUS))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let scroll_h = (ui.available_height() - footer_h).max(240.0);
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .max_height(scroll_h)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+
+                        let mut copy = false;
+                        rail_section(ui, |ui| {
+                            crate::widgets::room_panel::draw_room_connect(
+                                ui,
+                                &mut self.connect_ip_input,
+                                self.iroh.clone(),
+                                self.my_id,
+                                self.is_host.clone(),
+                                self.room.clone(),
+                            );
+                        });
+                        rail_divider(ui);
+
+                        rail_section(ui, |ui| {
+                            copy = crate::widgets::room_panel::draw_my_nodeid(
+                                ui,
+                                &self.my_node_id,
+                            );
+                        });
+                        if copy {
+                            self.copy_node_id(ui.ctx());
+                        }
+                        rail_divider(ui);
+
+                        rail_section(ui, |ui| {
+                            crate::widgets::room_panel::draw_participants(
+                                ui,
+                                self.room.clone(),
+                                &self.mixer,
+                                self.is_host.clone(),
+                                self.ptt_flag.load(std::sync::atomic::Ordering::Relaxed),
+                                &self.nick,
+                            );
+                        });
+                        rail_divider(ui);
+
+                        rail_section(ui, |ui| {
+                            crate::widgets::friends_panel::draw_friends_panel(
+                                ui,
+                                &self.friends,
+                                self.iroh.clone(),
+                                self.my_id,
+                                &self.my_node_id,
+                                &self.nick,
+                                self.is_host.clone(),
+                                &mut self.add_friend_node,
+                                &self.chat_log,
+                                &mut self.active_chat,
+                                &mut self.chat_open,
+                            );
+                        });
+                        if self.chat_open {
+                            self.settings_open = false;
+                        }
+                    });
+
+                // Подвал внутри карточки
+                rail_divider(ui);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 2.5, t::LIVE);
+                    ui.add_space(6.0);
+                    t::micro(ui, "Сквозное шифрование");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(14.0);
+                        t::micro(ui, "v0.1");
+                    });
+                });
+            });
+    }
+
+    fn draw_settings_overlay(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let mut close = false;
+        let mut copy = false;
+
+        let scrim = egui::Area::new(egui::Id::new("settings_scrim"))
+            .fixed_pos(screen.min)
+            .order(Order::Middle)
+            .show(ctx, |ui| {
+                let (rect, resp) =
+                    ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
+                resp
+            })
+            .inner;
+        if scrim.clicked() {
+            close = true;
+        }
+
+        let sheet_w = 690.0_f32.min(screen.width() - 60.0);
+        let sheet_h = 540.0_f32.min(screen.height() - 70.0);
+        let pos = egui::pos2(
+            screen.center().x - sheet_w * 0.5,
+            screen.center().y - sheet_h * 0.5,
+        );
+
+        egui::Area::new(egui::Id::new("settings_sheet"))
+            .fixed_pos(pos)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(t::SURFACE)
+                    .rounding(Rounding::same(16.0))
+                    .stroke(Stroke::new(1.0_f32, t::STROKE))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 18.0),
+                        blur: 50.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(170),
+                    })
+                    .inner_margin(egui::Margin::symmetric(18.0, 14.0))
+                    .show(ui, |ui| {
+                        ui.set_width(sheet_w - 36.0);
+                        ui.set_height(sheet_h - 28.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Настройки")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(t::TEXT),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if t::icon_button(ui, t::Icon::Close, 26.0, false)
+                                    .on_hover_text("Закрыть")
+                                    .clicked()
+                                {
+                                    close = true;
+                                }
+                            });
+                        });
+
+                        ui.add_space(4.0);
+                        t::divider(ui);
+                        ui.add_space(6.0);
+
+                        egui::ScrollArea::vertical()
+                            .max_height(sheet_h - 90.0)
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                crate::widgets::audio_settings::draw_audio_settings(
+                                    ui,
+                                    &self.input_devices,
+                                    &self.input_channel_counts,
+                                    &self.output_devices,
+                                    &self.selected_input,
+                                    &self.selected_output,
+                                    &self.mixer,
+                                    &mut self.ptt_bind,
+                                );
+
+                                ui.add_space(14.0);
+                                t::divider(ui);
+                                ui.add_space(8.0);
+
+                                t::section_label(ui, "ЭКРАН");
+                                ui.add_space(4.0);
+                                let fps = match self.config.video_fps {
+                                    Some(30) => 30,
+                                    _ => 60,
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Кадров в секунду")
+                                            .size(10.5)
+                                            .color(t::TEXT_MUTED),
+                                    );
+                                    ui.add_space(8.0);
+                                    if t::chip_button(ui, "30", fps == 30).clicked() {
+                                        self.config.video_fps = Some(30);
+                                        self.pending_save = true;
+                                    }
+                                    if t::chip_button(ui, "60", fps == 60).clicked() {
+                                        self.config.video_fps = Some(60);
+                                        self.pending_save = true;
+                                    }
+                                });
+
+                                ui.add_space(14.0);
+                                t::divider(ui);
+                                ui.add_space(8.0);
+
+                                t::section_label(ui, "ЛИЧНОСТЬ");
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Ваше имя")
+                                            .size(10.5)
+                                            .color(t::TEXT_MUTED),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.nick)
+                                            .desired_width(180.0),
+                                    );
+                                });
+
+                                ui.add_space(6.0);
+                                t::inset_frame().show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&self.my_node_id)
+                                                .monospace()
+                                                .size(9.0)
+                                                .color(t::TEXT_MUTED),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if t::chip_button(ui, "Копировать", false)
+                                                    .clicked()
+                                                {
+                                                    copy = true;
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+
+                                ui.add_space(8.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Сбросить личность")
+                                                .size(10.5)
+                                                .strong()
+                                                .color(t::REC),
+                                        )
+                                        .rounding(Rounding::same(8.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    crate::identity::Identity::reset();
+                                    self.reset_note = Some(
+                                        "Новый NodeID создан. Перезапустите приложение."
+                                            .to_string(),
+                                    );
+                                }
+                                if let Some(note) = &self.reset_note {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(note)
+                                            .size(9.5)
+                                            .color(t::TEXT_MUTED),
+                                    );
+                                }
+                            });
+                    });
+            });
+
+        if copy {
+            self.copy_node_id(ctx);
+        }
+        if close {
+            self.settings_open = false;
+        }
+    }
+
+    fn draw_chat_overlay(&mut self, ctx: &egui::Context) {
+        let Some(node_id) = self.active_chat.clone() else {
+            self.chat_open = false;
+            return;
+        };
+        let screen = ctx.screen_rect();
+        let mut close = false;
+
+        let scrim = egui::Area::new(egui::Id::new("chat_scrim"))
+            .fixed_pos(screen.min)
+            .order(Order::Middle)
+            .show(ctx, |ui| {
+                let (rect, resp) =
+                    ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(80));
+                resp
+            })
+            .inner;
+        if scrim.clicked() {
+            close = true;
+        }
+
+        let width = 392.0_f32.min(screen.width() - 20.0);
+        let height = screen.height() - 20.0;
+        let pos = egui::pos2(screen.right() - width - 10.0, screen.top() + 10.0);
+
+        egui::Area::new(egui::Id::new("chat_drawer"))
+            .fixed_pos(pos)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(t::SURFACE)
+                    .rounding(Rounding::same(16.0))
+                    .stroke(Stroke::new(1.0_f32, t::STROKE))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 18.0),
+                        blur: 50.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(160),
+                    })
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 28.0);
+                        ui.set_height(height - 24.0);
+                        crate::widgets::chat_panel::draw_chat_panel(
+                            ui,
+                            &self.chat_log,
+                            &self.friends,
+                            &node_id,
+                            &mut self.chat_input,
+                            self.iroh.clone(),
+                            self.my_id,
+                            &mut close,
+                        );
+                    });
+            });
+
+        if close {
+            self.chat_open = false;
+            self.chat_input.clear();
+        }
+    }
+
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some((text, at)) = self.toast.clone() else {
+            return;
+        };
+        if at.elapsed() > Duration::from_millis(2400) {
+            self.toast = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(60));
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("node_toast"))
+            .fixed_pos(egui::pos2(screen.center().x, screen.bottom() - 92.0))
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(t::SURFACE_HI)
+                    .rounding(Rounding::same(9.0))
+                    .stroke(Stroke::new(1.0_f32, t::STROKE))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 10.0),
+                        blur: 26.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(150),
+                    })
+                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (dot, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 3.0, t::LIVE);
+                            ui.label(egui::RichText::new(text).size(10.5).color(t::TEXT));
+                        });
+                    });
+            });
     }
 
     /// Окно просмотра: отдельное, растягиваемое, с полноэкранным режимом.
@@ -729,6 +1370,7 @@ impl RadioApp {
         }
 
         let close_requested = std::cell::Cell::new(false);
+        let chrome = std::cell::Cell::new(Instant::now());
         let mut builder = egui::ViewportBuilder::default()
             .with_title("Albus — трансляция")
             .with_inner_size([1280.0, 720.0])
@@ -742,48 +1384,75 @@ impl RadioApp {
             egui::ViewportId::from_hash_of("video-window"),
             builder,
             |ctx, _class| {
-                egui::TopBottomPanel::top("video-window-bar")
-                    .frame(
-                        egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(16, 18, 22))
-                            .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
-                    )
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            let label = if self.video_fullscreen {
-                                "Выйти из полноэкранного"
-                            } else {
-                                "На весь экран"
-                            };
-                            if ui.button(label).clicked() {
-                                self.video_fullscreen = !self.video_fullscreen;
-                            }
-                            if let Some(remote) = &self.remote {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Смотрит: {} · {:.0} FPS",
-                                        remote.peer,
-                                        remote.fps()
-                                    ))
-                                    .size(10.0)
-                                    .color(t::TEXT_MUTED),
-                                );
-                            } else if let Some(video) = &self.video {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} · {:.0} FPS",
-                                        video.source,
-                                        video.fps()
-                                    ))
-                                    .size(10.0)
-                                    .color(t::TEXT_MUTED),
-                                );
-                            }
-                            if ui.button("Закрыть").clicked() {
-                                close_requested.set(true);
-                            }
+                let pointer_active = ctx.input(|i| i.pointer.is_moving());
+                if pointer_active {
+                    chrome.set(Instant::now());
+                }
+                let show_bar = chrome.get().elapsed() < Duration::from_secs(3);
+
+                if show_bar {
+                    egui::TopBottomPanel::top("video-window-bar")
+                        .frame(
+                            egui::Frame::none()
+                                .fill(egui::Color32::from_black_alpha(190))
+                                .inner_margin(egui::Margin::symmetric(12.0, 7.0)),
+                        )
+                        .show(ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                let label = if self.video_fullscreen {
+                                    "Выйти из полноэкранного"
+                                } else {
+                                    "На весь экран"
+                                };
+                                if t::chip_button(ui, label, false).clicked() {
+                                    self.video_fullscreen = !self.video_fullscreen;
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                                        self.video_fullscreen,
+                                    ));
+                                }
+                                if let Some(remote) = &self.remote {
+                                    // миллисекунды по этапам: по ним зритель видит,
+                                    // упирается показ в его же компьютер или в сеть
+                                    let (decode, gpu, image) = remote.timings();
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Смотрит: {} · {:.0} FPS · декод {:.1} / GPU {:.1} / картинка {:.1} мс",
+                                            remote.peer,
+                                            remote.fps(),
+                                            decode,
+                                            gpu,
+                                            image
+                                        ))
+                                        .size(9.5)
+                                        .color(t::TEXT_MUTED),
+                                    );
+                                } else if let Some(video) = &self.video {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} · {:.0} FPS",
+                                            video.source,
+                                            video.fps()
+                                        ))
+                                        .size(9.5)
+                                        .color(t::TEXT_MUTED),
+                                    );
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if t::icon_button(ui, t::Icon::Close, 24.0, false)
+                                        .on_hover_text("Закрыть")
+                                        .clicked()
+                                    {
+                                        close_requested.set(true);
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("Esc — выйти")
+                                            .size(9.0)
+                                            .color(t::TEXT_MUTED),
+                                    );
+                                });
+                            });
                         });
-                    });
+                }
 
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(egui::Color32::BLACK))
@@ -807,6 +1476,9 @@ impl RadioApp {
                             let resp = ui.centered_and_justified(|ui| ui.add(img)).inner;
                             if resp.double_clicked() {
                                 self.video_fullscreen = !self.video_fullscreen;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                                    self.video_fullscreen,
+                                ));
                             }
                         }
                     });
@@ -814,12 +1486,17 @@ impl RadioApp {
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     if self.video_fullscreen {
                         self.video_fullscreen = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
                     } else {
                         close_requested.set(true);
                     }
                 }
                 if ctx.input(|i| i.viewport().close_requested()) {
                     close_requested.set(true);
+                }
+
+                if show_bar {
+                    ctx.request_repaint_after(Duration::from_millis(200));
                 }
             },
         );
@@ -828,81 +1505,6 @@ impl RadioApp {
             self.video_window = false;
             self.video_fullscreen = false;
         }
-    }
-
-    fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if back_button(ui).clicked() {
-                self.settings_open = false;
-            }
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new("Настройки")
-                    .size(15.0)
-                    .strong()
-                    .color(t::TEXT),
-            );
-        });
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false; 2])
-            .show(ui, |ui| {
-                crate::widgets::audio_settings::draw_audio_settings(
-                    ui,
-                    &self.input_devices,
-                    &self.input_channel_counts,
-                    &self.output_devices,
-                    &self.selected_input,
-                    &self.selected_output,
-                    &self.mixer,
-                    &mut self.ptt_bind,
-                );
-
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(12.0);
-
-                t::section_label(ui, "ЛИЧНОСТЬ");
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Ваше имя")
-                            .size(10.5)
-                            .color(t::TEXT_MUTED),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.nick).desired_width(160.0),
-                    );
-                });
-
-                ui.add_space(6.0);
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Сбросить личность")
-                                .size(11.0)
-                                .strong()
-                                .color(t::REC),
-                        )
-                        .rounding(Rounding::same(8.0)),
-                    )
-                    .clicked()
-                {
-                    crate::identity::Identity::reset();
-                    self.reset_note =
-                        Some("Новый NodeID создан. Перезапустите приложение.".to_string());
-                }
-                if let Some(note) = &self.reset_note {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(note).size(9.5).color(t::TEXT_MUTED),
-                    );
-                }
-            });
     }
 
     /// Сохраняет настройки на диск не чаще раза в 400 мс после изменений
@@ -965,25 +1567,124 @@ impl RadioApp {
     }
 }
 
-/// Стрелка «назад», нарисованная линиями (в шрифте нет надёжного глифа)
-fn back_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+/// «4 узла» — русская форма множественного числа
+pub fn members_label(n: usize) -> String {
+    let word = match n % 10 {
+        1 if n % 100 != 11 => "узел",
+        2..=4 if !(12..=14).contains(&(n % 100)) => "узла",
+        _ => "узлов",
+    };
+    format!("{} {}", n, word)
+}
+
+/// Кнопка чата с непрочитанными
+fn chat_chip(ui: &mut egui::Ui, unread: usize, active: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(74.0, 26.0), egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     let painter = ui.painter_at(rect);
-    let color = if response.hovered() {
-        t::TEXT
-    } else {
-        t::TEXT_DIM
-    };
-    let center = rect.center();
-    let stroke = Stroke::new(1.6_f32, color);
-    painter.line_segment(
-        [egui::pos2(center.x + 3.0, center.y - 6.0), egui::pos2(center.x - 3.0, center.y)],
-        stroke,
+    painter.rect_filled(
+        rect,
+        Rounding::same(7.0),
+        if active {
+            t::with_alpha(t::BRAND, 0.12)
+        } else if response.hovered() {
+            t::with_alpha(egui::Color32::WHITE, 0.07)
+        } else {
+            t::with_alpha(egui::Color32::WHITE, 0.035)
+        },
     );
-    painter.line_segment(
-        [egui::pos2(center.x - 3.0, center.y), egui::pos2(center.x + 3.0, center.y + 6.0)],
-        stroke,
+    painter.rect_stroke(rect, Rounding::same(7.0), Stroke::new(1.0_f32, t::STROKE_SOFT));
+    t::draw_icon(
+        &painter,
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 18.0, rect.center().y),
+            egui::vec2(13.0, 13.0),
+        ),
+        t::Icon::Chat,
+        if active { t::BRAND } else { t::TEXT_DIM },
     );
+    painter.text(
+        egui::pos2(rect.left() + 29.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Чат",
+        egui::FontId::proportional(10.5),
+        if active { t::BRAND } else { t::TEXT_DIM },
+    );
+    if unread > 0 {
+        painter.circle_filled(
+            egui::pos2(rect.right() - 12.0, rect.center().y),
+            7.0,
+            t::BRAND_2,
+        );
+        painter.text(
+            egui::pos2(rect.right() - 12.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            format!("{}", unread.min(9)),
+            egui::FontId::proportional(8.0),
+            egui::Color32::WHITE,
+        );
+    }
     response
 }
+
+/// Строка микшера: подпись, тонкий слайдер без ручки, значение
+fn mixer_row(ui: &mut egui::Ui, label: &str, value: &mut u32, level: f32) {
+    let row_h = 24.0;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    painter.text(
+        egui::pos2(rect.left(), rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(8.5),
+        t::TEXT_MUTED,
+    );
+    painter.text(
+        egui::pos2(rect.right(), rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        format!("{}%", *value),
+        egui::FontId::monospace(8.5),
+        t::TEXT_DIM,
+    );
+
+    let track = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 84.0, rect.center().y - 1.5),
+        egui::pos2(rect.right() - 36.0, rect.center().y + 1.5),
+    );
+    if track.width() <= 0.0 {
+        return;
+    }
+    painter.rect_filled(track, Rounding::same(1.0), t::TRACK);
+    let frac = (*value as f32 / 100.0).clamp(0.0, 1.0);
+    if frac > 0.0 {
+        let fill = egui::Rect::from_min_max(
+            track.left_top(),
+            egui::pos2(track.left() + track.width() * frac, track.bottom()),
+        );
+        painter.rect_filled(fill, Rounding::same(1.0), t::TRACK_FILL);
+    }
+    if level > 0.02 {
+        let vu = egui::Rect::from_min_size(
+            egui::pos2(track.left(), track.bottom() + 2.0),
+            egui::vec2(track.width() * level.clamp(0.0, 1.0), 1.0),
+        );
+        painter.rect_filled(vu, 0.0, t::with_alpha(t::LIVE, 0.35));
+    }
+
+    let resp = ui
+        .interact(
+            track.expand2(egui::vec2(0.0, 8.0)),
+            ui.id().with(label),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+    if (resp.dragged() || resp.clicked()) && resp.interact_pointer_pos().is_some() {
+        let x = resp.interact_pointer_pos().unwrap().x;
+        let f = ((x - track.left()) / track.width()).clamp(0.0, 1.0);
+        *value = (f * 100.0).round() as u32;
+    }
+}
+

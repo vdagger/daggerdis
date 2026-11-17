@@ -175,8 +175,8 @@ fn main() {
 
     let mut native_options = eframe::NativeOptions::default();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([480.0, 660.0])
-        .with_min_inner_size([430.0, 560.0]);
+        .with_inner_size([1120.0, 700.0])
+        .with_min_inner_size([980.0, 620.0]);
 
     if let Some(icon) = icon_data {
         viewport = viewport.with_icon(icon);

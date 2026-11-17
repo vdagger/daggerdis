@@ -9,13 +9,7 @@ use egui::{Color32, Rounding, Stroke};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-fn short_node_id(node_id: &str) -> String {
-    if node_id.len() > 16 {
-        format!("{}…", &node_id[..15])
-    } else {
-        node_id.to_string()
-    }
-}
+use super::room_panel::short_node_id;
 
 fn dial(p2p: &Arc<IrohP2pManager>, target: &str, my_id: u64) {
     let p2p = p2p.clone();
@@ -93,14 +87,6 @@ fn send_remove(p2p: &Arc<IrohP2pManager>, target: &str, my_id: u64, my_node_id: 
     });
 }
 
-fn card_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(t::SURFACE)
-        .rounding(Rounding::same(10.0))
-        .stroke(Stroke::new(1.0_f32, t::STROKE))
-        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
-}
-
 pub fn draw_friends_panel(
     ui: &mut egui::Ui,
     friends: &Arc<FriendsManager>,
@@ -112,53 +98,66 @@ pub fn draw_friends_panel(
     add_friend_node: &mut String,
     chat_log: &Arc<ChatLog>,
     active_chat: &mut Option<String>,
+    chat_open: &mut bool,
 ) {
     let row_width = ui.available_width();
     let p2p = iroh;
+    let incoming = friends.incoming();
+    let friend_list = friends.friends();
 
     ui.horizontal(|ui| {
-        t::section_label(ui, "ДРУЗЬЯ");
+        ui.label(
+            egui::RichText::new("Друзья")
+                .size(14.0)
+                .strong()
+                .color(t::TEXT),
+        );
+        if !incoming.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("{} заявка", incoming.len()))
+                    .size(9.5)
+                    .color(t::GOLD),
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(format!("{}", friends.friends().len()))
+                egui::RichText::new(format!("{}", friend_list.len()))
                     .size(10.0)
+                    .monospace()
                     .color(t::TEXT_MUTED),
             );
         });
     });
 
-    ui.add_space(4.0);
+    ui.add_space(5.0);
 
     // Входящие заявки
-    let incoming = friends.incoming();
     for req in incoming {
-        card_frame()
+        egui::Frame::none()
+            .fill(t::with_alpha(t::GOLD, 0.07))
+            .rounding(Rounding::same(9.0))
+            .stroke(Stroke::new(1.0_f32, t::with_alpha(t::GOLD, 0.20)))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
             .show(ui, |ui| {
-                ui.set_width(row_width - 20.0);
+                ui.set_width(row_width - 16.0);
                 ui.horizontal(|ui| {
+                    t::avatar(ui, &req.nick, 26.0, false);
                     ui.vertical(|ui| {
                         ui.label(
-                            egui::RichText::new(&req.nick)
-                                .size(12.5)
+                            egui::RichText::new(req.nick.as_str())
+                                .size(11.5)
                                 .strong()
                                 .color(t::TEXT),
                         );
                         ui.label(
-                            egui::RichText::new(format!("Заявка · {}", short_node_id(&req.node_id)))
-                                .size(9.5)
+                            egui::RichText::new(format!("заявка · {}", short_node_id(&req.node_id)))
+                                .size(9.0)
                                 .color(t::TEXT_MUTED),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Отклонить")
-                                        .size(10.5)
-                                        .color(t::TEXT_DIM),
-                                )
-                                .rounding(Rounding::same(7.0)),
-                            )
+                        if t::icon_button(ui, t::Icon::Close, 24.0, false)
+                            .on_hover_text("Отклонить")
                             .clicked()
                         {
                             friends.decline_incoming(&req.node_id);
@@ -167,12 +166,12 @@ pub fn draw_friends_panel(
                             .add(
                                 egui::Button::new(
                                     egui::RichText::new("Принять")
-                                        .size(10.5)
+                                        .size(9.5)
                                         .strong()
                                         .color(Color32::WHITE),
                                 )
-                                .fill(t::BRAND_DEEP)
-                                .rounding(Rounding::same(7.0)),
+                                .fill(t::BRAND_2)
+                                .rounding(Rounding::same(6.0)),
                             )
                             .clicked()
                         {
@@ -190,48 +189,61 @@ pub fn draw_friends_panel(
         ui.add_space(3.0);
     }
 
-    // Список друзей
-    for friend in friends.friends() {
-        card_frame()
-            .show(ui, |ui| {
-                ui.set_width(row_width - 20.0);
+    // Список друзей — плоские строки с волосяными линиями, как в макете
+    for (idx, friend) in friend_list.iter().enumerate() {
+        if idx > 0 {
+            ui.add_space(2.0);
+            let (line, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(line, 0.0, t::with_alpha(t::STROKE_SOFT, 0.7));
+            ui.add_space(2.0);
+        }
+
+        ui.horizontal(|ui| {
+            t::avatar(ui, &friend.name, 32.0, false);
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&friend.name)
-                                    .size(12.5)
-                                    .strong()
-                                    .color(t::TEXT),
-                            );
-                            let unread = chat_log.unread(&friend.node_id);
-                            if unread > 0 {
-                                ui.label(
-                                    egui::RichText::new(format!("{}", unread))
-                                        .size(9.0)
-                                        .strong()
-                                        .color(Color32::WHITE)
-                                        .background_color(t::REC),
-                                );
-                            }
-                        });
+                    ui.label(
+                        egui::RichText::new(&friend.name)
+                            .size(12.0)
+                            .strong()
+                            .color(t::TEXT),
+                    );
+                    let unread = chat_log.unread(&friend.node_id);
+                    if unread > 0 {
                         ui.label(
-                            egui::RichText::new(short_node_id(&friend.node_id))
-                                .monospace()
-                                .size(9.5)
-                                .color(t::TEXT_MUTED),
+                            egui::RichText::new(format!("{}", unread))
+                                .size(8.5)
+                                .strong()
+                                .color(Color32::WHITE)
+                                .background_color(t::BRAND_2),
                         );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(short_node_id(&friend.node_id))
+                        .monospace()
+                        .size(8.5)
+                        .color(t::TEXT_MUTED),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = t::icon_button(ui, t::Icon::More, 22.0, false).on_hover_text("Ещё");
+                let popup_id = ui.make_persistent_id(("friend_menu", &friend.node_id));
+                if more.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(popup_id));
+                }
+                egui::popup_below_widget(
+                    ui,
+                    popup_id,
+                    &more,
+                    egui::popup::PopupCloseBehavior::CloseOnClick,
+                    |ui| {
+                        ui.set_min_width(130.0);
                         if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Удалить")
-                                        .size(10.5)
-                                        .color(t::TEXT_DIM),
-                                )
-                                .rounding(Rounding::same(7.0)),
-                            )
+                            .button(egui::RichText::new("Удалить из друзей").size(10.5))
                             .clicked()
                         {
                             friends.remove_friend(&friend.node_id);
@@ -239,80 +251,70 @@ pub fn draw_friends_panel(
                                 send_remove(p2p, &friend.node_id, my_id, my_node_id);
                             }
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Чат")
-                                        .size(10.5)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(t::BRAND)
-                                .rounding(Rounding::same(7.0)),
-                            )
-                            .clicked()
-                        {
-                            chat_log.mark_read(&friend.node_id);
-                            *active_chat = Some(friend.node_id.clone());
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Позвонить")
-                                        .size(10.5)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(t::BRAND_DEEP)
-                                .rounding(Rounding::same(7.0)),
-                            )
-                            .clicked()
-                        {
-                            if let Some(ref p2p) = p2p {
-                                is_host.store(false, Ordering::SeqCst);
-                                dial(p2p, &friend.node_id, my_id);
-                            }
-                        }
-                    });
-                });
+                    },
+                );
+                if t::icon_button(ui, t::Icon::Chat, 22.0, false)
+                    .on_hover_text("Чат")
+                    .clicked()
+                {
+                    chat_log.mark_read(&friend.node_id);
+                    *active_chat = Some(friend.node_id.clone());
+                    *chat_open = true;
+                }
+                if t::icon_button(ui, t::Icon::Phone, 22.0, false)
+                    .on_hover_text("Позвонить")
+                    .clicked()
+                {
+                    if let Some(ref p2p) = p2p {
+                        is_host.store(false, Ordering::SeqCst);
+                        dial(p2p, &friend.node_id, my_id);
+                    }
+                }
             });
-        ui.add_space(3.0);
+        });
     }
 
-    ui.add_space(6.0);
+    ui.add_space(2.0);
+    if !friend_list.is_empty() {
+        let (line, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(line, 0.0, t::with_alpha(t::STROKE_SOFT, 0.7));
+    }
 
     // Добавить друга по NodeID
-    ui.add(
-        egui::TextEdit::singleline(add_friend_node)
-            .hint_text("NodeID друга")
-            .desired_width(row_width),
-    );
-
-    ui.add_space(4.0);
-    if ui
-        .add_sized(
-            [row_width, 24.0],
-            egui::Button::new(
-                egui::RichText::new("Отправить заявку")
-                    .size(11.5)
-                    .strong()
-                    .color(Color32::WHITE),
-            )
-            .fill(t::BRAND_DEEP)
-            .rounding(Rounding::same(8.0)),
-        )
-        .clicked()
-    {
-        let target = add_friend_node.trim().to_string();
-        if target.len() == 64
-            && target.chars().all(|c| c.is_ascii_hexdigit())
-            && !friends.is_friend(&target)
+    let mut send = false;
+    ui.horizontal(|ui| {
+        let field_width = (row_width - 34.0).max(60.0);
+        egui::Frame::none()
+            .fill(t::INSET)
+            .rounding(Rounding::same(8.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(add_friend_node)
+                        .hint_text("NodeID друга")
+                        .desired_width(field_width - 16.0)
+                        .frame(false),
+                );
+            });
+        if t::icon_button(ui, t::Icon::Plus, 26.0, false)
+            .on_hover_text("Отправить заявку")
+            .clicked()
         {
-            if let Some(ref p2p) = p2p {
-                is_host.store(false, Ordering::SeqCst);
-                send_request(p2p, friends, &target, my_id, my_node_id, nick);
-            }
-            add_friend_node.clear();
+            send = true;
         }
+    });
+
+    // Отправка заявки по кнопке «+»
+    let target = add_friend_node.trim().to_string();
+    let valid = target.len() == 64 && target.chars().all(|c| c.is_ascii_hexdigit());
+    if send && valid && !friends.is_friend(&target) {
+        if let Some(ref p2p) = p2p {
+            is_host.store(false, Ordering::SeqCst);
+            send_request(p2p, friends, &target, my_id, my_node_id, nick);
+        }
+        add_friend_node.clear();
     }
 }

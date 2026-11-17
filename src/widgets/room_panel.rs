@@ -14,48 +14,13 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn short_node_id(node_id: &str) -> String {
-    if node_id.len() > 16 {
-        format!("{}…", &node_id[..15])
+/// Короткая форма NodeID: начало и конец
+pub fn short_node_id(node_id: &str) -> String {
+    if node_id.len() > 18 {
+        format!("{}…{}", &node_id[..8], &node_id[node_id.len() - 7..])
     } else {
         node_id.to_string()
     }
-}
-
-/// Компактный аватар с кольцом состояния
-fn avatar(ui: &mut egui::Ui, speaking: bool, level: f32, time: f64) {
-    let size = 32.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-
-    let painter = ui.painter_at(rect);
-    let center = rect.center();
-    let radius = 15.0;
-
-    let ring = if speaking {
-        1.0 + 0.05 * (time * 6.0).sin() as f32
-    } else {
-        1.0
-    };
-
-    painter.circle_filled(center, 13.0, t::SURFACE_HI);
-    painter.circle_stroke(
-        center,
-        radius * ring,
-        Stroke::new(
-            if speaking { 1.8_f32 } else { 1.0_f32 },
-            if speaking { t::LIVE } else { t::STROKE },
-        ),
-    );
-
-    let dot = 3.0 + 7.0 * level.clamp(0.0, 1.0);
-    painter.circle_filled(
-        center,
-        dot,
-        if speaking { t::LIVE } else { t::TEXT_MUTED },
-    );
 }
 
 fn status_text(speaking: bool, alive: bool) -> (&'static str, Color32) {
@@ -68,129 +33,159 @@ fn status_text(speaking: bool, alive: bool) -> (&'static str, Color32) {
     }
 }
 
+/// Тонкая линия между строками списка
+fn row_divider(ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 0.0, t::with_alpha(t::STROKE_SOFT, 0.7));
+    ui.add_space(2.0);
+}
+
 pub fn draw_participants(
     ui: &mut egui::Ui,
     room: std::sync::Arc<crate::room::RoomManager>,
     mixer: &crate::mixer::AudioMixer,
-    my_id: u64,
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_transmitting: bool,
+    nick: &str,
 ) {
-    let time = ui.input(|i| i.time);
     let now = now_ms();
     let peers = room.get_all_peers();
     let my_is_host = is_host.load(Ordering::Relaxed);
 
     ui.horizontal(|ui| {
-        t::section_label(ui, "УЧАСТНИКИ");
+        ui.label(
+            egui::RichText::new("Участники")
+                .size(14.0)
+                .strong()
+                .color(t::TEXT),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(format!("{}", peers.len() + 1))
                     .size(10.0)
+                    .monospace()
                     .color(t::TEXT_MUTED),
             );
         });
     });
+    ui.add_space(2.0);
 
-    ui.add_space(4.0);
-
-    let row_width = ui.available_width();
-
-    // Себя показываем строкой без регулятора громкости
-    egui::Frame::none()
-        .fill(t::SURFACE)
-        .rounding(Rounding::same(10.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
-        .show(ui, |ui| {
-            ui.set_width(row_width - 20.0);
-            ui.horizontal(|ui| {
-                avatar(ui, is_transmitting, if is_transmitting { 0.5 } else { 0.0 }, time);
-                ui.add_space(2.0);
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Вы")
-                            .size(12.5)
-                            .strong()
-                            .color(t::TEXT),
-                    );
-                    let (status, color) = status_text(is_transmitting, true);
-                    ui.label(egui::RichText::new(status).size(10.0).color(color));
-                });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if my_is_host {
-                        t::badge(ui, "ХОСТ", t::GOLD);
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("{}", my_id))
-                            .monospace()
-                            .size(9.5)
-                            .color(t::TEXT_MUTED),
-                    );
-                });
-            });
+    // Себя — плоская строка, как в макете
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("01")
+                .monospace()
+                .size(8.5)
+                .color(t::TEXT_MUTED),
+        );
+        ui.add_space(6.0);
+        t::avatar(ui, nick, 32.0, is_transmitting);
+        ui.add_space(8.0);
+        ui.vertical(|ui| {
+            ui.label(
+                egui::RichText::new("Вы")
+                    .size(12.0)
+                    .strong()
+                    .color(t::TEXT),
+            );
+            // Как в макете: «ХОСТ · молчит» одной строкой статуса
+            let (status, color) = status_text(is_transmitting, true);
+            let (line, color) = if my_is_host {
+                (format!("ХОСТ · {}", status), t::with_alpha(t::GOLD, 0.85))
+            } else {
+                (status.to_string(), color)
+            };
+            ui.label(egui::RichText::new(line).size(9.5).color(color));
         });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (bars, _) = ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::hover());
+            t::level_bars(
+                &ui.painter_at(bars),
+                bars,
+                if is_transmitting { 0.8 } else { 0.0 },
+                if is_transmitting { t::LIVE } else { t::TEXT_MUTED },
+            );
+        });
+    });
+    ui.add_space(2.0);
 
-    ui.add_space(3.0);
-
-    for peer in peers {
+    for (idx, peer) in peers.into_iter().enumerate() {
         let alive = now.saturating_sub(peer.last_heartbeat) < 3000;
         let speaking = mixer.is_peer_speaking(peer.id);
         let level = mixer.peer_meter(peer.id).peak;
 
-        egui::Frame::none()
-            .fill(t::SURFACE)
-            .rounding(Rounding::same(10.0))
-            .inner_margin(egui::Margin::symmetric(10.0, 7.0))
-            .show(ui, |ui| {
-                ui.set_width(row_width - 20.0);
-                ui.horizontal(|ui| {
-                    avatar(ui, speaking, level, time);
-                    ui.add_space(2.0);
+        row_divider(ui);
 
-                    ui.vertical(|ui| {
-                        let id_str = peer.id.to_string();
-                        let short_id = &id_str[..4.min(id_str.len())];
-                        ui.label(
-                            egui::RichText::new(format!("Гость {}", short_id))
-                                .size(12.5)
-                                .strong()
-                                .color(t::TEXT),
-                        );
-                        let (status, color) = status_text(speaking, alive);
-                        ui.label(egui::RichText::new(status).size(10.0).color(color));
-                    });
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{:02}", idx + 2))
+                    .monospace()
+                    .size(8.5)
+                    .color(t::TEXT_MUTED),
+            );
+            ui.add_space(6.0);
+            let id_str = peer.id.to_string();
+            let short_id = &id_str[..4.min(id_str.len())];
+            let name = format!("Гость {}", short_id);
+            t::avatar(ui, &name, 32.0, speaking);
+            ui.add_space(8.0);
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(name.as_str())
+                        .size(12.0)
+                        .strong()
+                        .color(t::TEXT),
+                );
+                let (status, color) = status_text(speaking, alive);
+                ui.label(egui::RichText::new(status).size(9.5).color(color));
+            });
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Динамик (справа) открывает громкость собеседника
+                let speaker = t::icon_button(ui, t::Icon::Speaker, 20.0, false)
+                    .on_hover_text("Громкость собеседника");
+                let popup_id = ui.make_persistent_id(("peer_vol", peer.id));
+                if speaker.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(popup_id));
+                }
+                egui::popup_below_widget(
+                    ui,
+                    popup_id,
+                    &speaker,
+                    egui::popup::PopupCloseBehavior::CloseOnClick,
+                    |ui| {
+                        ui.set_min_width(150.0);
+                        ui.spacing_mut().slider_width = 96.0;
                         let mut volume = mixer.get_peer_volume(peer.id);
-                        ui.spacing_mut().slider_width = 64.0;
                         if ui
-                            .add(
-                                egui::Slider::new(&mut volume, 0..=300)
-                                    .show_value(false),
-                            )
+                            .add(egui::Slider::new(&mut volume, 0..=300).suffix("%"))
                             .changed()
                         {
                             mixer.set_peer_volume(peer.id, volume);
                         }
-                        ui.label(
-                            egui::RichText::new(format!("{}%", volume))
-                                .size(9.5)
-                                .color(t::TEXT_MUTED),
-                        );
+                    },
+                );
 
-                        if peer.is_host {
-                            t::badge(ui, "ХОСТ", t::GOLD);
-                        }
-                    });
-                });
+                let (bars, _) =
+                    ui.allocate_exact_size(egui::vec2(16.0, 14.0), egui::Sense::hover());
+                t::level_bars(
+                    &ui.painter_at(bars),
+                    bars,
+                    level,
+                    if speaking { t::LIVE } else { t::TEXT_MUTED },
+                );
             });
-
-        ui.add_space(3.0);
+        });
+        ui.add_space(2.0);
     }
 }
 
-pub fn draw_room_panel(
+/// Комната: вход по NodeID
+pub fn draw_room_connect(
     ui: &mut egui::Ui,
     connect_ip: &mut String,
     iroh: Option<Arc<IrohP2pManager>>,
@@ -198,31 +193,47 @@ pub fn draw_room_panel(
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
     room: std::sync::Arc<crate::room::RoomManager>,
 ) {
-    t::section_label(ui, "КОМНАТА");
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Комната")
+                .size(14.0)
+                .strong()
+                .color(t::TEXT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            t::micro(ui, "P2P");
+        });
+    });
 
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 
     ui.horizontal(|ui| {
-        let btn_width = 74.0;
+        let btn_width = 72.0;
         let spacing = ui.spacing().item_spacing.x;
         let input_width = (ui.available_width() - btn_width - spacing).max(80.0);
 
-        ui.add(
-            egui::TextEdit::singleline(connect_ip)
-                .hint_text("NodeID собеседника")
-                .desired_width(input_width),
-        );
+        egui::Frame::none()
+            .fill(t::INSET)
+            .rounding(Rounding::same(10.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new("NODE ID")
+                            .size(7.5)
+                            .color(t::TEXT_MUTED),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(connect_ip)
+                            .hint_text("NodeID собеседника")
+                            .desired_width(input_width - 20.0)
+                            .frame(false),
+                    );
+                });
+            });
 
-        let btn = egui::Button::new(
-            egui::RichText::new("Войти")
-                .size(12.0)
-                .strong()
-                .color(Color32::WHITE),
-        )
-        .fill(t::BRAND_DEEP)
-        .rounding(Rounding::same(8.0));
-
-        if ui.add_sized([btn_width, 26.0], btn).clicked() {
+        if t::primary_button(ui, "Войти", egui::vec2(btn_width, 44.0)).clicked() {
             join_room(connect_ip, iroh.clone(), my_id, is_host.clone());
         }
     });
@@ -237,10 +248,70 @@ pub fn draw_room_panel(
             .unwrap_or_else(|| "Ожидание хоста…".to_string());
         ui.label(
             egui::RichText::new(format!("Хост: {}", host_addr))
-                .size(10.0)
+                .size(9.5)
                 .color(t::TEXT_MUTED),
         );
     }
+}
+
+/// Свой NodeID и копирование — одной строкой, как в макете.
+/// Возвращает true, если NodeID только что скопирован.
+pub fn draw_my_nodeid(ui: &mut egui::Ui, my_node_id: &str) -> bool {
+    let mut copied = false;
+
+    ui.horizontal(|ui| {
+        t::micro(ui, "МОЙ NODEID");
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(short_node_id(my_node_id))
+                .monospace()
+                .size(9.5)
+                .color(t::TEXT_DIM),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (chip, resp) = ui.allocate_exact_size(egui::vec2(96.0, 24.0), egui::Sense::click());
+            let resp = resp
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Скопировать и отправить другу");
+            let painter = ui.painter_at(chip);
+            painter.rect_filled(
+                chip,
+                Rounding::same(6.0),
+                if resp.hovered() {
+                    egui::Color32::from_rgb(34, 34, 40)
+                } else {
+                    egui::Color32::from_rgb(28, 28, 34)
+                },
+            );
+            painter.rect_stroke(
+                chip,
+                Rounding::same(6.0),
+                Stroke::new(1.0_f32, t::with_alpha(t::BRAND, 0.22)),
+            );
+            t::draw_icon(
+                &painter,
+                egui::Rect::from_center_size(
+                    egui::pos2(chip.left() + 14.0, chip.center().y),
+                    egui::vec2(11.0, 11.0),
+                ),
+                t::Icon::Copy,
+                t::BRAND,
+            );
+            painter.text(
+                egui::pos2(chip.left() + 25.0, chip.center().y),
+                egui::Align2::LEFT_CENTER,
+                "Копировать",
+                egui::FontId::proportional(9.5),
+                t::BRAND,
+            );
+            if resp.clicked() {
+                ui.output_mut(|o| o.copied_text = my_node_id.to_string());
+                copied = true;
+            }
+        });
+    });
+
+    copied
 }
 
 fn join_room(

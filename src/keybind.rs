@@ -94,6 +94,28 @@ fn vk_to_name(vk: i32) -> String {
     }
 }
 
+/// Короткая подпись назначенной кнопки — для подсказки на PTT-пилюле
+pub fn shortcut_label(vk: i32) -> String {
+    match vk {
+        0x01 => "ЛКМ".to_string(),
+        0x02 => "ПКМ".to_string(),
+        0x04 => "КОЛЕСО".to_string(),
+        0x05 => "MOUSE 4".to_string(),
+        0x06 => "MOUSE 5".to_string(),
+        0x14 => "CAPSLOCK".to_string(),
+        0x20 => "ПРОБЕЛ".to_string(),
+        0x10 | 0xA0 | 0xA1 => "SHIFT".to_string(),
+        0x11 | 0xA2 | 0xA3 => "CTRL".to_string(),
+        0x12 | 0xA4 | 0xA5 => "ALT".to_string(),
+        0x09 => "TAB".to_string(),
+        0xC0 => "~".to_string(),
+        0x41..=0x5A => (vk as u8 as char).to_string(),
+        0x70..=0x7B => format!("F{}", vk - 0x70 + 1),
+        0 => "НЕ НАЗНАЧЕНО".to_string(),
+        _ => format!("{:#X}", vk),
+    }
+}
+
 /// Отрисовка кнопки назначения хоткея с фиксированной шириной
 pub fn handle_keybind_ui(ui: &mut egui::Ui, current_bind: &mut Option<PttBind>, width: f32) {
     let is_listening = IS_LISTENING.load(Ordering::Relaxed);

@@ -1,4 +1,4 @@
-//! DM-чат: сессионная переписка с выбранным другом.
+//! DM-чат: выдвижная панель с сессионной перепиской
 
 use crate::chat::{ChatLog, ChatMessage};
 use crate::friends::FriendsManager;
@@ -8,19 +8,13 @@ use eframe::egui;
 use egui::{Align, Color32, Layout, RichText, Rounding, Stroke};
 use std::sync::Arc;
 
+use super::room_panel::short_node_id;
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn short_node_id(node_id: &str) -> String {
-    if node_id.len() > 16 {
-        format!("{}…", &node_id[..15])
-    } else {
-        node_id.to_string()
-    }
 }
 
 fn friend_name(friends: &Arc<FriendsManager>, node_id: &str) -> String {
@@ -58,30 +52,48 @@ fn send_chat(p2p: &Arc<IrohP2pManager>, target: &str, my_id: u64, text: String) 
     });
 }
 
-fn bubble(ui: &mut egui::Ui, m: &ChatMessage) {
-    if m.from_me {
-        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-            bubble_inner(ui, m, t::BRAND, Color32::WHITE);
-        });
-    } else {
-        ui.with_layout(Layout::left_to_right(Align::TOP), |ui| {
-            bubble_inner(ui, m, t::SURFACE_HI, t::TEXT);
-        });
-    }
-    ui.add_space(3.0);
+fn bubble(ui: &mut egui::Ui, m: &ChatMessage, time: &str) {
+    let outgoing = m.from_me;
+    ui.with_layout(
+        if outgoing {
+            Layout::right_to_left(Align::TOP)
+        } else {
+            Layout::left_to_right(Align::TOP)
+        },
+        |ui| {
+            let max_w = ui.available_width() * 0.82;
+            let (fill, text_color, border) = if outgoing {
+                (t::BRAND_2, Color32::WHITE, t::with_alpha(t::BRAND, 0.0))
+            } else {
+                (t::SURFACE_HI, t::TEXT, t::STROKE_SOFT)
+            };
+            egui::Frame::none()
+                .fill(fill)
+                .rounding(Rounding::same(12.0))
+                .stroke(Stroke::new(1.0_f32, border))
+                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_max_width(max_w);
+                    ui.label(RichText::new(m.text.as_str()).size(11.5).color(text_color));
+                    ui.add_space(1.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(time)
+                                .size(8.5)
+                                .color(t::with_alpha(text_color, 0.55)),
+                        );
+                    });
+                });
+        },
+    );
+    ui.add_space(6.0);
 }
 
-fn bubble_inner(ui: &mut egui::Ui, m: &ChatMessage, fill: Color32, color: Color32) {
-    let max_w = ui.available_width() * 0.8;
-    egui::Frame::none()
-        .fill(fill)
-        .rounding(Rounding::same(10.0))
-        .stroke(Stroke::new(1.0_f32, t::STROKE))
-        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
-        .show(ui, |ui| {
-            ui.set_max_width(max_w);
-            ui.label(RichText::new(&m.text).size(12.0).color(color));
-        });
+fn clock(at_ms: u64) -> String {
+    let secs = at_ms / 1000;
+    let minutes = (secs / 60) % 60;
+    let hours = (secs / 3600 + 3) % 24;
+    format!("{:02}:{:02}", hours, minutes)
 }
 
 pub fn draw_chat_panel(
@@ -95,67 +107,111 @@ pub fn draw_chat_panel(
     close: &mut bool,
 ) {
     let name = friend_name(friends, node_id);
-    let row_width = ui.available_width();
 
+    // Шапка: друг и состояние
     ui.horizontal(|ui| {
-        t::section_label(ui, &format!("ЧАТ · {}", name));
+        t::avatar(ui, &name, 30.0, false);
+        ui.vertical(|ui| {
+            ui.label(RichText::new(name.as_str()).size(13.0).strong().color(t::TEXT));
+            ui.horizontal(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 2.5, t::LIVE);
+                ui.label(
+                    RichText::new(short_node_id(node_id))
+                        .monospace()
+                        .size(9.0)
+                        .color(t::TEXT_MUTED),
+                );
+            });
+        });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("Закрыть").clicked() {
+            if t::icon_button(ui, t::Icon::Close, 26.0, false)
+                .on_hover_text("Закрыть")
+                .clicked()
+            {
                 *close = true;
             }
         });
     });
 
-    ui.add_space(4.0);
-    ui.separator();
-    ui.add_space(4.0);
+    ui.add_space(6.0);
+    t::divider(ui);
+    ui.add_space(2.0);
 
     let msgs = chat.thread(node_id);
-    if msgs.is_empty() {
-        ui.label(
-            RichText::new("Переписка пуста. Напишите первым.")
-                .size(10.5)
-                .color(t::TEXT_MUTED),
-        );
-    } else {
-        egui::ScrollArea::vertical()
-            .max_height(240.0)
-            .stick_to_bottom(true)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
+    let footer_h = 22.0;
+    let composer_h = 46.0;
+    let scroll_h = (ui.available_height() - composer_h - footer_h - 12.0).max(80.0);
+
+    egui::ScrollArea::vertical()
+        .max_height(scroll_h)
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if msgs.is_empty() {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("Переписка пуста. Напишите первым.")
+                        .size(10.5)
+                        .color(t::TEXT_MUTED),
+                );
+            } else {
                 for m in &msgs {
-                    bubble(ui, m);
+                    bubble(ui, m, &clock(m.at));
+                }
+            }
+        });
+
+    ui.add_space(4.0);
+
+    // Ввод
+    let mut send = false;
+    ui.horizontal(|ui| {
+        let btn = 30.0;
+        let width = (ui.available_width() - btn - 8.0).max(80.0);
+        egui::Frame::none()
+            .fill(t::INSET)
+            .rounding(Rounding::same(9.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .inner_margin(egui::Margin::symmetric(9.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_width(width - 18.0);
+                let edit = ui.add(
+                    egui::TextEdit::singleline(input)
+                        .hint_text("Сообщение…")
+                        .char_limit(500)
+                        .desired_width(width - 18.0)
+                        .frame(false),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    send = true;
                 }
             });
-    }
 
-    ui.add_space(6.0);
-
-    let send = ui
-        .horizontal(|ui| {
-            let edit = ui.add(
-                egui::TextEdit::singleline(input)
-                    .hint_text("Сообщение…")
-                    .char_limit(500)
-                    .desired_width(row_width - 74.0),
-            );
-            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let clicked = ui
-                .add_sized(
-                    [58.0, 24.0],
-                    egui::Button::new(
-                        RichText::new("Отправить")
-                            .size(10.5)
-                            .strong()
-                            .color(Color32::WHITE),
-                    )
-                    .fill(t::BRAND_DEEP)
-                    .rounding(Rounding::same(8.0)),
-                )
-                .clicked();
-            enter || clicked
-        })
-        .inner;
+        // Круглая кнопка отправки
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(btn, 30.0), egui::Sense::click());
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().circle_filled(
+            rect.center(),
+            15.0,
+            if response.hovered() {
+                t::BRAND
+            } else {
+                t::BRAND_2
+            },
+        );
+        t::draw_icon(
+            &ui.painter_at(rect),
+            egui::Rect::from_center_size(rect.center(), egui::vec2(13.0, 13.0)),
+            t::Icon::Send,
+            Color32::WHITE,
+        );
+        if response.clicked() {
+            send = true;
+        }
+    });
 
     if send {
         let text = input.trim().to_string();
@@ -174,4 +230,27 @@ pub fn draw_chat_panel(
             input.clear();
         }
     }
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Только друзья · сквозное шифрование")
+                .size(8.0)
+                .color(t::with_alpha(t::TEXT_MUTED, 0.8)),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(
+                RichText::new("ИСТОРИЯ ДО ЗАКРЫТИЯ")
+                    .size(8.0)
+                    .color(t::with_alpha(t::TEXT_MUTED, 0.8)),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("{}/500", input.chars().count()))
+                    .size(8.5)
+                    .monospace()
+                    .color(t::TEXT_MUTED),
+            );
+        });
+    });
 }

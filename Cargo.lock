@@ -161,6 +161,7 @@ dependencies = [
  "eframe",
  "egui",
  "iroh",
+ "raw-window-handle 0.6.2",
  "rusty-opus",
  "serde",
  "serde_json",
