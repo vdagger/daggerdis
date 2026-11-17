@@ -214,8 +214,16 @@ impl UniversalAudioCapture {
             .map(|configs| configs.collect())
             .unwrap_or_default();
 
+        // i32 нужен из-за виртуальных 7.1-устройств (Razer 7.1 Surround Sound):
+        // там драйвер отдаёт f32, но воспроизводит его перекошенным — речь
+        // превращается в свист, зато тот же поток в i32 звучит нормально
+        // (RustAudio/cpal#892). Поэтому i32 тоже в списке кандидатов.
         let mut candidates: Vec<(cpal::SampleFormat, u32, u16)> = Vec::new();
-        for format in [cpal::SampleFormat::F32, cpal::SampleFormat::I16] {
+        for format in [
+            cpal::SampleFormat::F32,
+            cpal::SampleFormat::I32,
+            cpal::SampleFormat::I16,
+        ] {
             for range in &ranges {
                 if range.sample_format() != format
                     || range.min_sample_rate().0 > 48000
@@ -231,9 +239,28 @@ impl UniversalAudioCapture {
         }
         // Меньше каналов — лучше: стерео на виртуальном 7.1-устройстве звучит
         // как обычные динамики, а восьмиканальный поток та же виртуализация
-        // размазывает по комнате, и речь превращается в кашу.
+        // размазывает по комнате, и речь превращается в кашу. На многоканальном
+        // выходе ставим i32 впереди f32: у таких виртуальных карт f32 — как раз
+        // тот формат, который они портят.
+        let format_order = |format: cpal::SampleFormat, channels: u16| -> u8 {
+            if channels > 2 {
+                match format {
+                    cpal::SampleFormat::I32 => 0,
+                    cpal::SampleFormat::F32 => 1,
+                    cpal::SampleFormat::I16 => 2,
+                    _ => 3,
+                }
+            } else {
+                match format {
+                    cpal::SampleFormat::F32 => 0,
+                    cpal::SampleFormat::I16 => 1,
+                    cpal::SampleFormat::I32 => 2,
+                    _ => 3,
+                }
+            }
+        };
         candidates.sort_by_key(|(format, _, channels)| {
-            (*format != cpal::SampleFormat::F32, *channels)
+            (*channels, format_order(*format, *channels))
         });
 
         // Последний шанс — формат устройства по умолчанию, на какой бы частоте
@@ -258,6 +285,9 @@ impl UniversalAudioCapture {
             let built = match format {
                 cpal::SampleFormat::F32 => {
                     Self::build_playback::<f32>(&output_device, &config, rx.clone(), mixer.clone())
+                }
+                cpal::SampleFormat::I32 => {
+                    Self::build_playback::<i32>(&output_device, &config, rx.clone(), mixer.clone())
                 }
                 cpal::SampleFormat::I16 => {
                     Self::build_playback::<i16>(&output_device, &config, rx.clone(), mixer.clone())
