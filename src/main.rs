@@ -151,6 +151,16 @@ fn main() {
         ),
     }
 
+    // Звонки: приглашение → «Принять» → разговор; до согласия собеседник
+    // не попадает в комнату
+    let calls = Arc::new(albus::calls::CallManager::new(
+        my_id,
+        config.nick.clone().unwrap_or_else(|| "Гость".to_string()),
+        iroh_p2p.clone(),
+        room.clone(),
+        is_host.clone(),
+    ));
+
     // 4. Запуск фоновых сервисов
     albus::network::iroh_service::spawn_iroh_receiver(
         &rt,
@@ -160,6 +170,7 @@ fn main() {
         is_host.clone(),
         friends.clone(),
         chat_log.clone(),
+        calls.clone(),
     );
     albus::network::broadcast::spawn_audio_broadcast(&rt, packet_rx, iroh_p2p.clone(), my_id);
 
@@ -221,6 +232,7 @@ fn main() {
                 chat_log,
                 my_node_id,
                 network_error,
+                calls,
             );
 
             #[cfg(windows)]

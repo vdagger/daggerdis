@@ -141,6 +141,17 @@ impl IrohP2pManager {
         });
     }
 
+    /// Закрывает P2P-соединение с узлом. Нужно по окончании звонка: пока
+    /// соединение живо, собеседник раз в секунду присылает IrohSync и снова
+    /// попадает в комнату, даже если мы его удалили.
+    pub async fn disconnect_peer(&self, node_id: &str) {
+        let conn = self.connections.lock().await.remove(node_id);
+        if let Some(conn) = conn {
+            println!("[IROH] Соединение с {} закрыто.", node_id);
+            conn.close(0u32.into(), b"call ended");
+        }
+    }
+
     /// Рассылает байты всем активным P2P-соседям, кроме автора
     pub async fn broadcast_bytes_except(&self, except_node_id: &str, data: &[u8]) {
         let conns = self.connections.lock().await;

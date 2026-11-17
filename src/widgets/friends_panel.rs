@@ -11,23 +11,6 @@ use std::sync::Arc;
 
 use super::room_panel::short_node_id;
 
-fn dial(p2p: &Arc<IrohP2pManager>, target: &str, my_id: u64) {
-    let p2p = p2p.clone();
-    let target = target.to_string();
-    tokio::task::spawn(async move {
-        if let Err(e) = p2p.connect_to_peer(&target).await {
-            eprintln!("[ДРУЗЬЯ] Не удалось дозвониться до {}: {}", target, e);
-            return;
-        }
-        let hello = crate::network::NetworkMessage::Heartbeat {
-            sender_id: my_id,
-            is_host: false,
-        };
-        let bytes = crate::network::message::serialize_msg(&hello);
-        p2p.broadcast_bytes(&bytes).await;
-    });
-}
-
 fn send_request(
     p2p: &Arc<IrohP2pManager>,
     friends: &Arc<FriendsManager>,
@@ -99,6 +82,7 @@ pub fn draw_friends_panel(
     chat_log: &Arc<ChatLog>,
     active_chat: &mut Option<String>,
     chat_open: &mut bool,
+    calls: &Arc<crate::calls::CallManager>,
 ) {
     let row_width = ui.available_width();
     let p2p = iroh;
@@ -265,10 +249,9 @@ pub fn draw_friends_panel(
                     .on_hover_text("Позвонить")
                     .clicked()
                 {
-                    if let Some(ref p2p) = p2p {
-                        is_host.store(false, Ordering::SeqCst);
-                        dial(p2p, &friend.node_id, my_id);
-                    }
+                    // Собеседник получает приглашение и сам решает, отвечать ли:
+                    // в комнату он попадает только после «Принять».
+                    calls.start_outgoing(&friend.node_id, &friend.name, nick);
                 }
             });
         });

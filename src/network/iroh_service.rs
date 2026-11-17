@@ -1,5 +1,6 @@
 //! Фоновый сервис приема и ретрансляции пакетов через Iroh P2P
 
+use crate::calls::CallManager;
 use crate::chat::ChatLog;
 use crate::friends::FriendsManager;
 use crate::network::p2p_iroh::IrohP2pManager;
@@ -27,6 +28,7 @@ pub fn spawn_iroh_receiver(
     is_host: Arc<AtomicBool>,
     friends: Arc<FriendsManager>,
     chat_log: Arc<ChatLog>,
+    calls: Arc<CallManager>,
 ) {
     if let Some(p2p) = iroh_p2p {
         let p2p_recv = p2p.clone();
@@ -35,6 +37,7 @@ pub fn spawn_iroh_receiver(
         let is_host_iroh = is_host.clone();
         let friends_iroh = friends.clone();
         let chat_log_iroh = chat_log.clone();
+        let calls_iroh = calls.clone();
 
         rt.spawn(async move {
             println!("[IROH] Слушатель входящих P2P пакетов активен.");
@@ -62,6 +65,13 @@ pub fn spawn_iroh_receiver(
                                     "[БЕЗОПАСНОСТЬ] IrohSync с чужим sender_id/NodeID от {} отброшен",
                                     pkt.sender_id
                                 );
+                                continue;
+                            }
+
+                            // Звонящий, которого ещё не приняли, в комнату не попадает:
+                            // IrohSync рассылается раз в секунду и иначе добавлял бы
+                            // его в участники в обход согласия на звонок.
+                            if calls_iroh.is_blocked(&pkt.sender_id) {
                                 continue;
                             }
 
@@ -124,6 +134,9 @@ pub fn spawn_iroh_receiver(
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
+                            if calls_iroh.is_blocked(&pkt.sender_id) {
+                                continue;
+                            }
                             let is_peer_host = room_iroh
                                 .get_all_peers()
                                 .iter()
@@ -146,6 +159,9 @@ pub fn spawn_iroh_receiver(
                             is_host: peer_is_host,
                         } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            if calls_iroh.is_blocked(&pkt.sender_id) {
                                 continue;
                             }
                             room_iroh.update_peer(crate::types::Peer {
@@ -224,6 +240,57 @@ pub fn spawn_iroh_receiver(
                                 text,
                                 at: now,
                             });
+                        }
+                        NetworkMessage::CallInvite {
+                            sender_id,
+                            call_id,
+                            nick,
+                        } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            // Звонить могут только друзья: чужой не должен
+                            // заставлять окно звонить и тянуть к себе комнату.
+                            if !friends_iroh.is_friend(&pkt.sender_id) {
+                                eprintln!(
+                                    "[ЗВОНКИ] Приглашение от незнакомца {} отброшено.",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+                            println!(
+                                "[ЗВОНКИ] Входящий звонок от {} ({})",
+                                nick, pkt.sender_id
+                            );
+                            calls_iroh.on_invite(&pkt.sender_id, &nick, call_id);
+                        }
+                        NetworkMessage::CallAccept { sender_id, .. } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            calls_iroh.on_accept(&pkt.sender_id);
+                        }
+                        NetworkMessage::CallDecline {
+                            sender_id,
+                            reason,
+                            ..
+                        } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            calls_iroh.on_decline(&pkt.sender_id, reason);
+                        }
+                        NetworkMessage::CallCancel { sender_id, .. } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            calls_iroh.on_cancel(&pkt.sender_id);
+                        }
+                        NetworkMessage::CallEnd { sender_id, .. } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            calls_iroh.on_end(&pkt.sender_id);
                         }
                     }
                 }

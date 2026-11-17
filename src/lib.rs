@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod calls;
 pub mod chat;
 pub mod config;
 pub mod devices;

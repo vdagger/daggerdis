@@ -46,6 +46,7 @@ pub struct RadioApp {
     config: crate::config::AppConfig,
     friends: Arc<crate::friends::FriendsManager>,
     chat_log: Arc<crate::chat::ChatLog>,
+    calls: Arc<crate::calls::CallManager>,
     active_chat: Option<String>,
     chat_input: String,
     my_node_id: String,
@@ -97,6 +98,7 @@ impl RadioApp {
         chat_log: Arc<crate::chat::ChatLog>,
         my_node_id: String,
         network_error: Option<String>,
+        calls: Arc<crate::calls::CallManager>,
     ) -> Self {
         let initial_input = selected_input.load(std::sync::atomic::Ordering::Relaxed);
         let initial_output = selected_output.load(std::sync::atomic::Ordering::Relaxed);
@@ -131,6 +133,7 @@ impl RadioApp {
             config,
             friends,
             chat_log,
+            calls,
             active_chat: None,
             chat_input: String::new(),
             my_node_id,
@@ -306,6 +309,14 @@ fn rail_divider(ui: &mut egui::Ui) {
 impl eframe::App for RadioApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
+
+        // Звонки: повтор приглашений, таймауты, гудок и тосты о результате
+        self.calls.set_my_nick(&self.nick);
+        self.calls.tick();
+        self.mixer.set_ring_mode(self.calls.ring_mode());
+        while let Some(note) = self.calls.take_notice() {
+            self.show_toast(&note);
+        }
 
         #[cfg(windows)]
         self.apply_dark_titlebar(frame);
@@ -514,6 +525,7 @@ impl eframe::App for RadioApp {
         if self.chat_open {
             self.draw_chat_overlay(ctx);
         }
+        self.draw_call_overlay(ctx);
         self.draw_toast(ctx);
 
         #[cfg(windows)]
@@ -1041,6 +1053,7 @@ impl RadioApp {
                                 &self.chat_log,
                                 &mut self.active_chat,
                                 &mut self.chat_open,
+                                &self.calls,
                             );
                         });
                         if self.chat_open {
@@ -1321,6 +1334,159 @@ impl RadioApp {
         }
     }
 
+    /// Карточка звонка поверх окна: входящий, «звоним…» или идущий разговор
+    fn draw_call_overlay(&mut self, ctx: &egui::Context) {
+        let view = self.calls.view();
+        if matches!(view, crate::calls::CallView::Idle) {
+            return;
+        }
+
+        let width = 330.0_f32.min(ctx.screen_rect().width() - 40.0);
+        let screen = ctx.screen_rect();
+        let pos = egui::pos2(screen.center().x - width * 0.5, screen.top() + 66.0);
+
+        let mut accept = false;
+        let mut decline = false;
+        let mut cancel = false;
+        let mut end = false;
+
+        egui::Area::new(egui::Id::new("call_card"))
+            .fixed_pos(pos)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(t::SURFACE)
+                    .rounding(Rounding::same(14.0))
+                    .stroke(Stroke::new(1.0_f32, t::with_alpha(t::BRAND, 0.45)))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 16.0),
+                        blur: 42.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(160),
+                    })
+                    .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 32.0);
+
+                        match &view {
+                            crate::calls::CallView::Idle => {}
+                            crate::calls::CallView::Incoming { nick, .. } => {
+                                ui.horizontal(|ui| {
+                                    t::avatar(ui, nick, 34.0, true);
+                                    ui.add_space(4.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Входящий звонок")
+                                                .size(9.0)
+                                                .strong()
+                                                .color(t::TEXT_MUTED),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(nick)
+                                                .size(14.0)
+                                                .strong()
+                                                .color(t::TEXT),
+                                        );
+                                    });
+                                });
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    if t::chip_button(ui, "Отклонить", false).clicked() {
+                                        decline = true;
+                                    }
+                                    if t::primary_button(ui, "Принять", egui::vec2(150.0, 30.0))
+                                        .clicked()
+                                    {
+                                        accept = true;
+                                    }
+                                });
+                            }
+                            crate::calls::CallView::Outgoing { nick, elapsed } => {
+                                ui.horizontal(|ui| {
+                                    t::avatar(ui, nick, 34.0, false);
+                                    ui.add_space(4.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Звоним…")
+                                                .size(9.0)
+                                                .strong()
+                                                .color(t::TEXT_MUTED),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(nick)
+                                                .size(14.0)
+                                                .strong()
+                                                .color(t::TEXT),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format_elapsed(*elapsed))
+                                                .size(10.0)
+                                                .monospace()
+                                                .color(t::TEXT_MUTED),
+                                        );
+                                    });
+                                });
+                                ui.add_space(10.0);
+                                if t::chip_button(ui, "Отменить", true).clicked() {
+                                    cancel = true;
+                                }
+                            }
+                            crate::calls::CallView::Active { nick, elapsed } => {
+                                ui.horizontal(|ui| {
+                                    t::avatar(ui, nick, 34.0, false);
+                                    ui.add_space(4.0);
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("В звонке")
+                                                .size(9.0)
+                                                .strong()
+                                                .color(t::LIVE),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(nick)
+                                                .size(14.0)
+                                                .strong()
+                                                .color(t::TEXT),
+                                        );
+                                    });
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format_elapsed(*elapsed))
+                                                .size(10.0)
+                                                .monospace()
+                                                .color(t::TEXT_MUTED),
+                                        );
+                                    });
+                                });
+                                ui.add_space(10.0);
+                                if t::chip_button(ui, "Завершить", false).clicked() {
+                                    end = true;
+                                }
+                            }
+                        }
+                    });
+            });
+
+        if accept {
+            self.calls.accept_incoming();
+        }
+        if decline {
+            self.calls.decline_incoming();
+        }
+        if cancel {
+            self.calls.cancel_outgoing();
+        }
+        if end {
+            self.calls.end_active();
+        }
+        if accept || decline || cancel || end {
+            self.mixer
+                .set_ring_mode(self.calls.ring_mode());
+        }
+    }
+
     fn draw_toast(&mut self, ctx: &egui::Context) {
         let Some((text, at)) = self.toast.clone() else {
             return;
@@ -1565,6 +1731,12 @@ impl RadioApp {
             self.last_save = Instant::now();
         }
     }
+}
+
+/// «0:07» — длительность звонка в оверлее
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// «4 узла» — русская форма множественного числа

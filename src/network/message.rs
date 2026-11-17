@@ -35,6 +35,30 @@ pub enum NetworkMessage {
         sender_id: u64,
         text: String,
     },
+    /// Звонок: приглашение. Попасть в комнату можно только после `CallAccept`.
+    CallInvite {
+        sender_id: u64,
+        call_id: u32,
+        nick: String,
+    },
+    CallAccept {
+        sender_id: u64,
+        call_id: u32,
+    },
+    /// Причина: 0 — отклонил, 1 — занят, 2 — не отвечает/таймаут
+    CallDecline {
+        sender_id: u64,
+        call_id: u32,
+        reason: u8,
+    },
+    CallCancel {
+        sender_id: u64,
+        call_id: u32,
+    },
+    CallEnd {
+        sender_id: u64,
+        call_id: u32,
+    },
 }
 
 /// Пишет строку как `длина u16 LE` + байты UTF-8 (единый формат для текстовых полей).
@@ -123,6 +147,41 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             data.extend_from_slice(&sender_id.to_le_bytes());
             push_str(&mut data, text);
         }
+        NetworkMessage::CallInvite {
+            sender_id,
+            call_id,
+            nick,
+        } => {
+            data.push(10);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&call_id.to_le_bytes());
+            push_str(&mut data, nick);
+        }
+        NetworkMessage::CallAccept { sender_id, call_id } => {
+            data.push(11);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&call_id.to_le_bytes());
+        }
+        NetworkMessage::CallDecline {
+            sender_id,
+            call_id,
+            reason,
+        } => {
+            data.push(12);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&call_id.to_le_bytes());
+            data.push(*reason);
+        }
+        NetworkMessage::CallCancel { sender_id, call_id } => {
+            data.push(13);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&call_id.to_le_bytes());
+        }
+        NetworkMessage::CallEnd { sender_id, call_id } => {
+            data.push(14);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&call_id.to_le_bytes());
+        }
     }
     data
 }
@@ -200,6 +259,41 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
             let mut off = 9;
             let text = read_str(bytes, &mut off)?;
             Some(NetworkMessage::ChatMessage { sender_id, text })
+        }
+        10 if bytes.len() >= 13 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            let mut off = 13;
+            let nick = read_str(bytes, &mut off)?;
+            Some(NetworkMessage::CallInvite {
+                sender_id,
+                call_id,
+                nick,
+            })
+        }
+        11 if bytes.len() >= 13 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            Some(NetworkMessage::CallAccept { sender_id, call_id })
+        }
+        12 if bytes.len() >= 14 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            Some(NetworkMessage::CallDecline {
+                sender_id,
+                call_id,
+                reason: bytes[13],
+            })
+        }
+        13 if bytes.len() >= 13 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            Some(NetworkMessage::CallCancel { sender_id, call_id })
+        }
+        14 if bytes.len() >= 13 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            Some(NetworkMessage::CallEnd { sender_id, call_id })
         }
         _ => None,
     }

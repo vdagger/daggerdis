@@ -381,6 +381,21 @@ impl UniversalAudioCapture {
         // монитор своего тракта приходит на 48 кГц, карта может быть другой
         let mut monitor_in: Vec<f32> = Vec::new();
         let mut monitor_pos: f64 = 0.0;
+        // гудок звонка синтезируется прямо в колбэке: без файлов и без задержки
+        let mut ring_t: f64 = 0.0;
+        let mut last_ring_mode: u32 = 0;
+        // короткий тон с плавными краями: без фейдов слышны щелчки
+        let ring_tone = |t: f64, freq: f64, from: f64, to: f64| -> f32 {
+            if t < from || t >= to {
+                return 0.0;
+            }
+            let fade = 0.010;
+            let env = ((t - from) / fade)
+                .min(1.0)
+                .min(((to - t) / fade).min(1.0))
+                .max(0.0);
+            ((2.0 * std::f64::consts::PI * freq * t).sin() * env * 0.10) as f32
+        };
         let mut peers: std::collections::HashMap<u64, Peer> = std::collections::HashMap::new();
         // диагностика приёма: по этим числам видно, что именно рвёт звук
         let (mut underruns, mut concealed, mut stale_resets, mut burst_drops) =
@@ -568,6 +583,29 @@ impl UniversalAudioCapture {
                             *dst += src;
                         }
                     }
+                }
+
+                // Гудок звонка: входящий — двойной сигнал раз в 2.2 с,
+                // исходящий — длинный гудок раз в 4 с. Слышен независимо от
+                // громкости собеседников: его нельзя случайно «замьютить».
+                let ring_mode = mixer.ring_mode();
+                if ring_mode != last_ring_mode {
+                    ring_t = 0.0;
+                    last_ring_mode = ring_mode;
+                }
+                if ring_mode != 0 {
+                    let dt = 1.0 / sample_rate as f64;
+                    let period = if ring_mode == 1 { 2.2 } else { 4.0 };
+                    for (i, sample) in out_scratch.iter_mut().enumerate() {
+                        let t = (ring_t + i as f64 * dt) % period;
+                        let tone = if ring_mode == 1 {
+                            ring_tone(t, 880.0, 0.0, 0.20) + ring_tone(t, 880.0, 0.32, 0.52)
+                        } else {
+                            ring_tone(t, 425.0, 0.0, 0.8)
+                        };
+                        *sample += tone;
+                    }
+                    ring_t = (ring_t + num_frames as f64 * dt) % period;
                 }
 
                 mix_limiter.process(&mut out_scratch);

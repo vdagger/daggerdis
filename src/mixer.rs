@@ -161,6 +161,8 @@ pub struct AudioMixer {
     monitor_enabled: AtomicBool,
     /// Обработанный звук своего тракта (48 кГц), ждущий вывода в динамики
     monitor_buf: Mutex<VecDeque<f32>>,
+    /// Гудок звонка: 0 — тихо, 1 — входящий, 2 — «звоним…»
+    ring_mode: AtomicU32,
 }
 
 impl AudioMixer {
@@ -179,7 +181,17 @@ impl AudioMixer {
             peer_meters: Mutex::new(HashMap::new()),
             monitor_enabled: AtomicBool::new(false),
             monitor_buf: Mutex::new(VecDeque::new()),
+            ring_mode: AtomicU32::new(0),
         }
+    }
+
+    /// Режим гудка: 0 — тихо, 1 — входящий звонок, 2 — гудок «звоним…»
+    pub fn ring_mode(&self) -> u32 {
+        self.ring_mode.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ring_mode(&self, mode: u32) {
+        self.ring_mode.store(mode, Ordering::Relaxed);
     }
 
     /// Включено ли прослушивание своего тракта
