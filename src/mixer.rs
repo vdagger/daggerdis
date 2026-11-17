@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -155,6 +155,10 @@ pub struct AudioMixer {
     input2_peak: AtomicU32,
     peer_volumes: Mutex<HashMap<u64, u32>>,
     peer_meters: Mutex<HashMap<u64, PeerMeter>>,
+    /// Прослушивание своего тракта в своих же динамиках
+    monitor_enabled: AtomicBool,
+    /// Обработанный звук своего тракта (48 кГц), ждущий вывода в динамики
+    monitor_buf: Mutex<VecDeque<f32>>,
 }
 
 impl AudioMixer {
@@ -171,6 +175,47 @@ impl AudioMixer {
             input2_peak: AtomicU32::new(0),
             peer_volumes: Mutex::new(HashMap::new()),
             peer_meters: Mutex::new(HashMap::new()),
+            monitor_enabled: AtomicBool::new(false),
+            monitor_buf: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Включено ли прослушивание своего тракта
+    pub fn is_monitor_enabled(&self) -> bool {
+        self.monitor_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Включает/выключает прослушивание. При включении буфер чистится,
+    /// иначе в динамики успевает уйти накопленный старый звук.
+    pub fn set_monitor_enabled(&self, on: bool) {
+        self.monitor_enabled.store(on, Ordering::Relaxed);
+        if let Ok(mut buf) = self.monitor_buf.lock() {
+            buf.clear();
+        }
+    }
+
+    /// Кладёт обработанный кусок своего тракта (уже 48 кГц) в буфер
+    /// прослушивания. Хвост ограничен 400 мс: если вывод не успевает,
+    /// старое выкидывается, а не накапливается.
+    pub fn push_monitor(&self, samples: &[f32]) {
+        if !self.is_monitor_enabled() {
+            return;
+        }
+        if let Ok(mut buf) = self.monitor_buf.lock() {
+            buf.extend(samples.iter().copied());
+            const CAP: usize = 48_000 * 4 / 10;
+            while buf.len() > CAP {
+                buf.pop_front();
+            }
+        }
+    }
+
+    /// Забирает до `max` сэмплов для вывода в динамики
+    pub fn drain_monitor(&self, out: &mut Vec<f32>, max: usize) {
+        out.clear();
+        if let Ok(mut buf) = self.monitor_buf.lock() {
+            let n = max.min(buf.len());
+            out.extend(buf.drain(..n));
         }
     }
 

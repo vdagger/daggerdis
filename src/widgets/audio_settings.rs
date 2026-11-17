@@ -129,6 +129,37 @@ pub fn draw_audio_settings(
     ui.separator();
     ui.add_space(12.0);
 
+    // Прослушивание своего тракта: баланс микрофона и гитары настраивается
+    // на слух ещё до созвона — слышно то, что уйдёт собеседнику.
+    t::section_label(ui, "ПРОСЛУШИВАНИЕ");
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Слышать свой тракт")
+                .size(11.5)
+                .color(t::TEXT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut on = mixer.is_monitor_enabled();
+            if t::switch(ui, &mut on).changed() {
+                mixer.set_monitor_enabled(on);
+            }
+        });
+    });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Гейт, AGC и лимитер — ровно то, что услышит собеседник. \
+             Только в наушниках: через колонки микрофон поймает свой же голос.",
+        )
+        .size(9.5)
+        .color(t::TEXT_MUTED),
+    );
+
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(12.0);
+
     // Рация
     t::section_label(ui, "РАЦИЯ");
     ui.add_space(4.0);

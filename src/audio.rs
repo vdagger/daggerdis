@@ -173,6 +173,12 @@ impl UniversalAudioCapture {
                 tx_agc.process(&mut processed_chunk);
                 tx_limiter.process(&mut processed_chunk);
 
+                // Прослушивание своего тракта: в динамики уходит ровно то,
+                // что после гейта, AGC и лимитера уйдёт собеседнику.
+                // Не зависит от PTT — баланс микрофона и гитары можно
+                // настраивать, ничего не передавая.
+                mixer.push_monitor(&processed_chunk);
+
                 // Нарезаем ровно по 960 сэмплов (20 мс при 48 кГц) для Opus
                 if ptt_flag.load(Ordering::Relaxed) {
                     sample_acc.extend_from_slice(&processed_chunk);
@@ -372,6 +378,9 @@ impl UniversalAudioCapture {
         // не больше −1 dBFS. Персональный +18 дБ при этом доходит до слуха —
         // раньше его съедал лимитер каждого отдельного голоса.
         let mut mix_limiter = crate::mixer::Limiter::new(sample_rate);
+        // монитор своего тракта приходит на 48 кГц, карта может быть другой
+        let mut monitor_in: Vec<f32> = Vec::new();
+        let mut monitor_pos: f64 = 0.0;
         let mut peers: std::collections::HashMap<u64, Peer> = std::collections::HashMap::new();
         // диагностика приёма: по этим числам видно, что именно рвёт звук
         let (mut underruns, mut concealed, mut stale_resets, mut burst_drops) =
@@ -542,6 +551,25 @@ impl UniversalAudioCapture {
                 for sample in out_scratch.iter_mut() {
                     *sample *= master_gain;
                 }
+
+                // Свой тракт подмешивается после общей громкости: его уровень
+                // не должен зависеть от того, насколько прибавлены собеседники
+                if mixer.is_monitor_enabled() {
+                    let need = ((num_frames as f64) * 48_000.0 / sample_rate as f64).ceil() as usize
+                        + 2;
+                    mixer.drain_monitor(&mut monitor_in, need);
+                    if !monitor_in.is_empty() {
+                        let chunk: Vec<f32> = if sample_rate != 48000 {
+                            resample_linear(&monitor_in, 48000, sample_rate, &mut monitor_pos)
+                        } else {
+                            monitor_in.clone()
+                        };
+                        for (dst, src) in out_scratch.iter_mut().zip(chunk) {
+                            *dst += src;
+                        }
+                    }
+                }
+
                 mix_limiter.process(&mut out_scratch);
 
                 let silence = T::from_sample(0.0);
