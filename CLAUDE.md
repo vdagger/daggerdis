@@ -66,10 +66,12 @@ normal terminal triggers a UAC prompt.
    - `broadcast::spawn_audio_broadcast` — fan-out voice over Iroh.
    - `presence::spawn_ping_loop` — пинг друзей раз в 4 с (`PresencePing`/`Pong`), только если iroh поднялся.
    - `MigrationManager::start_heartbeat_loop` — 1 s IrohSync / host failover.
-8. On Windows: `video_link::VideoLink::spawn(p2p, rt.handle())` — the video
-   transport (its own ALPN). It must be spawned with the runtime `Handle`, not
-   bare `tokio::spawn` — at this point `main` has not entered the runtime yet.
-   The GUI receives it via `RadioApp::attach_video(link, rt_handle)`.
+8. On Windows: `video_link::VideoLink::spawn(p2p, rt.handle(), video_directory)` —
+   the video transport (its own ALPN) sharing the `VideoDirectory` that carries
+   the live-broadcast announcements (IrohSync `video_gen`). It must be spawned with
+   the runtime `Handle`, not bare `tokio::spawn` — at this point `main` has not
+   entered the runtime yet. The GUI receives both via
+   `RadioApp::attach_video(link, directory)`.
 9. `eframe::run_native("Albus Audio", ...)` → `gui::RadioApp`.
 
 Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun.rs`,
@@ -95,11 +97,11 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), эффекты входов по тумблерам (эхо-подавление AEC3, шумодав RNNoise, затвор и AGC независимо), лимитер передачи, монитор, Opus 64/96/128 кбит/с |
 | `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, кольцо опоры `echo_ref`, тумблеры `input1_denoise`/`input1_gate`/`input1_agc`/`input1_aec`/`input2_denoise`/`input2_gate`/`input2_agc`/`input2_aec`/`tx_limiter_enabled`/`rx_limiter_enabled` — все по умолчанию выкл., битрейт `opus_bitrate`), `SlotProfile` (пресет тумблеров), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
-| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, эффекты `input1_denoise`/`input1_gate`/`input1_agc`/`input1_aec`/`input2_denoise`/`input2_gate`/`input2_agc`/`input2_aec`/`tx_limiter`, nick, per-peer volume, `video_fps`, `rx_limiter`; старые `mic_processing` и `input*_profile` читаются для совместимости) |
+| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, эффекты `input1_denoise`/`input1_gate`/`input1_agc`/`input1_aec`/`input2_denoise`/`input2_gate`/`input2_agc`/`input2_aec`/`tx_limiter`, nick, per-peer volume, `video_fps`, `video_buffer_ms`, `rx_limiter`; старые `mic_processing` и `input*_profile` читаются для совместимости) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule for the current exe — идемпотентно (лишние одноимённые записи чистятся) |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
-| `src/network/mod.rs` | Re-exports `NetworkMessage`; declares `broadcast`, `iroh_service`, `message`, `p2p_iroh` |
+| `src/network/mod.rs` | Re-exports `NetworkMessage`; declares `broadcast`, `iroh_service`, `message`, `p2p_iroh`, `video_directory`, `video_link` |
 | `src/network/p2p_iroh.rs` | `IrohP2pManager`: QUIC datagrams + uni-стримы (`send_bytes` с переподключением, `spawn_stream_receiver`), connect by NodeID, `broadcast_bytes`, `disconnect_peer`/`disconnect_all` |
 | `src/network/iroh_service.rs` | `spawn_iroh_receiver`: Iroh listener, sender_id↔NodeID check, full-mesh, relay, friends, chat, звонки (гейт по `CallManager::is_blocked`) |
 | `src/network/broadcast.rs` | `spawn_audio_broadcast`: parallel voice fan-out over Iroh |
@@ -120,7 +122,8 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/video/win_mf.rs` | Async hardware H.264 MFT encoder (NVENC/AMF/QSV), CBR/GOP via `ICodecAPI` |
 | `src/video/win_decode.rs` | H.264 decoder MFT — both async and sync paths; NV12 repack 1088→1080 |
 | `src/video/publisher.rs` | `video-publisher` thread: capture at the chosen fps (30/60) → NV12 → encode → mpsc of `EncodedUnit`; `encode_fps` counter for diagnostics |
-| `src/network/video_link.rs` | `discordrf-video/1`: incoming video connections, one uni-stream per frame, fan-out to viewers |
+| `src/network/video_directory.rs` | `VideoDirectory`: номер своей трансляции (`my_gen`) + анонсы соседей из IrohSync (`video_gen`), TTL 5 с; общая для миграции, сервиса приёма и видео |
+| `src/network/video_link.rs` | `discordrf-video/1`: протокол подписки (контроль `kind=2/3` в первом bi-стриме), окно недавних кадров (180 / 64 МиБ, отдача с последнего ключевого), broadcast подписчикам, очередь зрителя со сдвигом показа на буфер |
 | `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
 | `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
 | `src/widgets/room_panel.rs` | Секции рейла: вход по NodeID, «Мой NodeID» + копирование, участники плоскими строками, громкость собеседника |
@@ -137,7 +140,7 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 0 | `Heartbeat` | `sender_id` u64 LE, `is_host` u8 |
 | 3 | `AudioFrame` | `sender_id` u64 LE, `seq` u32 LE, `opus_data` (rest of payload) |
 | 4 | `HostMigration` | `sender_id` u64 LE, `new_host_id` u64 LE (принимается только если `sender_id == new_host_id` и совпадает с NodeID соединения) |
-| 5 | `IrohSync` | `sender_id` u64 LE, `is_host` u8, `hops` u8 (0 — от самого узла, 1 — переслан хостом, дальше не релеится), `len` u16 LE, `node_id` UTF-8 |
+| 5 | `IrohSync` | `sender_id` u64 LE, `is_host` u8, `hops` u8 (0 — от самого узла, 1 — переслан хостом, дальше не релеится), `len` u16 LE, `node_id` UTF-8, `video_gen` u32 LE — номер трансляции (0 = не в эфире); поле в конце, старые парсеры его игнорируют, новый без него читает 0 |
 | 6 | `FriendRequest` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 7 | `FriendAccept` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 8 | `FriendRemove` | `sender_id` u64 LE, `node_id` str |
@@ -172,17 +175,39 @@ Annex-B H.264 payload:
 | 24 | u32 | payload length |
 | 28 | bytes | SPS/PPS (if flag 2), then H.264 |
 
-When a broadcast starts, `VideoLink::add_viewer` opens a connection to every
-peer already in the room; viewers accept automatically and the GUI opens the
-video window. Peers who join mid-stream are not subscribed yet.
+**Subscription protocol.** The connection opens the *viewer*, and only to a
+broadcast it has found in `VideoDirectory`. The first bidirectional stream is
+the control channel: viewer → `u8 kind=2, u32 gen`; publisher → `u8 kind=3,
+u8 status` (0 = accepted, 1 = not broadcasting / other gen), `u32 gen`. On 0 the
+publisher starts a send task on that connection; on 1 it closes it. The viewer
+closes its control send side right after subscribing, so the publisher detects
+its departure with `Connection::closed()`, not with EOF. A viewer whose control
+answer takes longer than 3 s retries no sooner than 2 s later.
 
-Stopping a broadcast must call `VideoLink::stop_viewers()` (the GUI does it in
-the same click that drops `self.video`). Each viewer connection lives inside a
-send task that selects on a `watch` stop signal; when it fires, the task ends and
-with it the QUIC connection. Without this every stop/start cycle left the old
-connections alive and added a fresh one per peer — pinned memory that grew with
-every restart, plus duplicated video traffic. `add_viewer` also de-duplicates by
-NodeID. On the receiving side a finished stream drops that sender's queued frames.
+The publisher announces `my_gen` in `IrohSync` (tag 5, `video_gen`, sent once a
+second); `VideoDirectory` keeps the announcements of neighbours with a 5 s TTL
+and `live(now)` returns `(node_id, gen)` pairs. The GUI takes the first live
+broadcast not its own and calls `VideoLink::sync_viewing(Some((node, gen)))`;
+`None` (no live broadcast, or `room.is_left()`) stops the subscription and clears
+the remote window. So a peer who joins the room mid-stream subscribes within
+about a second without any manual recipient picker.
+
+**Late joiners start from a keyframe.** `publish` always keeps a ring of the
+last 180 frames / 64 MiB (`Recent`), keyed by an in-memory `seq`, even when
+nobody is subscribed. `handoff()` creates the broadcast receiver and snapshots
+the ring from the last keyframe **under the same mutex `publish` uses**, so a
+new subscriber gets a gap-free chain; P-frames before the first keyframe are
+skipped (if the ring has no keyframe, the task waits for the next IDR). The
+broadcast capacity is 240 frames; after `Lagged` the task takes a fresh handoff
+instead of continuing from a P-frame. The wire frame format is unchanged.
+
+Stopping a broadcast calls `VideoLink::end_stream()` (gen 0, `stop_viewers()`,
+ring cleared); the GUI does it in the same click that drops `self.video` and in
+`leave_voice`. Each viewer connection lives inside a send task that selects on a
+`watch` stop signal; when it fires, the task ends and with it the QUIC
+connection — without this every stop/start cycle left the old connections alive
+and added a fresh one per peer. On the receiving side a finished stream drops
+that sender's queued frames and waits for a keyframe.
 
 ## Key implementation details & gotchas
 
@@ -340,7 +365,8 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   stream reads both channels of one card; profiles are `input1_profile` /
   `input2_profile` (0 — голос, 1 — инструмент, прочее отбрасывается). `opus_bitrate`
   is 64000, 96000 or 128000 (anything else is dropped). Per-peer volume
-  is stored as `peer_<id>_volume` keyed by the stable `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
+  is stored as `peer_<id>_volume` keyed by the stable `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60), viewer delay
+is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
   written on change with a 400 ms throttle, never on exit.
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
@@ -443,10 +469,17 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   `win_mf.rs` allocate a new `IMFSample` for every call. Reusing one persistent
   sample makes the Microsoft H.264 decoder fail every frame with
   `ProcessOutput: CopyDecodedFrame failed (0x80004005)`.
-- **Viewer queue is bounded:** `video_link.rs` holds at most 30 frames
-  (`MAX_QUEUE`); on overflow it drops the queue and waits for the next keyframe —
-  P-frames without their references decode to garbage. The GUI decodes at most
-  4 frames per update so one slow frame cannot stall the UI.
+- **The viewer shows frames on a delay (`video_buffer_ms`, default 2000).** Each
+  `RemoteFrame` carries `arrived: Instant`; `RemoteQueue::pop_due(buffer, now)`
+  releases the head only when `arrived + buffer <= now`. The queue is in display
+  order, so a frame that arrives 1.5 s late holds its successors instead of being
+  skipped — that is the whole point of the buffer: the network gets time to
+  deliver. `0` means "show at once", as before. The cap is
+  `buffer*fps + fps*2 + 30` frames (clamped to 96..600) and 96 MiB: it must cover
+  the buffer plus the join burst of a whole GOP, or the queue would clear itself
+  right after subscribing. On overflow the queue is dropped and the stream waits
+  for a keyframe — P-frames without their references decode to garbage. The GUI
+  decodes at most 4 frames per update so one slow frame cannot stall the UI.
 - **Display is capped at the stream's own fps** (`show_period` in `video_session.rs`,
   taken from `StreamInfo.fps` — 30 or 60): preview and remote stream still push every
   frame through the decoder (a skipped P-frame breaks the chain) but only show that
@@ -550,6 +583,14 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   pacing. The panel shows both numbers — "показ N · захват M FPS": a low *захват*
   means the capture/encode loop cannot keep up, a low *показ* with a healthy *захват*
   means the per-frame GPU readback + `bgra_to_image` + texture upload is the limit.
+- **Viewer buffer is a display deadline, not a sender-side delay.** `video_buffer_ms`
+  (slider in the «ЭКРАН» settings section, 0..5000 in 100 ms steps) is read every
+  frame by the GUI and passed to `VideoLink::set_buffer_ms`; `try_recv_due()` then
+  releases a frame only after it has sat in the queue that long. Changing it on the
+  fly applies to frames already queued (the deadline is evaluated at release). The
+  viewer toolbar shows it as «буфер N.N с». It is not a NACK/retransmission
+  mechanism — a frame lost in the network is skipped, the stream waits for the
+  next keyframe only when the queue overflows.
 - **Decoder output is 1088 rows** (height aligned to 16) and its UV plane starts
   below; `repack_nv12()` strips the padding to exactly w×h before upload.
 - **The Microsoft H.264 decoder MFT is synchronous** (no
