@@ -144,11 +144,12 @@ pub struct PeerMeter {
     pub peak: f32,
 }
 
-/// Профиль обработки входа: голосу нужны затвор и AGC, инструменту они вредят
-/// (AGC осаживает удары и «дышит» на затухающих нотах).
+/// Профиль обработки входа: голосу нужны шумодав, затвор и AGC, инструменту
+/// они вредят (AGC осаживает удары и «дышит» на затухающих нотах, RNNoise
+/// съедает хвосты идеально ровных нот).
 ///
-/// Профиль — только пресет для двух тумблеров: «Голос» включает затвор и AGC,
-/// «Инструмент» выключает оба. Если тумблеры выставлены вручную не парой,
+/// Профиль — только пресет для трёх тумблеров: «Голос» включает все три,
+/// «Инструмент» выключает все. Если тумблеры выставлены вручную не тройкой,
 /// профиль становится `Custom` — так в настройках видно, что пресет изменён.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotProfile {
@@ -178,25 +179,26 @@ impl SlotProfile {
         }
     }
 
-    /// Затвор и AGC — только для голоса: инструмент с затвором теряет
+    /// Эффекты — только для голоса: инструмент с затвором теряет
     /// затухающие ноты, а AGC выравнивает аккорды по громкости.
     pub fn uses_voice_dsp(self) -> bool {
         self == Self::Voice
     }
 
-    /// Пресет тумблеров: `Voice` — оба включены, `Instrument` — оба выключены.
-    pub fn effects(self) -> (bool, bool) {
+    /// Пресет тумблеров: `Voice` — все включены, `Instrument` — все выключены.
+    /// Порядок: (шумодав, затвор, AGC).
+    pub fn effects(self) -> (bool, bool, bool) {
         match self {
-            Self::Voice => (true, true),
-            Self::Instrument | Self::Custom => (false, false),
+            Self::Voice => (true, true, true),
+            Self::Instrument | Self::Custom => (false, false, false),
         }
     }
 
-    /// Профиль по состоянию тумблеров; `Custom` — когда они не пара.
-    pub fn from_effects(gate: bool, agc: bool) -> Self {
-        match (gate, agc) {
-            (true, true) => Self::Voice,
-            (false, false) => Self::Instrument,
+    /// Профиль по состоянию тумблеров; `Custom` — когда они не тройка.
+    pub fn from_effects(denoise: bool, gate: bool, agc: bool) -> Self {
+        match (denoise, gate, agc) {
+            (true, true, true) => Self::Voice,
+            (false, false, false) => Self::Instrument,
             _ => Self::Custom,
         }
     }
@@ -210,9 +212,11 @@ pub struct AudioMixer {
     ch2_volume: AtomicU32, // Вход 2
     input1_channel: AtomicU32,
     input2_channel: AtomicU32,
-    /// Эффекты входа 1: затвор и AGC — независимо друг от друга.
+    /// Эффекты входа 1: шумодав, затвор и AGC — независимо друг от друга.
+    input1_denoise: AtomicBool,
     input1_gate: AtomicBool,
     input1_agc: AtomicBool,
+    input2_denoise: AtomicBool,
     input2_gate: AtomicBool,
     input2_agc: AtomicBool,
     output_volume: AtomicU32,
@@ -251,8 +255,10 @@ impl AudioMixer {
             ch2_volume: AtomicU32::new(100),
             input1_channel: AtomicU32::new(0),
             input2_channel: AtomicU32::new(1),
+            input1_denoise: AtomicBool::new(false),
             input1_gate: AtomicBool::new(false),
             input1_agc: AtomicBool::new(false),
+            input2_denoise: AtomicBool::new(false),
             input2_gate: AtomicBool::new(false),
             input2_agc: AtomicBool::new(false),
             output_volume: AtomicU32::new(100),
@@ -292,6 +298,24 @@ impl AudioMixer {
 
     pub fn set_tx_limiter_enabled(&self, on: bool) {
         self.tx_limiter_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Шумодав RNNoise на входе 1: убирает клавиатуру, кулеры и улицу,
+    /// которые затвор пропускает вместе с речью.
+    pub fn input1_denoise(&self) -> bool {
+        self.input1_denoise.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input1_denoise(&self, on: bool) {
+        self.input1_denoise.store(on, Ordering::Relaxed);
+    }
+
+    pub fn input2_denoise(&self) -> bool {
+        self.input2_denoise.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input2_denoise(&self, on: bool) {
+        self.input2_denoise.store(on, Ordering::Relaxed);
     }
 
     pub fn input1_gate(&self) -> bool {
@@ -498,23 +522,25 @@ impl AudioMixer {
     /// Профиль Входа 1, выведенный из тумблеров: «Голос» (оба включены),
     /// «Инструмент» (оба выключены) или «Свой».
     pub fn input1_profile(&self) -> SlotProfile {
-        SlotProfile::from_effects(self.input1_gate(), self.input1_agc())
+        SlotProfile::from_effects(self.input1_denoise(), self.input1_gate(), self.input1_agc())
     }
 
-    /// Пресет: «Голос» включает затвор и AGC, «Инструмент» выключает оба.
+    /// Пресет: «Голос» включает шумодав, затвор и AGC, «Инструмент» выключает все.
     pub fn set_input1_profile(&self, profile: SlotProfile) {
-        let (gate, agc) = profile.effects();
+        let (denoise, gate, agc) = profile.effects();
+        self.set_input1_denoise(denoise);
         self.set_input1_gate(gate);
         self.set_input1_agc(agc);
     }
 
     /// Профиль Входа 2
     pub fn input2_profile(&self) -> SlotProfile {
-        SlotProfile::from_effects(self.input2_gate(), self.input2_agc())
+        SlotProfile::from_effects(self.input2_denoise(), self.input2_gate(), self.input2_agc())
     }
 
     pub fn set_input2_profile(&self, profile: SlotProfile) {
-        let (gate, agc) = profile.effects();
+        let (denoise, gate, agc) = profile.effects();
+        self.set_input2_denoise(denoise);
         self.set_input2_gate(gate);
         self.set_input2_agc(agc);
     }
@@ -602,8 +628,14 @@ mod tests {
     #[test]
     fn effects_off_by_default() {
         let m = AudioMixer::new();
-        assert!(!m.input1_gate() && !m.input1_agc(), "вход 1 должен быть сырым");
-        assert!(!m.input2_gate() && !m.input2_agc(), "вход 2 должен быть сырым");
+        assert!(
+            !m.input1_denoise() && !m.input1_gate() && !m.input1_agc(),
+            "вход 1 должен быть сырым"
+        );
+        assert!(
+            !m.input2_denoise() && !m.input2_gate() && !m.input2_agc(),
+            "вход 2 должен быть сырым"
+        );
         assert!(!m.is_tx_limiter_enabled(), "лимитер передачи должен быть выключен");
         assert!(!m.is_rx_limiter_enabled(), "лимитер приёма должен быть выключен");
         m.set_input1_gate(true);
@@ -640,7 +672,7 @@ mod tests {
         // По умолчанию эффекты выключены — профиль выходит «Инструмент».
         assert_eq!(m.input1_profile(), SlotProfile::Instrument);
         m.set_input1_profile(SlotProfile::Voice);
-        assert!(m.input1_gate() && m.input1_agc());
+        assert!(m.input1_denoise() && m.input1_gate() && m.input1_agc());
         assert_eq!(m.input1_profile(), SlotProfile::Voice);
         m.set_input2_profile(SlotProfile::Voice);
         assert_eq!(m.input2_profile(), SlotProfile::Voice);
@@ -649,7 +681,7 @@ mod tests {
         assert_eq!(m.input1_profile(), SlotProfile::Custom);
         assert_eq!(m.input1_profile().label(), "Свой");
         m.set_input1_profile(SlotProfile::Instrument);
-        assert!(!m.input1_gate() && !m.input1_agc());
+        assert!(!m.input1_denoise() && !m.input1_gate() && !m.input1_agc());
         // Мусор в конфиге не должен давать произвольного профиля.
         assert_eq!(SlotProfile::from_u32(42), SlotProfile::Voice);
         assert_eq!(SlotProfile::from_u32(2), SlotProfile::Custom);

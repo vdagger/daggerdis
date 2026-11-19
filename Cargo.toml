@@ -9,6 +9,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 cpal = "0.15"
 rusty-opus = "1.0"
+# RNNoise на чистом Rust: шумодав с обученной моделью, кадр 10 мс при 48 кГц
+# (две половины нашего кадра 20 мс), без C-зависимостей и сборки биндингов
+nnnoiseless = "0.5"
 egui = "0.28"
 # renderer wgpu — запасной путь для машин без OpenGL 2.0 (виртуалки, RDP):
 # включается переменной ALBUS_RENDERER=wgpu, по умолчанию остаётся glow

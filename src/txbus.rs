@@ -8,7 +8,7 @@
 //!
 //! Из аудио-колбэка нельзя блокироваться: `push` берёт мьютекс слота на время
 //! записи и будит воркер через `try_send`. Энкодер, лимитер и пер-слотовые
-//! гейт/AGC живут только в воркере — две карты никогда не кодируют параллельно.
+//! шумодав/гейт/AGC живут только в воркере — две карты никогда не кодируют параллельно.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,6 +17,11 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::mixer::{AudioMixer, Limiter, TransmitAgc};
+
+/// Кадр RNNoise: 10 мс при 48 кГц — половина нашего кадра 20 мс.
+const DENOISE_FRAME: usize = nnnoiseless::DenoiseState::FRAME_SIZE;
+/// RNNoise работает не с −1..1, а с масштабом i16.
+const RNNOISE_SCALE: f32 = 32_768.0;
 
 /// Длина кадра Opus: 20 мс при 48 кГц.
 pub const FRAME: usize = 960;
@@ -245,6 +250,10 @@ fn spawn_worker(
 pub(crate) struct TxWorker {
     encoder: rusty_opus::OpusEncoder,
     limiter: Limiter,
+    /// Состояние шумодава на слот. Создаётся при первом включённом кадре:
+    /// у выключенного тумблера нет ни модели в памяти, ни старого состояния
+    /// после повторного включения.
+    denoisers: [Option<Box<nnnoiseless::DenoiseState<'static>>>; 2],
     agcs: [TransmitAgc; 2],
     gates: [f32; 2],
     /// Текущий битрейт энкодера — чтобы не переписывать его каждый кадр.
@@ -263,6 +272,7 @@ impl TxWorker {
         Ok(Self {
             encoder,
             limiter: Limiter::new(48_000),
+            denoisers: [None, None],
             agcs: [TransmitAgc::new(), TransmitAgc::new()],
             gates: [0.0, 0.0],
             bitrate: 64_000,
@@ -285,10 +295,20 @@ impl TxWorker {
         let mut contributing = 0u32;
 
         for slot in 0..2 {
-            let (gain, gate, agc) = if slot == 0 {
-                (mixer.ch1_volume(), mixer.input1_gate(), mixer.input1_agc())
+            let (gain, denoise, gate, agc) = if slot == 0 {
+                (
+                    mixer.ch1_volume(),
+                    mixer.input1_denoise(),
+                    mixer.input1_gate(),
+                    mixer.input1_agc(),
+                )
             } else {
-                (mixer.ch2_volume(), mixer.input2_gate(), mixer.input2_agc())
+                (
+                    mixer.ch2_volume(),
+                    mixer.input2_denoise(),
+                    mixer.input2_gate(),
+                    mixer.input2_agc(),
+                )
             };
 
             if !bus.take(slot, &mut self.slot_buf) {
@@ -321,6 +341,12 @@ impl TxWorker {
                 self.have_held[slot] = true;
             }
 
+            if denoise {
+                self.denoise(slot);
+            } else if self.denoisers[slot].is_some() {
+                // Тумблер выключили: модель и состояние воркера не держим.
+                self.denoisers[slot] = None;
+            }
             if gate || agc {
                 self.apply_effects(slot, gate, agc);
             }
@@ -368,6 +394,34 @@ impl TxWorker {
         match self.encoder.encode(&self.mixed, FRAME, &mut self.packet_buf) {
             Ok(len) => Some(self.packet_buf[..len].to_vec()),
             Err(_) => None,
+        }
+    }
+
+    /// Шумодав RNNoise: обученная модель отличает речь от ровного шума
+    /// (клавиатура, кулеры, улица) и гасит шум, не трогая голос — то, чего
+    /// не умеет затвор, который пропускает шум вместе с речью.
+    ///
+    /// Кадр шумодава вдвое короче нашего (10 мс), поэтому буфер режется на два
+    /// куска. Сэмплы — в масштабе i16: модель обучена на нём, в −1..1 она
+    /// работала бы с сигналом на 90 дБ тише и не распознала бы ни речи, ни шума.
+    fn denoise(&mut self, slot: usize) {
+        let state = self.denoisers[slot].get_or_insert_with(nnnoiseless::DenoiseState::new);
+        let mut input = [0.0f32; DENOISE_FRAME];
+        let mut output = [0.0f32; DENOISE_FRAME];
+        for chunk in self.slot_buf.chunks_mut(DENOISE_FRAME) {
+            // Неполного хвоста быть не может: 960 кратно 480. Если появится
+            // (сменили длину кадра), честнее оставить хвост без обработки,
+            // чем докормить модель нулями и получить «щелчок».
+            if chunk.len() < DENOISE_FRAME {
+                break;
+            }
+            for (dst, &src) in input.iter_mut().zip(chunk.iter()) {
+                *dst = src * RNNOISE_SCALE;
+            }
+            state.process_frame(&mut output, &input);
+            for (dst, &src) in chunk.iter_mut().zip(output.iter()) {
+                *dst = src / RNNOISE_SCALE;
+            }
         }
     }
 
@@ -565,6 +619,56 @@ mod tests {
         bus.push(0, bus.epoch(0), &vec![0.002; FRAME]);
         w.render_frame(&bus, &mixer, false);
         assert!((monitor(&mixer)[0] - 0.002).abs() < 1e-5);
+    }
+
+    /// Ровный «шум»: детерминированный LCG в диапазоне −амплитуда..амплитуда.
+    fn noise_frame(amp: f32, mut seed: u32) -> Vec<f32> {
+        (0..FRAME)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 8) as f32 / 16_777_215.0 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    fn rms(buf: &[f32]) -> f32 {
+        (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn denoise_off_is_passthrough() {
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        let frame = noise_frame(0.1, 7);
+        bus.push(0, bus.epoch(0), &frame);
+        w.render_frame(&bus, &mixer, false);
+        let out = monitor(&mixer);
+        for (a, b) in out.iter().zip(frame.iter()) {
+            assert!((a - b).abs() < 1e-6, "без шумодава сэмплы меняться не должны");
+        }
+    }
+
+    #[test]
+    fn denoise_suppresses_steady_noise() {
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        mixer.set_input1_denoise(true);
+        let input = noise_frame(0.03, 1);
+        let input_rms = rms(&input);
+        let mut out = Vec::new();
+        // Модели нужно несколько кадров, чтобы обучиться на шуме.
+        for _ in 0..30 {
+            bus.push(0, bus.epoch(0), &input);
+            w.render_frame(&bus, &mixer, false);
+            out = monitor(&mixer);
+        }
+        let out_rms = rms(&out);
+        assert!(
+            out_rms < input_rms * 0.6,
+            "шумодав не погасил ровный шум: вход {input_rms}, выход {out_rms}"
+        );
     }
 
     #[test]

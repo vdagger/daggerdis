@@ -1980,12 +1980,16 @@ impl RadioApp {
             changed = true;
         }
         for (key, value) in [
+            ("input1_denoise", self.mixer.input1_denoise()),
+            ("input2_denoise", self.mixer.input2_denoise()),
             ("input1_gate", self.mixer.input1_gate()),
             ("input1_agc", self.mixer.input1_agc()),
             ("input2_gate", self.mixer.input2_gate()),
             ("input2_agc", self.mixer.input2_agc()),
         ] {
             let slot = match key {
+                "input1_denoise" => &mut self.config.input1_denoise,
+                "input2_denoise" => &mut self.config.input2_denoise,
                 "input1_gate" => &mut self.config.input1_gate,
                 "input1_agc" => &mut self.config.input1_agc,
                 "input2_gate" => &mut self.config.input2_gate,
@@ -2022,8 +2026,10 @@ impl RadioApp {
         // Старый общий тумблер — «есть ли хоть один эффект»: так его поймёт
         // exe прежней версии, а наш загрузчик его проигнорирует, если есть
         // новые ключи.
-        let legacy_dsp = self.mixer.input1_gate()
+        let legacy_dsp = self.mixer.input1_denoise()
+            || self.mixer.input1_gate()
             || self.mixer.input1_agc()
+            || self.mixer.input2_denoise()
             || self.mixer.input2_gate()
             || self.mixer.input2_agc();
         if self.config.mic_processing != Some(legacy_dsp) {

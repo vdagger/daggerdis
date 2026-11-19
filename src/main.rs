@@ -126,8 +126,10 @@ fn main() {
         config.input2_profile,
         albus::mixer::SlotProfile::Instrument,
     );
+    mixer.set_input1_denoise(config.input1_denoise.unwrap_or(voice1));
     mixer.set_input1_gate(config.input1_gate.unwrap_or(voice1));
     mixer.set_input1_agc(config.input1_agc.unwrap_or(voice1));
+    mixer.set_input2_denoise(config.input2_denoise.unwrap_or(voice2));
     mixer.set_input2_gate(config.input2_gate.unwrap_or(voice2));
     mixer.set_input2_agc(config.input2_agc.unwrap_or(voice2));
     mixer.set_tx_limiter_enabled(config.tx_limiter.unwrap_or(legacy_dsp));

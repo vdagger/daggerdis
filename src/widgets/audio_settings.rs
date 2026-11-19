@@ -57,6 +57,8 @@ pub fn draw_audio_settings(
     ui.add_space(4.0);
     effect_switches(
         ui,
+        mixer.input1_denoise(),
+        |v| mixer.set_input1_denoise(v),
         mixer.input1_gate(),
         |v| mixer.set_input1_gate(v),
         mixer.input1_agc(),
@@ -128,6 +130,8 @@ pub fn draw_audio_settings(
     ui.add_space(4.0);
     effect_switches(
         ui,
+        mixer.input2_denoise(),
+        |v| mixer.set_input2_denoise(v),
         mixer.input2_gate(),
         |v| mixer.set_input2_gate(v),
         mixer.input2_agc(),
@@ -335,7 +339,7 @@ pub fn draw_audio_settings(
     );
 }
 
-/// Пресеты эффектов: «Голос» включает затвор и AGC, «Инструмент» — выключает.
+/// Пресеты эффектов: «Голос» включает шумодав, затвор и AGC, «Инструмент» — выключает все.
 /// После ручной правки тумблеров ниже не подсвечен ни один — профиль «Свой».
 fn profile_chips(
     ui: &mut egui::Ui,
@@ -360,14 +364,36 @@ fn profile_chips(
     });
 }
 
-/// Тумблеры эффектов одного входа: затвор и AGC включаются независимо.
+/// Тумблеры эффектов одного входа: шумодав, затвор и AGC включаются
+/// независимо. Шумодав — отдельной строкой: в одну строку с остальными
+/// подписи не помещаются в узкую колонку настроек.
 fn effect_switches(
     ui: &mut egui::Ui,
+    denoise: bool,
+    set_denoise: impl Fn(bool),
     gate: bool,
     set_gate: impl Fn(bool),
     agc: bool,
     set_agc: impl Fn(bool),
 ) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Шумодав")
+                .size(10.5)
+                .color(t::TEXT_MUTED),
+        );
+        let mut on = denoise;
+        if t::switch(ui, &mut on).changed() {
+            set_denoise(on);
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("RNNoise")
+                .size(9.5)
+                .color(t::TEXT_MUTED),
+        );
+    });
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Затвор")
