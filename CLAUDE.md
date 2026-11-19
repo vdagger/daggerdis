@@ -54,8 +54,10 @@ normal terminal triggers a UAC prompt.
    still runs GUI-only and shows an error banner (`RadioApp.network_error`).
 4. `config::AppConfig::load()` + `friends::FriendsManager::load()` (friends.json).
 5. `RoomManager`, `AudioMixer`, `UniversalAudioCapture`, `MigrationManager`.
-   Mixer levels/channels, PTT key and hands-free come from config; mic/playback streams
-   open the saved devices by name (fallback: system default). Per-peer volumes restored.
+   Mixer levels/channels/profiles, PTT key and hands-free come from config; mic/playback
+   streams open the saved devices by name (fallback: system default). Per-peer volumes
+   restored. If `input2_device` names a different card, two input streams open
+   (`[true,false]` and `[false,true]` slots); otherwise one stream fills both slots.
 6. Two mpsc channels:
    - `packet_tx/rx: Vec<u8>` — outbound encoded voice.
    - `playback_tx/rx: (u64, u32, Vec<u8>)` — inbound `(sender_id, seq, opus)`.
@@ -89,10 +91,11 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), переходы под одним замком, проверка `call_id` в Accept/Decline/Cancel/End, приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
-| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, Opus, опциональные noise gate + AGC + лимитер (по умолчанию выкл.), per-peer mix bus |
+| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, per-peer mix bus. Вход пишет сэмплы своего устройства в слоты `txbus`; Opus-энкодера и DSP в колбэке больше нет |
+| `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), профили «Голос/Инструмент», лимитер, монитор, Opus 64 кбит/с |
 | `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, тумблеры `dsp_enabled`/`rx_limiter_enabled` — оба по умолчанию выкл.), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
-| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume, `video_fps`, `mic_processing`, `rx_limiter`) |
+| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, профили `input1_profile`/`input2_profile`, nick, per-peer volume, `video_fps`, `mic_processing`, `rx_limiter`) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule for the current exe — идемпотентно (лишние одноимённые записи чистятся) |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
@@ -239,10 +242,30 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   `rx_limiter=1` в `config.ini`). Причина: у одного из собеседников тракт
   загонял тихую речь в гейт и AGC, и его почти не было слышно, хотя обратный
   канал звучал нормально. Сырой микрофон честнее; обработку включают по желанию.
-- **DSP chain, передача (при включённой обработке):** noise gate (−44 dBFS) →
-  linear resampler (`resample_linear`, preserves pitch across any card rate, работает
-  всегда) → `TransmitAgc` (цель −20 dBFS RMS, усиление −12…+24 дБ) → `Limiter`
-  (−1 dBFS) → Opus 64 kbps. Выключена — в Opus идёт сигнал после ресэмплера и мьюта.
+- **DSP chain, передача (при включённой обработке):** linear resampler
+  (`resample_linear`, preserves pitch across any card rate, работает всегда, у
+  каждого входа свой `resample_pos`) → для профиля «Голос» noise gate (−44 dBFS)
+  → `TransmitAgc` (цель −20 dBFS RMS, усиление −12…+24 дБ) → сумма входов,
+  нормированная по числу звучащих → `Limiter` (−1 dBFS) → Opus 64 kbps.
+  Инструмент идёт без гейта и AGC. Выключена — в Opus идёт сигнал после
+  ресэмплера, суммы и мьюта, без лимитера.
+- **Один энкодер и один поток кадров на оба входа (`src/txbus.rs`).** Каждый
+  аудиоколбэк только читает свой канал, применяет громкость слота, ресэмплит в
+  48 кГц и кладёт сэмплы в кольцо на 4800 сэмплов (`try_send` в notify и
+  `into_inner()`-локи — из колбэка ничего блокирующего). Поток `albus-tx` по
+  абсолютному дедлайну раз в 20 мс забирает по 960 сэмплов на слот, недобор
+  добивает последним сэмплом (нули посреди сигнала слышны щелчком), пустой слот
+  — тишина. Почему не энкодер в колбэке: у двух карт свои часы, кадр запускался
+  бы не по фазе, а AGC адаптировался бы с произвольной частотой.
+- **Канал входа — «выключен», если вне диапазона.** `u32::MAX` = выключен, и
+  индекс вне числа каналов тоже считается выключенным, без отката на канал 0:
+  иначе моно-микрофон попал бы в обе дорожки. Эпоха (`InputBus::epoch`) на слот
+  отсекает колбэк старого потока после горячей смены устройства; новый поток
+  собирается с `next_epochs` и применяется только после успешной сборки
+  (`commit_epochs`), чтобы неудачная попытка не оставляла без звука рабочий вход.
+  Второй вход не откатывается на устройство по умолчанию: в инструмент молча
+  пошёл бы микрофон. Слот без сэмплов дольше 250 мс гасит VU и молчит — выход
+  карты из строя не делает первый вход вдвое тише.
 - **DSP chain, приём:** миксовый `Limiter` тоже опционален (`rx_limiter`).
   `Limiter` на каждый голос **не ставится** — персональная
   громкость (слайдер в дБ, −30…+18) умножается на декодированный буфер, голоса
@@ -259,9 +282,9 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   и в мониторинге это слышалось как «громко, затем резко тише».
   Огибающая RMS захватывается быстро (0.8), отпускает медленно (0.1).
 - **Прослушивание своего тракта (self-monitor):** тумблер «Слышать свой тракт» в
-  настройках звука. В `AudioMixer.monitor_buf` кладётся звук **после** гейта, AGC и
-  лимитера — то есть ровно то, что уйдёт в Opus, но до нарезки на кадры, поэтому
-  прослушивание не зависит от PTT. В колбэке воспроизведения он подмешивается к
+  настройках звука. В `AudioMixer.monitor_buf` кладётся каждый собранный кадр
+  (`txbus`) — то есть ровно то, что уйдёт в Opus: после гейта/AGC профиля,
+  суммы и лимитера, поэтому прослушивание не зависит от PTT. В колбэке воспроизведения он подмешивается к
   миксу **после** master gain (уровень монитора не зависит от громкости собеседников)
   и **до** миксового лимитера, с ресэмплингом 48 кГц → частота карты. Буфер ограничен
   400 мс, при включении чистится. Состояние сессионное, в `config.ini` не пишется.
@@ -275,8 +298,10 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   fullscreen games / minimized window.
 - **Settings persistence:** `src/config.rs` reads/writes `%APPDATA%\Albus\config.ini`
   (plain `key=value`; a broken file is ignored). Devices are matched by **name** (cpal
-  indices shift). Per-peer volume is stored as `peer_<id>_volume` keyed by the stable
-  `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
+  indices shift). `input2_device` missing, empty or equal to `input_device` means one
+  stream reads both channels of one card; profiles are `input1_profile` /
+  `input2_profile` (0 — голос, 1 — инструмент, прочее отбрасывается). Per-peer volume
+  is stored as `peer_<id>_volume` keyed by the stable `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
   written on change with a 400 ms throttle, never on exit.
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
