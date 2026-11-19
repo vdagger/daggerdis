@@ -27,6 +27,9 @@ pub struct AppConfig {
     /// Шумодав RNNoise на входе (отдельный от затвора и AGC).
     pub input1_denoise: Option<bool>,
     pub input2_denoise: Option<bool>,
+    /// Эхо-подавление AEC3 на входе — независимо от профилей.
+    pub input1_aec: Option<bool>,
+    pub input2_aec: Option<bool>,
     /// Эффекты каждого входа: затвор и AGC включаются независимо.
     pub input1_gate: Option<bool>,
     pub input1_agc: Option<bool>,
@@ -124,6 +127,8 @@ impl AppConfig {
                 "input2_profile" => cfg.input2_profile = value.parse().ok().filter(|v| *v <= 1),
                 "input1_denoise" => cfg.input1_denoise = value.parse().ok(),
                 "input2_denoise" => cfg.input2_denoise = value.parse().ok(),
+                "input1_aec" => cfg.input1_aec = value.parse().ok(),
+                "input2_aec" => cfg.input2_aec = value.parse().ok(),
                 "input1_gate" => cfg.input1_gate = value.parse().ok(),
                 "input1_agc" => cfg.input1_agc = value.parse().ok(),
                 "input2_gate" => cfg.input2_gate = value.parse().ok(),
@@ -183,6 +188,8 @@ impl AppConfig {
         for (key, value) in [
             ("input1_denoise", self.input1_denoise),
             ("input2_denoise", self.input2_denoise),
+            ("input1_aec", self.input1_aec),
+            ("input2_aec", self.input2_aec),
             ("input1_gate", self.input1_gate),
             ("input1_agc", self.input1_agc),
             ("input2_gate", self.input2_gate),
@@ -276,10 +283,12 @@ mod tests {
     #[test]
     fn effect_keys_roundtrip() {
         let cfg = AppConfig::parse(
-            "input1_gate=true\ninput1_agc=false\ninput2_gate=true\ntx_limiter=true\ninput2_agc=yes\ninput1_denoise=true\ninput2_denoise=false\n",
+            "input1_gate=true\ninput1_agc=false\ninput2_gate=true\ntx_limiter=true\ninput2_agc=yes\ninput1_denoise=true\ninput2_denoise=false\ninput1_aec=true\ninput2_aec=false\n",
         );
         assert_eq!(cfg.input1_denoise, Some(true));
         assert_eq!(cfg.input2_denoise, Some(false));
+        assert_eq!(cfg.input1_aec, Some(true));
+        assert_eq!(cfg.input2_aec, Some(false));
         assert_eq!(cfg.input1_gate, Some(true));
         assert_eq!(cfg.input1_agc, Some(false));
         assert_eq!(cfg.input2_gate, Some(true));
@@ -288,6 +297,8 @@ mod tests {
         let again = AppConfig::parse(&cfg.to_text());
         assert_eq!(again.input1_denoise, cfg.input1_denoise);
         assert_eq!(again.input2_denoise, cfg.input2_denoise);
+        assert_eq!(again.input1_aec, cfg.input1_aec);
+        assert_eq!(again.input2_aec, cfg.input2_aec);
         assert_eq!(again.input1_gate, cfg.input1_gate);
         assert_eq!(again.input1_agc, cfg.input1_agc);
         assert_eq!(again.input2_gate, cfg.input2_gate);

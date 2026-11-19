@@ -132,6 +132,10 @@ fn main() {
     mixer.set_input2_denoise(config.input2_denoise.unwrap_or(voice2));
     mixer.set_input2_gate(config.input2_gate.unwrap_or(voice2));
     mixer.set_input2_agc(config.input2_agc.unwrap_or(voice2));
+    // Эхо-подавление — не часть профилей и старый конфиг о нём не знал:
+    // по умолчанию выключено.
+    mixer.set_input1_aec(config.input1_aec.unwrap_or(false));
+    mixer.set_input2_aec(config.input2_aec.unwrap_or(false));
     mixer.set_tx_limiter_enabled(config.tx_limiter.unwrap_or(legacy_dsp));
     mixer.set_rx_limiter_enabled(config.rx_limiter.unwrap_or(false));
     if let Some(vk) = config.ptt_vk {

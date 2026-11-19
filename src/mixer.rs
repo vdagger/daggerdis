@@ -219,6 +219,10 @@ pub struct AudioMixer {
     input2_denoise: AtomicBool,
     input2_gate: AtomicBool,
     input2_agc: AtomicBool,
+    /// Эхо-подавление AEC3 на входе — отдельный тумблер, не часть профилей:
+    /// нужен только тем, кто слушает собеседников в колонках.
+    input1_aec: AtomicBool,
+    input2_aec: AtomicBool,
     output_volume: AtomicU32,
     input1_peak: AtomicU32,
     input2_peak: AtomicU32,
@@ -228,6 +232,9 @@ pub struct AudioMixer {
     monitor_enabled: AtomicBool,
     /// Обработанный звук своего тракта (48 кГц), ждущий вывода в динамики
     monitor_buf: Mutex<VecDeque<f32>>,
+    /// Опорный сигнал эхо-подавления (48 кГц): то, что реально уходит
+    /// в динамики из голосов собеседников. Монитор и гудок сюда не входят.
+    echo_ref: Mutex<VecDeque<f32>>,
     /// Гудок звонка: 0 — тихо, 1 — входящий, 2 — «звоним…»
     ring_mode: AtomicU32,
     /// Лимитер на передаваемом миксе. Раньше он жил под общим тумблером
@@ -261,6 +268,8 @@ impl AudioMixer {
             input2_denoise: AtomicBool::new(false),
             input2_gate: AtomicBool::new(false),
             input2_agc: AtomicBool::new(false),
+            input1_aec: AtomicBool::new(false),
+            input2_aec: AtomicBool::new(false),
             output_volume: AtomicU32::new(100),
             input1_peak: AtomicU32::new(0),
             input2_peak: AtomicU32::new(0),
@@ -268,6 +277,7 @@ impl AudioMixer {
             peer_meters: Mutex::new(HashMap::new()),
             monitor_enabled: AtomicBool::new(false),
             monitor_buf: Mutex::new(VecDeque::new()),
+            echo_ref: Mutex::new(VecDeque::new()),
             ring_mode: AtomicU32::new(0),
             tx_limiter_enabled: AtomicBool::new(false),
             rx_limiter_enabled: AtomicBool::new(false),
@@ -348,6 +358,55 @@ impl AudioMixer {
 
     pub fn set_input2_agc(&self, on: bool) {
         self.input2_agc.store(on, Ordering::Relaxed);
+    }
+
+    /// Эхо-подавление на входе 1: вычитает из микрофона голос собеседников,
+    /// который слышат колонки.
+    pub fn input1_aec(&self) -> bool {
+        self.input1_aec.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input1_aec(&self, on: bool) {
+        self.input1_aec.store(on, Ordering::Relaxed);
+    }
+
+    pub fn input2_aec(&self) -> bool {
+        self.input2_aec.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input2_aec(&self, on: bool) {
+        self.input2_aec.store(on, Ordering::Relaxed);
+    }
+
+    /// Кладёт кусок опоры эхо-подавления (48 кГц) из колбэка вывода.
+    /// Сэмплы за пределами −1..1 и NaN/бесконечность недопустимы для AEC3,
+    /// поэтому приводим их здесь, а не в воркере передачи.
+    pub fn push_echo_ref(&self, samples: &[f32]) {
+        if let Ok(mut buf) = self.echo_ref.lock() {
+            buf.extend(samples.iter().map(|s| {
+                if s.is_finite() {
+                    s.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            }));
+            // Полсекунды: при отставании воркера старое выкидывается, а не копится.
+            const CAP: usize = 48_000 / 2;
+            while buf.len() > CAP {
+                buf.pop_front();
+            }
+        }
+    }
+
+    /// Забирает опору на кадр передачи; недобор добивается нулями.
+    pub fn drain_echo_ref(&self, out: &mut [f32]) {
+        out.fill(0.0);
+        if let Ok(mut buf) = self.echo_ref.lock() {
+            let n = out.len().min(buf.len());
+            for (dst, src) in out.iter_mut().zip(buf.drain(..n)) {
+                *dst = src;
+            }
+        }
     }
 
     /// Включён ли лимитер на общем миксе собеседников
@@ -636,6 +695,10 @@ mod tests {
             !m.input2_denoise() && !m.input2_gate() && !m.input2_agc(),
             "вход 2 должен быть сырым"
         );
+        assert!(
+            !m.input1_aec() && !m.input2_aec(),
+            "эхо-подавление по умолчанию выключено"
+        );
         assert!(!m.is_tx_limiter_enabled(), "лимитер передачи должен быть выключен");
         assert!(!m.is_rx_limiter_enabled(), "лимитер приёма должен быть выключен");
         m.set_input1_gate(true);
@@ -667,6 +730,25 @@ mod tests {
     }
 
     #[test]
+    fn echo_ref_clamps_and_pads_with_zeros() {
+        let m = AudioMixer::new();
+        // AEC3 принимает только конечные сэмплы в −1..1: обрезаем здесь.
+        m.push_echo_ref(&[0.5, 2.0, f32::NAN, -1.5]);
+        let mut out = [9.0f32; 6];
+        m.drain_echo_ref(&mut out);
+        assert_eq!(&out[..4], &[0.5, 1.0, 0.0, -1.0]);
+        assert_eq!(&out[4..], &[0.0, 0.0], "недобор — тишина");
+    }
+
+    #[test]
+    fn echo_ref_ring_is_bounded() {
+        let m = AudioMixer::new();
+        m.push_echo_ref(&vec![0.1; 60_000]);
+        let len = m.echo_ref.lock().unwrap().len();
+        assert_eq!(len, 48_000 / 2, "старое выкидывается, а не копится");
+    }
+
+    #[test]
     fn profile_presets_and_custom() {
         let m = AudioMixer::new();
         // По умолчанию эффекты выключены — профиль выходит «Инструмент».
@@ -680,8 +762,13 @@ mod tests {
         m.set_input1_agc(false);
         assert_eq!(m.input1_profile(), SlotProfile::Custom);
         assert_eq!(m.input1_profile().label(), "Свой");
+        m.set_input1_aec(true);
         m.set_input1_profile(SlotProfile::Instrument);
         assert!(!m.input1_denoise() && !m.input1_gate() && !m.input1_agc());
+        assert!(
+            m.input1_aec(),
+            "пресеты эффектов не должны трогать эхо-подавление"
+        );
         // Мусор в конфиге не должен давать произвольного профиля.
         assert_eq!(SlotProfile::from_u32(42), SlotProfile::Voice);
         assert_eq!(SlotProfile::from_u32(2), SlotProfile::Custom);

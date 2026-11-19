@@ -106,6 +106,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "aec3_rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8a4b7329e7ba2f4c6cd8654fbcb2845663bdf188d7855e6b994bde82de9df80"
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -156,6 +162,7 @@ dependencies = [
 name = "albus"
 version = "0.1.0"
 dependencies = [
+ "aec3_rs",
  "bytes",
  "cpal",
  "eframe",

@@ -411,6 +411,8 @@ impl UniversalAudioCapture {
         // монитор своего тракта приходит на 48 кГц, карта может быть другой
         let mut monitor_in: Vec<f32> = Vec::new();
         let mut monitor_pos: f64 = 0.0;
+        // позиция ресэмплера опоры эха (карта не на 48 кГц)
+        let mut echo_pos: f64 = 0.0;
         // гудок звонка синтезируется прямо в колбэке: без файлов и без задержки
         let mut ring_t: f64 = 0.0;
         let mut last_ring_mode: u32 = 0;
@@ -595,6 +597,18 @@ impl UniversalAudioCapture {
                 let master_gain = mixer.master_gain();
                 for sample in out_scratch.iter_mut() {
                     *sample *= master_gain;
+                }
+
+                // Опора эхо-подавления — ровно то, что услышат колонки из
+                // голосов собеседников. Монитор и гудок сюда не входят: свой
+                // голос из микрофона вычитать нельзя. AEC3 работает на 48 кГц,
+                // поэтому карту на другой частоте приводим здесь же.
+                if sample_rate != 48000 {
+                    let ref48 =
+                        resample_linear(&out_scratch, sample_rate, 48000, &mut echo_pos);
+                    mixer.push_echo_ref(&ref48);
+                } else {
+                    mixer.push_echo_ref(&out_scratch);
                 }
 
                 // Свой тракт подмешивается после общей громкости: его уровень

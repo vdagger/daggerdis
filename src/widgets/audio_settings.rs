@@ -63,6 +63,8 @@ pub fn draw_audio_settings(
         |v| mixer.set_input1_gate(v),
         mixer.input1_agc(),
         |v| mixer.set_input1_agc(v),
+        mixer.input1_aec(),
+        |v| mixer.set_input1_aec(v),
     );
 
     ui.add_space(6.0);
@@ -136,6 +138,8 @@ pub fn draw_audio_settings(
         |v| mixer.set_input2_gate(v),
         mixer.input2_agc(),
         |v| mixer.set_input2_agc(v),
+        mixer.input2_aec(),
+        |v| mixer.set_input2_aec(v),
     );
 
     ui.add_space(6.0);
@@ -375,6 +379,8 @@ fn effect_switches(
     set_gate: impl Fn(bool),
     agc: bool,
     set_agc: impl Fn(bool),
+    aec: bool,
+    set_aec: impl Fn(bool),
 ) {
     ui.horizontal(|ui| {
         ui.label(
@@ -410,6 +416,24 @@ fn effect_switches(
         if t::switch(ui, &mut on).changed() {
             set_agc(on);
         }
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Эхо")
+                .size(10.5)
+                .color(t::TEXT_MUTED),
+        );
+        let mut on = aec;
+        if t::switch(ui, &mut on).changed() {
+            set_aec(on);
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("AEC — для колонок")
+                .size(9.5)
+                .color(t::TEXT_MUTED),
+        );
     });
 }
 

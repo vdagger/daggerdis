@@ -22,6 +22,8 @@ use crate::mixer::{AudioMixer, Limiter, TransmitAgc};
 const DENOISE_FRAME: usize = nnnoiseless::DenoiseState::FRAME_SIZE;
 /// RNNoise работает не с −1..1, а с масштабом i16.
 const RNNOISE_SCALE: f32 = 32_768.0;
+/// Кадр AEC3: 10 мс при 48 кГц — как у шумодава, половина нашего.
+const AEC_FRAME: usize = aec3_rs::FRAME_SIZE;
 
 /// Длина кадра Opus: 20 мс при 48 кГц.
 pub const FRAME: usize = 960;
@@ -254,6 +256,14 @@ pub(crate) struct TxWorker {
     /// у выключенного тумблера нет ни модели в памяти, ни старого состояния
     /// после повторного включения.
     denoisers: [Option<Box<nnnoiseless::DenoiseState<'static>>>; 2],
+    /// Эхо-подавление на слот. Создаётся при первом включённом кадре и
+    /// выбрасывается при выключении тумблера — состояние AEC3 не «протухает».
+    aec: [Option<Box<aec3_rs::EchoCanceller>>; 2],
+    /// Громкость входа на прошлом кадре: AEC3 просит пометить её изменение.
+    aec_last_gain: [u32; 2],
+    aec_failed: [bool; 2],
+    /// Кадр опоры (голоса собеседников) на текущий тик, 960 сэмплов.
+    ref_buf: Vec<f32>,
     agcs: [TransmitAgc; 2],
     gates: [f32; 2],
     /// Текущий битрейт энкодера — чтобы не переписывать его каждый кадр.
@@ -273,6 +283,10 @@ impl TxWorker {
             encoder,
             limiter: Limiter::new(48_000),
             denoisers: [None, None],
+            aec: [None, None],
+            aec_last_gain: [0, 0],
+            aec_failed: [false, false],
+            ref_buf: vec![0.0; FRAME],
             agcs: [TransmitAgc::new(), TransmitAgc::new()],
             gates: [0.0, 0.0],
             bitrate: 64_000,
@@ -294,13 +308,19 @@ impl TxWorker {
         self.mixed.resize(FRAME, 0.0);
         let mut contributing = 0u32;
 
+        // Опора эхо-подавления — общая на оба входа. Забираем каждый тик,
+        // даже когда AEC выключен: иначе при включении в кольце лежал бы
+        // старый хвост и фильтр искал бы задержку заново.
+        mixer.drain_echo_ref(&mut self.ref_buf);
+
         for slot in 0..2 {
-            let (gain, denoise, gate, agc) = if slot == 0 {
+            let (gain, denoise, gate, agc, aec) = if slot == 0 {
                 (
                     mixer.ch1_volume(),
                     mixer.input1_denoise(),
                     mixer.input1_gate(),
                     mixer.input1_agc(),
+                    mixer.input1_aec(),
                 )
             } else {
                 (
@@ -308,6 +328,7 @@ impl TxWorker {
                     mixer.input2_denoise(),
                     mixer.input2_gate(),
                     mixer.input2_agc(),
+                    mixer.input2_aec(),
                 )
             };
 
@@ -321,6 +342,14 @@ impl TxWorker {
                 }
                 self.held[slot] = 0.0;
                 self.have_held[slot] = false;
+                // Вход молчит, но колонки продолжают играть: AEC3 должен
+                // видеть и опору, и тишину микрофона, иначе история фильтра
+                // рвётся и отмена начинается заново.
+                if aec {
+                    self.slot_buf.clear();
+                    self.slot_buf.resize(FRAME, 0.0);
+                    self.echo_cancel(slot, gain);
+                }
                 continue;
             }
 
@@ -339,6 +368,15 @@ impl TxWorker {
             if let Some(&last) = self.slot_buf.last() {
                 self.held[slot] = last;
                 self.have_held[slot] = true;
+            }
+
+            // Эхо снимаем до шумодава: шумодав меняет спектр эха, и AEC3
+            // пришлось бы искать его заново. Порядок: AEC → шумодав → затвор/AGC.
+            if aec {
+                self.echo_cancel(slot, gain);
+            } else if self.aec[slot].is_some() {
+                // Тумблер выключили: состояние фильтра не держим.
+                self.aec[slot] = None;
             }
 
             if denoise {
@@ -394,6 +432,64 @@ impl TxWorker {
         match self.encoder.encode(&self.mixed, FRAME, &mut self.packet_buf) {
             Ok(len) => Some(self.packet_buf[..len].to_vec()),
             Err(_) => None,
+        }
+    }
+
+    /// Эхо-подавление AEC3: из кадра микрофона вычитается то, что сейчас
+    /// играют колонки (`ref_buf`, кадр голосов собеседников). Кадр AEC3 вдвое
+    /// короче нашего (10 мс), поэтому и опора, и захват идут половинками.
+    fn echo_cancel(&mut self, slot: usize, gain: u32) {
+        if self.aec[slot].is_none() {
+            match aec3_rs::EchoCanceller::new(1, 1) {
+                Ok(c) => self.aec[slot] = Some(Box::new(c)),
+                Err(e) => {
+                    if !self.aec_failed[slot] {
+                        eprintln!(
+                            "[ОШИБКА] Эхо-подавление входа {} не запустилось: {}",
+                            slot + 1,
+                            e
+                        );
+                        self.aec_failed[slot] = true;
+                    }
+                    return;
+                }
+            }
+        }
+        // Смена громкости входа меняет уровень эха: AEC3 просит пометить это
+        // на следующем кадре, чтобы не считать скачок сменой акустики.
+        let level_change = self.aec_last_gain[slot] != gain;
+        self.aec_last_gain[slot] = gain;
+
+        let mut render = [0.0f32; AEC_FRAME];
+        let mut capture = [0.0f32; AEC_FRAME];
+        for (i, chunk) in self.slot_buf.chunks_mut(AEC_FRAME).enumerate() {
+            if chunk.len() < AEC_FRAME {
+                break;
+            }
+            let start = i * AEC_FRAME;
+            render.copy_from_slice(&self.ref_buf[start..start + AEC_FRAME]);
+            // AEC3 отвергает NaN и сэмплы за пределами −1..1; воркер не должен
+            // падать из-за одного плохого кадра — такой кадр просто не трогаем.
+            for (dst, &src) in capture.iter_mut().zip(chunk.iter()) {
+                *dst = if src.is_finite() {
+                    src.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+            }
+            let Some(state) = self.aec[slot].as_mut() else {
+                return;
+            };
+            // `&mut [capture]` создал бы временную копию массива (f32-массивы
+            // Copy) и отменил бы эхо в ней: нужен срез прямо над `capture`.
+            let cancelled = state.analyze_render(&[render]).is_ok()
+                && state
+                    .process_capture(std::slice::from_mut(&mut capture), level_change)
+                    .is_ok();
+            if !cancelled {
+                continue;
+            }
+            chunk.copy_from_slice(&capture);
         }
     }
 
@@ -668,6 +764,89 @@ mod tests {
         assert!(
             out_rms < input_rms * 0.6,
             "шумодав не погасил ровный шум: вход {input_rms}, выход {out_rms}"
+        );
+    }
+
+    #[test]
+    fn aec_off_is_passthrough() {
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        let capture = noise_frame(0.05, 3);
+        mixer.push_echo_ref(&noise_frame(0.2, 4));
+        bus.push(0, bus.epoch(0), &capture);
+        w.render_frame(&bus, &mixer, false);
+        let out = monitor(&mixer);
+        for (a, b) in out.iter().zip(capture.iter()) {
+            assert!((a - b).abs() < 1e-6, "без AEC сэмплы меняться не должны");
+        }
+    }
+
+    #[test]
+    fn aec_keeps_near_end_with_silent_reference() {
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        mixer.set_input1_aec(true);
+        let capture = noise_frame(0.05, 5);
+        let input_rms = rms(&capture);
+        let mut out = Vec::new();
+        // Опора тихая: вычитать нечего, собственный голос должен остаться.
+        for _ in 0..40 {
+            mixer.push_echo_ref(&[0.0; FRAME]);
+            bus.push(0, bus.epoch(0), &capture);
+            w.render_frame(&bus, &mixer, false);
+            out = monitor(&mixer);
+        }
+        let out_rms = rms(&out);
+        assert!(
+            out_rms > input_rms * 0.4 && out_rms < input_rms * 1.6,
+            "AEC без опоры не должен съедать ближний голос: вход {input_rms}, выход {out_rms}"
+        );
+    }
+
+    #[test]
+    fn aec_suppresses_linear_echo() {
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        mixer.set_input1_aec(true);
+
+        // Синтетическое эхо: капчур — та же опора, приглушённая и с задержкой,
+        // как будто колонки играют в комнату и звук возвращается в микрофон.
+        const TICKS: usize = 400;
+        const DELAY: usize = 240;
+        let mut ref_stream = Vec::with_capacity(TICKS * FRAME);
+        for t in 0..TICKS {
+            ref_stream.extend(noise_frame(0.05, t as u32 + 11));
+        }
+
+        let (mut in_energy, mut out_energy, mut counted) = (0.0f64, 0.0f64, 0usize);
+        for t in 0..TICKS {
+            let r = &ref_stream[t * FRAME..(t + 1) * FRAME];
+            let mut capture = vec![0.0f32; FRAME];
+            for (k, sample) in capture.iter_mut().enumerate() {
+                let n = t * FRAME + k;
+                if n >= DELAY {
+                    *sample = ref_stream[n - DELAY] * 0.3;
+                }
+            }
+            mixer.push_echo_ref(r);
+            bus.push(0, bus.epoch(0), &capture);
+            w.render_frame(&bus, &mixer, false);
+            let out = monitor(&mixer);
+            // Первые кадры — разгон фильтра: меряем хвост.
+            if t >= TICKS - 100 {
+                in_energy += capture.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
+                out_energy += out.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
+                counted += capture.len();
+            }
+        }
+        let in_rms = (in_energy / counted as f64).sqrt();
+        let out_rms = (out_energy / counted as f64).sqrt();
+        assert!(
+            out_rms < in_rms * 0.5,
+            "AEC не подавил линейное эхо: вход {in_rms}, выход {out_rms}"
         );
     }
 

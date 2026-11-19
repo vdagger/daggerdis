@@ -1982,6 +1982,8 @@ impl RadioApp {
         for (key, value) in [
             ("input1_denoise", self.mixer.input1_denoise()),
             ("input2_denoise", self.mixer.input2_denoise()),
+            ("input1_aec", self.mixer.input1_aec()),
+            ("input2_aec", self.mixer.input2_aec()),
             ("input1_gate", self.mixer.input1_gate()),
             ("input1_agc", self.mixer.input1_agc()),
             ("input2_gate", self.mixer.input2_gate()),
@@ -1990,6 +1992,8 @@ impl RadioApp {
             let slot = match key {
                 "input1_denoise" => &mut self.config.input1_denoise,
                 "input2_denoise" => &mut self.config.input2_denoise,
+                "input1_aec" => &mut self.config.input1_aec,
+                "input2_aec" => &mut self.config.input2_aec,
                 "input1_gate" => &mut self.config.input1_gate,
                 "input1_agc" => &mut self.config.input1_agc,
                 "input2_gate" => &mut self.config.input2_gate,
