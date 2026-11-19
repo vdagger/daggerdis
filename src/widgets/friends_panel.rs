@@ -6,7 +6,6 @@ use crate::gui::theme as t;
 use crate::network::p2p_iroh::IrohP2pManager;
 use eframe::egui;
 use egui::{Color32, Rounding, Stroke};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::room_panel::short_node_id;
@@ -29,9 +28,8 @@ fn send_request(
     let friends = friends.clone();
     let target = target.to_string();
     tokio::task::spawn(async move {
-        if p2p.connect_to_peer(&target).await.is_err() {
-            return;
-        }
+        // send_bytes внутри сам подключается к пиру — отдельный connect только
+        // заводил второе соединение наперегонки.
         crate::friends::resend_pending_to(friends.as_ref(), &p2p, &target).await;
     });
 }
@@ -51,7 +49,6 @@ fn send_accept(
     let p2p = p2p.clone();
     let target = target.to_string();
     tokio::task::spawn(async move {
-        let _ = p2p.connect_to_peer(&target).await;
         let bytes = crate::network::message::serialize_msg(&accept);
         let _ = p2p.send_bytes(&target, &bytes).await;
     });
@@ -77,7 +74,6 @@ pub fn draw_friends_panel(
     my_id: u64,
     my_node_id: &str,
     nick: &str,
-    is_host: Arc<AtomicBool>,
     add_friend_node: &mut String,
     chat_log: &Arc<ChatLog>,
     active_chat: &mut Option<String>,
@@ -162,7 +158,8 @@ pub fn draw_friends_panel(
                             let accepted = friends.accept_incoming(&req.node_id);
                             if accepted.is_some() {
                                 if let Some(ref p2p) = p2p {
-                                    is_host.store(false, Ordering::SeqCst);
+                                    // Роль хоста от дружбы не зависит: сбрасывать
+                                    // is_host здесь значило бы ломать failover.
                                     send_accept(p2p, &req.node_id, my_id, my_node_id, nick);
                                 }
                             }
@@ -295,7 +292,6 @@ pub fn draw_friends_panel(
     let valid = target.len() == 64 && target.chars().all(|c| c.is_ascii_hexdigit());
     if send && valid && !friends.is_friend(&target) {
         if let Some(ref p2p) = p2p {
-            is_host.store(false, Ordering::SeqCst);
             send_request(p2p, friends, &target, my_id, my_node_id, nick);
         }
         add_friend_node.clear();

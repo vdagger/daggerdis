@@ -29,6 +29,7 @@ impl MigrationManager {
                     sender_id: self.my_id,
                     node_id: p2p.my_node_id.clone(),
                     is_host: my_is_host,
+                    hops: 0,
                 };
                 let serialized = crate::network::message::serialize_msg(&sync_msg);
                 p2p.broadcast_bytes(&serialized).await;
@@ -128,6 +129,7 @@ impl MigrationManager {
                 println!("[МИГРАЦИЯ] 👑 Я стал НОВЫМ ХОСТОМ (ID: {})!", self.my_id);
 
                 let msg = NetworkMessage::HostMigration {
+                    sender_id: self.my_id,
                     new_host_id: self.my_id,
                 };
                 let serialized = crate::network::message::serialize_msg(&msg);

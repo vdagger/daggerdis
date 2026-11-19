@@ -21,6 +21,10 @@ pub struct AppConfig {
     /// Частота трансляции экрана (30 или 60 fps); по умолчанию 60.
     pub video_fps: Option<u32>,
     pub nick: Option<String>,
+    /// Гейт + AGC + лимитер на микрофоне. По умолчанию выключено.
+    pub mic_processing: Option<bool>,
+    /// Лимитер на общем миксе собеседников. По умолчанию выключено.
+    pub rx_limiter: Option<bool>,
     pub peer_volumes: HashMap<u64, u32>,
 }
 
@@ -93,6 +97,8 @@ impl AppConfig {
                 "continuous_mode" => cfg.continuous_mode = value.parse().ok(),
                 "video_fps" => cfg.video_fps = value.parse().ok(),
                 "nick" => cfg.nick = Some(value.to_string()),
+                "mic_processing" => cfg.mic_processing = value.parse().ok(),
+                "rx_limiter" => cfg.rx_limiter = value.parse().ok(),
                 _ => {}
             }
         }
@@ -133,6 +139,12 @@ impl AppConfig {
         }
         if let Some(value) = &self.nick {
             out.push_str(&format!("nick={}\n", value));
+        }
+        if let Some(value) = self.mic_processing {
+            out.push_str(&format!("mic_processing={}\n", value));
+        }
+        if let Some(value) = self.rx_limiter {
+            out.push_str(&format!("rx_limiter={}\n", value));
         }
         let mut vols: Vec<(u64, u32)> = self.peer_volumes.iter().map(|(k, v)| (*k, *v)).collect();
         vols.sort();

@@ -207,6 +207,19 @@ impl VideoLink {
         }
     }
 
+    /// Сколько зрителей сейчас смотрят нашу трансляцию. Раньше в карточке
+    /// показывали размер комнаты — «зрит.» было неправдой, если стрим
+    /// никто не открывал или смотрел не участник комнаты.
+    pub fn viewer_count(&self) -> usize {
+        match self.viewers.lock() {
+            Ok(mut viewers) => {
+                viewers.retain(|v| !*v.stop.borrow());
+                viewers.len()
+            }
+            Err(_) => 0,
+        }
+    }
+
     /// Публикует кадр всем подключённым зрителям.
     pub fn publish(&self, unit: &EncodedUnit, info: &StreamInfo) {
         if self.outgoing.receiver_count() == 0 {

@@ -52,38 +52,113 @@ impl UniversalAudioCapture {
                 .ok_or("No default input device")?,
         };
 
-        // Ищем конфигурацию на 48000 Гц, предпочитая f32: микрофонный поток
-        // строится с типом f32, и у карты, которая на 48 кГц даёт только i16,
-        // первый подходящий по частоте диапазон приводил к отказу.
+        // Кандидаты: 48 кГц (ресэмплер не нужен) в порядке f32 → i16 → i32,
+        // затем родной формат устройства по умолчанию. Раньше поток всегда
+        // строился как f32: у карты, которая на 48 кГц даёт только i16, он
+        // не открывался вовсе — свой голос не уходил в эфир, хотя собеседник
+        // всё делал правильно.
         let ranges: Vec<cpal::SupportedStreamConfigRange> = input_device
             .supported_input_configs()
             .map(|configs| configs.collect())
             .unwrap_or_default();
-        let at_48000 = |f32_only: bool, range: &&cpal::SupportedStreamConfigRange| {
-            range.min_sample_rate().0 <= 48000
-                && range.max_sample_rate().0 >= 48000
-                && (!f32_only || range.sample_format() == cpal::SampleFormat::F32)
-        };
-        let best_config = ranges
-            .iter()
-            .find(|r| at_48000(true, r))
-            .or_else(|| ranges.iter().find(|r| at_48000(false, r)))
-            .map(|r| {
-                r.with_sample_rate(cpal::SampleRate(48000))
-                    .config()
-            })
-            .or_else(|| input_device.default_input_config().ok().map(|c| c.config()))
-            .ok_or("Не удалось получить поддерживаемый формат микрофона")?;
 
-        let sample_rate = best_config.sample_rate.0;
-        let total_channels = best_config.channels as usize;
+        let mut candidates: Vec<(cpal::SampleFormat, cpal::StreamConfig)> = Vec::new();
+        for fmt in [
+            cpal::SampleFormat::F32,
+            cpal::SampleFormat::I16,
+            cpal::SampleFormat::I32,
+        ] {
+            let range = ranges.iter().find(|r| {
+                r.sample_format() == fmt
+                    && r.min_sample_rate().0 <= 48000
+                    && r.max_sample_rate().0 >= 48000
+            });
+            if let Some(r) = range {
+                candidates.push((fmt, r.with_sample_rate(cpal::SampleRate(48000)).config()));
+            }
+        }
+        if let Ok(def) = input_device.default_input_config() {
+            let cfg = def.config();
+            let dup = candidates.iter().any(|(f, c)| {
+                *f == def.sample_format()
+                    && c.sample_rate == cfg.sample_rate
+                    && c.channels == cfg.channels
+            });
+            if !dup {
+                candidates.push((def.sample_format(), cfg));
+            }
+        }
+        if candidates.is_empty() {
+            return Err("Не удалось получить поддерживаемый формат микрофона".into());
+        }
 
-        println!(
-            "[АУДИО] Открыт микрофон: '{}', частота: {} Гц, каналов: {}",
-            input_device.name().unwrap_or_default(),
-            sample_rate,
-            total_channels
-        );
+        let name = input_device.name().unwrap_or_default();
+        let mut last_err: Option<Box<dyn std::error::Error>> = None;
+        for (fmt, cfg) in candidates {
+            println!(
+                "[АУДИО] Микрофон '{}': пробуем {:?}, {} Гц, каналов: {}",
+                name, fmt, cfg.sample_rate.0, cfg.channels
+            );
+            let attempt = match fmt {
+                cpal::SampleFormat::F32 => Self::build_input::<f32>(
+                    &input_device,
+                    &cfg,
+                    ptt_flag.clone(),
+                    packet_tx.clone(),
+                    mixer.clone(),
+                ),
+                cpal::SampleFormat::I16 => Self::build_input::<i16>(
+                    &input_device,
+                    &cfg,
+                    ptt_flag.clone(),
+                    packet_tx.clone(),
+                    mixer.clone(),
+                ),
+                cpal::SampleFormat::I32 => Self::build_input::<i32>(
+                    &input_device,
+                    &cfg,
+                    ptt_flag.clone(),
+                    packet_tx.clone(),
+                    mixer.clone(),
+                ),
+                other => {
+                    eprintln!("[АУДИО] Формат {:?} для микрофона не поддержан", other);
+                    continue;
+                }
+            };
+            match attempt {
+                Ok(stream) => {
+                    println!(
+                        "[АУДИО] Открыт микрофон: '{}', частота: {} Гц, каналов: {}, формат: {:?}",
+                        name, cfg.sample_rate.0, cfg.channels, fmt
+                    );
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    eprintln!("[АУДИО] Микрофон не открылся в {:?}: {}", fmt, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| "ни один формат микрофона не открылся".into()))
+    }
+
+    /// Поток ввода в формате самой карты. Сведение каналов, ресэмплинг,
+    /// обработка и Opus от типа сэмпла не зависят — как и на выводе,
+    /// параметризуем, а не дублируем.
+    fn build_input<T>(
+        input_device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        ptt_flag: Arc<AtomicBool>,
+        packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        mixer: std::sync::Arc<crate::mixer::AudioMixer>,
+    ) -> Result<cpal::Stream, Box<dyn std::error::Error>>
+    where
+        T: cpal::SizedSample + cpal::FromSample<f32>,
+        f32: cpal::FromSample<T>,
+    {
+        let sample_rate = config.sample_rate.0;
+        let total_channels = config.channels as usize;
 
         // Создаем Opus-энкодер строго на 48000 Гц, 64 kbps
         let mut encoder = rusty_opus::OpusEncoder::new(48000, 1, rusty_opus::Application::Voip)?;
@@ -97,8 +172,8 @@ impl UniversalAudioCapture {
         let mut tx_limiter = crate::mixer::Limiter::new(48000);
 
         let stream = input_device.build_input_stream(
-            &best_config,
-            move |data: &[f32], _| {
+            config,
+            move |data: &[T], _| {
                 mono_chunk.clear();
                 let ch1 = mixer.input1_channel();
                 let ch2 = mixer.input2_channel();
@@ -115,7 +190,7 @@ impl UniversalAudioCapture {
                     let mut sample = 0.0f32;
                     let mut active = 0u32;
                     if (ch1 as usize) < total_channels {
-                        let v1 = chunk[ch1 as usize];
+                        let v1 = <f32 as cpal::FromSample<T>>::from_sample_(chunk[ch1 as usize]);
                         peak1 = peak1.max(v1.abs());
                         if gain1 > 0.0 {
                             sample += v1 * gain1;
@@ -123,7 +198,7 @@ impl UniversalAudioCapture {
                         }
                     }
                     if (ch2 as usize) < total_channels {
-                        let v2 = chunk[ch2 as usize];
+                        let v2 = <f32 as cpal::FromSample<T>>::from_sample_(chunk[ch2 as usize]);
                         peak2 = peak2.max(v2.abs());
                         if gain2 > 0.0 {
                             sample += v2 * gain2;
@@ -149,32 +224,40 @@ impl UniversalAudioCapture {
                     mono_chunk.clone()
                 };
 
-                // Noise Gate (Шумовой затвор): порог ~ -44 dBFS (0.006)
                 let mut processed_chunk = normalized_chunk;
-                let chunk_peak = processed_chunk
-                    .iter()
-                    .map(|s| s.abs())
-                    .fold(0.0f32, f32::max);
-                let target_gain = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
 
-                for sample in processed_chunk.iter_mut() {
-                    if target_gain > gate_gain {
-                        gate_gain += (target_gain - gate_gain) * 0.1;
-                    } else {
-                        gate_gain += (target_gain - gate_gain) * 0.002;
+                // Гейт, AGC и лимитер — опция из настроек, по умолчанию
+                // выключены: сырой микрофон на приёме честнее, а «проглоченный»
+                // компрессорами голос звучал глухо и тихо.
+                if mixer.is_dsp_enabled() {
+                    // Noise Gate (Шумовой затвор): порог ~ -44 dBFS (0.006)
+                    let chunk_peak = processed_chunk
+                        .iter()
+                        .map(|s| s.abs())
+                        .fold(0.0f32, f32::max);
+                    let target_gain = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
+
+                    for sample in processed_chunk.iter_mut() {
+                        if target_gain > gate_gain {
+                            gate_gain += (target_gain - gate_gain) * 0.1;
+                        } else {
+                            gate_gain += (target_gain - gate_gain) * 0.002;
+                        }
+                        *sample *= gate_gain;
                     }
-                    *sample *= gate_gain;
+
+                    // AGC: тихий микрофон подтягивается до цели по RMS, громкий
+                    // осаживается. Следом страховочный лимитер: в Opus уходит
+                    // не громче −1 dBFS.
+                    tx_agc.process(&mut processed_chunk);
+                    tx_limiter.process(&mut processed_chunk);
+                } else {
+                    // Гейт выключен — не копим закрытый гейн к моменту включения
+                    gate_gain = 1.0;
                 }
 
-                // AGC: тихий микрофон подтягивается до цели по RMS, громкий
-                // осаживается — без этого свой голос уходил в эфир заметно тише,
-                // чем в Discord, и громкость добиралась уже у собеседника.
-                // Следом страховочный лимитер: в Opus уходит не громче −1 dBFS.
-                tx_agc.process(&mut processed_chunk);
-                tx_limiter.process(&mut processed_chunk);
-
                 // Прослушивание своего тракта: в динамики уходит ровно то,
-                // что после гейта, AGC и лимитера уйдёт собеседнику.
+                // что после обработки уйдёт собеседнику.
                 // Не зависит от PTT — баланс микрофона и гитары можно
                 // настраивать, ничего не передавая.
                 mixer.push_monitor(&processed_chunk);
@@ -608,7 +691,11 @@ impl UniversalAudioCapture {
                     ring_t = (ring_t + num_frames as f64 * dt) % period;
                 }
 
-                mix_limiter.process(&mut out_scratch);
+                // Лимитер микса — опция (по умолчанию выключен): без него
+                // громкость приёма ровно такая, как выставили ползунками.
+                if mixer.is_rx_limiter_enabled() {
+                    mix_limiter.process(&mut out_scratch);
+                }
 
                 let silence = T::from_sample(0.0);
                 for (i, frame) in out_scratch.iter().enumerate() {

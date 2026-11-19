@@ -48,6 +48,9 @@ pub struct RadioApp {
     chat_log: Arc<crate::chat::ChatLog>,
     calls: Arc<crate::calls::CallManager>,
     active_chat: Option<String>,
+    /// Собеседник, для которого сейчас набран `chat_input`. Смена диалога
+    /// чистит черновик, а не переносит его в чужую переписку.
+    chat_target: Option<String>,
     chat_input: String,
     /// Счётчики непрочитанного на прошлом кадре: рост = новое сообщение,
     /// о нём сообщаем тостом, потому что бейдж легко пропустить.
@@ -140,6 +143,7 @@ impl RadioApp {
             chat_log,
             calls,
             active_chat: None,
+            chat_target: None,
             chat_input: String::new(),
             seen_unread: std::collections::HashMap::new(),
             call_attention: false,
@@ -323,6 +327,12 @@ impl eframe::App for RadioApp {
         self.mixer.set_ring_mode(self.calls.ring_mode());
         while let Some(note) = self.calls.take_notice() {
             self.show_toast(&note);
+        }
+
+        // Смена собеседника не должна притаскивать в поле ввода чужой черновик
+        if self.active_chat != self.chat_target {
+            self.chat_target = self.active_chat.clone();
+            self.chat_input.clear();
         }
 
         // Непрочитанное: бейдж в шапке легко пропустить, поэтому о новом
@@ -710,10 +720,13 @@ impl RadioApp {
                         );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
-                                egui::RichText::new("60 FPS")
-                                    .size(9.0)
-                                    .monospace()
-                                    .color(t::TEXT_MUTED),
+                                egui::RichText::new(format!(
+                                    "{} FPS",
+                                    self.config.video_fps.unwrap_or(60)
+                                ))
+                                .size(9.0)
+                                .monospace()
+                                .color(t::TEXT_MUTED),
                             );
                         });
                     });
@@ -900,12 +913,17 @@ impl RadioApp {
 
                         let subtitle = if let Some(v) = &self.video {
                             let (w, h) = v.size();
+                            let viewers = self
+                                .video_link
+                                .as_ref()
+                                .map(|l| l.viewer_count())
+                                .unwrap_or(0);
                             format!(
                                 "{}×{} · {} FPS · {} зрит.",
                                 w,
                                 h,
                                 v.encode_fps(),
-                                self.room.get_all_peers().len()
+                                viewers
                             )
                         } else {
                             "Не запущена".to_string()
@@ -1087,7 +1105,6 @@ impl RadioApp {
                                 self.my_id,
                                 &self.my_node_id,
                                 &self.nick,
-                                self.is_host.clone(),
                                 &mut self.add_friend_node,
                                 &self.chat_log,
                                 &mut self.active_chat,
@@ -1419,8 +1436,8 @@ impl RadioApp {
             return;
         }
 
-        let width = 330.0_f32.min(ctx.screen_rect().width() - 40.0);
         let screen = ctx.screen_rect();
+        let width = 330.0_f32.min(screen.width() - 40.0);
         let pos = egui::pos2(screen.center().x - width * 0.5, screen.top() + 66.0);
 
         let mut accept = false;
@@ -1429,7 +1446,9 @@ impl RadioApp {
         let mut end = false;
 
         // Esc работает как крупная кнопка: выйти из звонка, не целясь мышью.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Но только когда фокус не в текстовом поле: там Esc — для текста,
+        // иначе он заодно обрывал бы разговор при правке сообщения.
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             match view {
                 crate::calls::CallView::Incoming { .. } => decline = true,
                 crate::calls::CallView::Outgoing { .. } => cancel = true,
@@ -1438,6 +1457,66 @@ impl RadioApp {
             }
         }
 
+        if let crate::calls::CallView::Active { nick, elapsed } = &view {
+            // Идёт разговор: никакой карточки поверх окна — стрим и комната
+            // должны оставаться видны. Только компактная плашка в углу.
+            egui::Area::new(egui::Id::new("call_pill"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 66.0))
+                .order(Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::none()
+                        .fill(t::SURFACE)
+                        .rounding(Rounding::same(11.0))
+                        .stroke(Stroke::new(1.0_f32, t::with_alpha(t::LIVE, 0.35)))
+                        .shadow(egui::epaint::Shadow {
+                            offset: egui::vec2(0.0, 8.0),
+                            blur: 22.0,
+                            spread: 0.0,
+                            color: egui::Color32::from_black_alpha(130),
+                        })
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (dot, _) = ui.allocate_exact_size(
+                                    egui::vec2(7.0, 7.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(dot.center(), 3.0, t::LIVE);
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(nick)
+                                        .size(11.5)
+                                        .strong()
+                                        .color(t::TEXT),
+                                );
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(format_elapsed(*elapsed))
+                                        .size(10.0)
+                                        .monospace()
+                                        .color(t::TEXT_MUTED),
+                                );
+                                ui.add_space(8.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Завершить")
+                                                .size(10.0)
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(t::REC)
+                                        .rounding(Rounding::same(7.0)),
+                                    )
+                                    .on_hover_text("Завершить звонок (ESC)")
+                                    .clicked()
+                                {
+                                    end = true;
+                                }
+                            });
+                        });
+                });
+        } else {
         egui::Area::new(egui::Id::new("call_card"))
             .fixed_pos(pos)
             .order(Order::Foreground)
@@ -1539,57 +1618,12 @@ impl RadioApp {
                                 ui.add_space(4.0);
                                 t::micro(ui, "ESC — отменить");
                             }
-                            crate::calls::CallView::Active { nick, elapsed } => {
-                                ui.horizontal(|ui| {
-                                    t::avatar(ui, nick, 34.0, false);
-                                    ui.add_space(4.0);
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("В звонке")
-                                                .size(9.0)
-                                                .strong()
-                                                .color(t::LIVE),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(nick)
-                                                .size(14.0)
-                                                .strong()
-                                                .color(t::TEXT),
-                                        );
-                                    });
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        ui.label(
-                                            egui::RichText::new(format_elapsed(*elapsed))
-                                                .size(10.0)
-                                                .monospace()
-                                                .color(t::TEXT_MUTED),
-                                        );
-                                    });
-                                });
-                                ui.add_space(10.0);
-                                let w = ui.available_width();
-                                if ui
-                                    .add_sized(
-                                        egui::vec2(w, 32.0),
-                                        egui::Button::new(
-                                            egui::RichText::new("Завершить звонок")
-                                                .size(11.5)
-                                                .strong()
-                                                .color(egui::Color32::WHITE),
-                                        )
-                                        .fill(t::REC)
-                                        .rounding(Rounding::same(8.0)),
-                                    )
-                                    .clicked()
-                                {
-                                    end = true;
-                                }
-                                ui.add_space(4.0);
-                                t::micro(ui, "ESC — выйти из звонка");
-                            }
+                            // Идущий разговор рисуется плашкой выше, не карточкой
+                            crate::calls::CallView::Active { .. } => {}
                         }
                     });
             });
+        }
 
         if accept {
             self.calls.accept_incoming();
@@ -1835,6 +1869,16 @@ impl RadioApp {
         }
         if self.config.nick.as_deref() != Some(self.nick.as_str()) {
             self.config.nick = Some(self.nick.clone());
+            changed = true;
+        }
+        let dsp = self.mixer.is_dsp_enabled();
+        if self.config.mic_processing != Some(dsp) {
+            self.config.mic_processing = Some(dsp);
+            changed = true;
+        }
+        let rx_limiter = self.mixer.is_rx_limiter_enabled();
+        if self.config.rx_limiter != Some(rx_limiter) {
+            self.config.rx_limiter = Some(rx_limiter);
             changed = true;
         }
         let peer_vols = self.mixer.peer_volumes();

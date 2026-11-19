@@ -246,7 +246,7 @@ pub fn draw_room_connect(
             });
 
         if t::primary_button(ui, "Войти", egui::vec2(btn_width, 44.0)).clicked() {
-            room.join();
+            // room.join() зовётся внутри join_room — только после проверки NodeID
             join_room(connect_ip, iroh.clone(), my_id, is_host.clone(), room.clone(), calls);
         }
     });

@@ -163,6 +163,13 @@ pub struct AudioMixer {
     monitor_buf: Mutex<VecDeque<f32>>,
     /// Гудок звонка: 0 — тихо, 1 — входящий, 2 — «звоним…»
     ring_mode: AtomicU32,
+    /// Обработка своего голоса перед отправкой: гейт + AGC + лимитер.
+    /// По умолчанию выключена — сырой микрофон слышно честнее, а «проглоченный»
+    /// компрессорами голос на приёме звучал глухо и тихо.
+    dsp_enabled: AtomicBool,
+    /// Страховочный лимитер на общем миксе собеседников. Тоже по умолчанию
+    /// выключен: без него громкость приёма ровно такая, какую выставили.
+    rx_limiter_enabled: AtomicBool,
 }
 
 impl AudioMixer {
@@ -182,7 +189,27 @@ impl AudioMixer {
             monitor_enabled: AtomicBool::new(false),
             monitor_buf: Mutex::new(VecDeque::new()),
             ring_mode: AtomicU32::new(0),
+            dsp_enabled: AtomicBool::new(false),
+            rx_limiter_enabled: AtomicBool::new(false),
         }
+    }
+
+    /// Включена ли обработка микрофона (гейт + AGC + лимитер)
+    pub fn is_dsp_enabled(&self) -> bool {
+        self.dsp_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_dsp_enabled(&self, on: bool) {
+        self.dsp_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Включён ли лимитер на общем миксе собеседников
+    pub fn is_rx_limiter_enabled(&self) -> bool {
+        self.rx_limiter_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_rx_limiter_enabled(&self, on: bool) {
+        self.rx_limiter_enabled.store(on, Ordering::Relaxed);
     }
 
     /// Режим гудка: 0 — тихо, 1 — входящий звонок, 2 — гудок «звоним…»
@@ -375,5 +402,72 @@ impl AudioMixer {
 impl Default for AudioMixer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gain_curve() {
+        assert_eq!(slider_to_gain(0), 0.0);
+        assert!((slider_to_gain(100) - 1.0).abs() < 1e-6);
+        assert!((slider_to_gain(200) - 10f32.powf(9.0 / 20.0)).abs() < 1e-4);
+        assert!((slider_to_gain(300) - 10f32.powf(18.0 / 20.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn slider_db_roundtrip() {
+        for v in (1..=300).step_by(5) {
+            let back = db_to_slider(slider_to_db(v)) as i32;
+            assert!((back - v as i32).abs() <= 1, "v={v} back={back}");
+        }
+        assert_eq!(db_to_slider(-40.0), 1);
+    }
+
+    #[test]
+    fn limiter_ceiling() {
+        let mut lim = Limiter::new(48_000);
+        let mut buf = vec![0.95f32; 480];
+        lim.process(&mut buf);
+        for s in &buf {
+            assert!(s.abs() <= LIMIT_THRESHOLD + 1e-6, "выброс выше порога: {s}");
+        }
+    }
+
+    #[test]
+    fn agc_boosts_quiet_signal() {
+        // На каждом шаге — свежий блок одной амплитуды: старый тест прогонял
+        // один и тот же буфер по кругу, и накопленное усиление умножалось
+        // снова и снова, пока значения не уходили в бесконечность.
+        let mut agc = TransmitAgc::new();
+        let mut buf = Vec::new();
+        for _ in 0..400 {
+            buf = vec![0.002f32; 960];
+            agc.process(&mut buf);
+        }
+        let rms = (buf.iter().map(|s| s * s).sum::<f32>() / buf.len() as f32).sqrt();
+        // Вход −54 dBFS, потолок усиления +24 дБ (×15.85) → максимум ~0.0317.
+        assert!(rms > 0.02, "тихий сигнал не подтянулся: rms={rms}");
+    }
+
+    #[test]
+    fn processing_off_by_default() {
+        let m = AudioMixer::new();
+        assert!(!m.is_dsp_enabled(), "обработка микрофона должна быть выключена");
+        assert!(!m.is_rx_limiter_enabled(), "лимитер приёма должен быть выключен");
+        m.set_dsp_enabled(true);
+        m.set_rx_limiter_enabled(true);
+        assert!(m.is_dsp_enabled());
+        assert!(m.is_rx_limiter_enabled());
+    }
+
+    #[test]
+    fn peer_volume_clamped() {
+        let m = AudioMixer::new();
+        assert_eq!(m.get_peer_volume(7), 100);
+        m.set_peer_volume(7, 9999);
+        assert_eq!(m.get_peer_volume(7), 300);
     }
 }

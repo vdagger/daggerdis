@@ -186,9 +186,19 @@ impl IrohP2pManager {
         }
     }
 
+    /// Выкидывает соединения, которые уже закрыты (пир перезапустился или
+    /// соединение уснуло по idle timeout). Иначе они висят в карте вечно:
+    /// `get_connected_peers` считает их живыми, звонки уходят «в никуда»,
+    /// а авто-связывание думает, что пир уже на связи.
+    async fn prune_dead(&self) {
+        let mut conns = self.connections.lock().await;
+        conns.retain(|_, conn| conn.close_reason().is_none());
+    }
+
     /// Рассылает байты всем активным P2P-соседям, кроме автора
     pub async fn broadcast_bytes_except(&self, except_node_id: &str, data: &[u8]) {
-        let conns = self.connections.lock().await;
+        let mut conns = self.connections.lock().await;
+        conns.retain(|_, conn| conn.close_reason().is_none());
         let bytes = Bytes::copy_from_slice(data);
         for (node_id, conn) in conns.iter() {
             if node_id != except_node_id {
@@ -199,7 +209,8 @@ impl IrohP2pManager {
 
     /// Рассылает байты всем активным P2P-соседям
     pub async fn broadcast_bytes(&self, data: &[u8]) {
-        let conns = self.connections.lock().await;
+        let mut conns = self.connections.lock().await;
+        conns.retain(|_, conn| conn.close_reason().is_none());
         let bytes = Bytes::copy_from_slice(data);
         for conn in conns.values() {
             let _ = conn.send_datagram(bytes.clone());
@@ -208,6 +219,7 @@ impl IrohP2pManager {
 
     /// Возвращает список NodeID подключенных участников
     pub async fn get_connected_peers(&self) -> Vec<String> {
+        self.prune_dead().await;
         self.connections.lock().await.keys().cloned().collect()
     }
 

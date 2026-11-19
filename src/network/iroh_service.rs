@@ -55,12 +55,38 @@ pub fn spawn_iroh_receiver(
                             sender_id,
                             node_id,
                             is_host: peer_is_host,
+                            hops,
                         } => {
-                            // Узел обязан назвать в пакете тот же NodeID, что у соединения,
-                            // а sender_id должен быть хешем этого NodeID.
-                            if !sender_id_verified(&pkt.sender_id, sender_id)
+                            if hops > 0 {
+                                // Релей: хост пересылает IrohSync тем, с кем этот
+                                // узел ещё не соединился напрямую. Подлинность
+                                // соединения тут не проверить, поэтому пускаем
+                                // только один релей и только от нашего хоста.
+                                let id_ok = crate::identity::my_id_from_node_id(&node_id)
+                                    == Some(sender_id);
+                                if hops > 1 || !id_ok || node_id == p2p_recv.my_node_id {
+                                    eprintln!(
+                                        "[БЕЗОПАСНОСТЬ] Релейный IrohSync от {} отброшен",
+                                        pkt.sender_id
+                                    );
+                                    continue;
+                                }
+                                let relayed_by_host = room_iroh
+                                    .get_all_peers()
+                                    .iter()
+                                    .any(|p| p.address == pkt.sender_id && p.is_host);
+                                if !relayed_by_host {
+                                    eprintln!(
+                                        "[БЕЗОПАСНОСТЬ] IrohSync по релею не от хоста ({}) отброшен",
+                                        pkt.sender_id
+                                    );
+                                    continue;
+                                }
+                            } else if !sender_id_verified(&pkt.sender_id, sender_id)
                                 || node_id != pkt.sender_id
                             {
+                                // Узел обязан назвать в пакете тот же NodeID, что у
+                                // соединения, а sender_id должен быть хешем этого NodeID.
                                 eprintln!(
                                     "[БЕЗОПАСНОСТЬ] IrohSync с чужим sender_id/NodeID от {} отброшен",
                                     pkt.sender_id
@@ -109,14 +135,38 @@ pub fn spawn_iroh_receiver(
                                 });
                             }
 
-                            // 3. Релеинг: если мы Хост, пересылаем IrohSync остальным участникам
-                            if is_host_iroh.load(Ordering::Relaxed) {
+                            // 3. Релеинг: если мы Хост, пересылаем IrohSync остальным
+                            // участникам — с увеличенным hops, чтобы пакет не ходил
+                            // по кругу и дальше одного релея не уходил.
+                            if is_host_iroh.load(Ordering::Relaxed) && hops < 2 {
+                                let relay = NetworkMessage::IrohSync {
+                                    sender_id,
+                                    node_id: node_id.clone(),
+                                    is_host: peer_is_host,
+                                    hops: hops + 1,
+                                };
+                                let bytes = crate::network::message::serialize_msg(&relay);
                                 p2p_recv
-                                    .broadcast_bytes_except(&pkt.sender_id, &pkt.data)
+                                    .broadcast_bytes_except(&pkt.sender_id, &bytes)
                                     .await;
                             }
                         }
-                        NetworkMessage::HostMigration { new_host_id } => {
+                        NetworkMessage::HostMigration {
+                            sender_id,
+                            new_host_id,
+                        } => {
+                            // Объявить нового хоста может только он сам: иначе
+                            // любой участник перехватывал бы роль хоста одним
+                            // датаграмом.
+                            if !sender_id_verified(&pkt.sender_id, sender_id)
+                                || sender_id != new_host_id
+                            {
+                                eprintln!(
+                                    "[БЕЗОПАСНОСТЬ] HostMigration от {} (заявляет хостом {}) отброшен",
+                                    pkt.sender_id, new_host_id
+                                );
+                                continue;
+                            }
                             println!(
                                 "[IROH] 👑 Получено уведомление о смене хоста. Новый лидер ID: {}",
                                 new_host_id
@@ -266,33 +316,42 @@ pub fn spawn_iroh_receiver(
                             );
                             calls_iroh.on_invite(&pkt.sender_id, &nick, call_id);
                         }
-                        NetworkMessage::CallAccept { sender_id, .. } => {
-                            if !sender_id_verified(&pkt.sender_id, sender_id) {
-                                continue;
-                            }
-                            calls_iroh.on_accept(&pkt.sender_id);
-                        }
-                        NetworkMessage::CallDecline {
+                        NetworkMessage::CallAccept {
                             sender_id,
-                            reason,
-                            ..
+                            call_id,
                         } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            calls_iroh.on_decline(&pkt.sender_id, reason);
+                            calls_iroh.on_accept(&pkt.sender_id, call_id);
                         }
-                        NetworkMessage::CallCancel { sender_id, .. } => {
+                        NetworkMessage::CallDecline {
+                            sender_id,
+                            call_id,
+                            reason,
+                        } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            calls_iroh.on_cancel(&pkt.sender_id);
+                            calls_iroh.on_decline(&pkt.sender_id, call_id, reason);
                         }
-                        NetworkMessage::CallEnd { sender_id, .. } => {
+                        NetworkMessage::CallCancel {
+                            sender_id,
+                            call_id,
+                        } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            calls_iroh.on_end(&pkt.sender_id);
+                            calls_iroh.on_cancel(&pkt.sender_id, call_id);
+                        }
+                        NetworkMessage::CallEnd {
+                            sender_id,
+                            call_id,
+                        } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            calls_iroh.on_end(&pkt.sender_id, call_id);
                         }
                     }
                 }

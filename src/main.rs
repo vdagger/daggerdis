@@ -105,6 +105,9 @@ fn main() {
     for (id, vol) in &config.peer_volumes {
         mixer.set_peer_volume(*id, *vol);
     }
+    // Обработка звука — опция, по умолчанию выключена
+    mixer.set_dsp_enabled(config.mic_processing.unwrap_or(false));
+    mixer.set_rx_limiter_enabled(config.rx_limiter.unwrap_or(false));
     if let Some(vk) = config.ptt_vk {
         albus::keybind::CURRENT_VK.store(vk, std::sync::atomic::Ordering::Relaxed);
     }

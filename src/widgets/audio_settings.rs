@@ -149,8 +149,62 @@ pub fn draw_audio_settings(
     ui.add_space(2.0);
     ui.label(
         egui::RichText::new(
-            "Гейт, AGC и лимитер — ровно то, что услышит собеседник. \
+            "Ровно то, что услышит собеседник. \
              Только в наушниках: через колонки микрофон поймает свой же голос.",
+        )
+        .size(9.5)
+        .color(t::TEXT_MUTED),
+    );
+
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(12.0);
+
+    // Обработка звука: по умолчанию всё выключено — сырой тракт честнее
+    t::section_label(ui, "ОБРАБОТКА ЗВУКА");
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Шумовой затвор, AGC и лимитер")
+                .size(11.5)
+                .color(t::TEXT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut on = mixer.is_dsp_enabled();
+            if t::switch(ui, &mut on).changed() {
+                mixer.set_dsp_enabled(on);
+            }
+        });
+    });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Тише шум в паузах и ровнее громкость микрофона, но голос звучит \
+             плотнее и глуше. Выключено: в эфир идёт чистый микрофон.",
+        )
+        .size(9.5)
+        .color(t::TEXT_MUTED),
+    );
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Лимитер приёма")
+                .size(11.5)
+                .color(t::TEXT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut on = mixer.is_rx_limiter_enabled();
+            if t::switch(ui, &mut on).changed() {
+                mixer.set_rx_limiter_enabled(on);
+            }
+        });
+    });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Осаживает громкий общий микс, когда говорят несколько человек \
+             сразу. Выключено: громкость приёма ровно такая, как выставлена.",
         )
         .size(9.5)
         .color(t::TEXT_MUTED),

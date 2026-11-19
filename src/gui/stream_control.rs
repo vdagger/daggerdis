@@ -19,19 +19,24 @@ pub fn restart_audio_stream(
     };
     *stream_lock = None; // Останавливаем старый поток
 
-    // Находим устройство по имени без паник (если устройство исчезло — просто выходим)
+    // Находим устройство по имени. Если оно исчезло (USB-микрофон выдернули),
+    // молча оставались без звука — теперь откатываемся на устройство по
+    // умолчанию, а не оставляем пользователя без микрофона.
     let host = cpal::default_host();
     let device = match host.input_devices().ok().and_then(|mut devs| {
         devs.find(|d| d.name().unwrap_or_default() == device_name)
     }) {
-        Some(d) => d,
+        Some(d) => Some(d),
         None => {
-            eprintln!("[ОШИБКА] Выбранное устройство не найдено: {}", device_name);
-            return;
+            eprintln!(
+                "[АУДИО] Выбранное устройство не найдено: {} — берём микрофон по умолчанию",
+                device_name
+            );
+            None
         }
     };
 
-    match audio.create_input_stream(Some(device), ptt_flag, packet_tx, mixer) {
+    match audio.create_input_stream(device, ptt_flag, packet_tx, mixer) {
         Ok(new_stream) => {
             *stream_lock = Some(new_stream);
             println!("[GUI] Аудиопоток успешно перезапущен.");
@@ -51,16 +56,21 @@ pub fn restart_playback_stream(
     *stream_lock = None; // Останавливаем старый поток
 
     let host = cpal::default_host();
-    if let Some(device) = host.output_devices().ok().and_then(|mut devs| {
+    let device = host.output_devices().ok().and_then(|mut devs| {
         use cpal::traits::DeviceTrait;
         devs.find(|d| d.name().unwrap_or_default() == device_name)
-    }) {
-        match crate::audio::UniversalAudioCapture::create_playback_stream(Some(device), rx, mixer) {
-            Ok(new_stream) => {
-                *stream_lock = Some(new_stream);
-                println!("[GUI] Поток воспроизведения переключен на: {}", device_name);
-            }
-            Err(e) => eprintln!("[ОШИБКА] Не удалось переключить динамики: {}", e),
+    });
+    if device.is_none() {
+        eprintln!(
+            "[АУДИО] Выбранные динамики не найдены: {} — берём устройство по умолчанию",
+            device_name
+        );
+    }
+    match crate::audio::UniversalAudioCapture::create_playback_stream(device, rx, mixer) {
+        Ok(new_stream) => {
+            *stream_lock = Some(new_stream);
+            println!("[GUI] Поток воспроизведения переключен на: {}", device_name);
         }
+        Err(e) => eprintln!("[ОШИБКА] Не удалось переключить динамики: {}", e),
     }
 }

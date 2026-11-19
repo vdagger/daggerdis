@@ -47,7 +47,9 @@ fn send_chat(p2p: &Arc<IrohP2pManager>, target: &str, my_id: u64, text: String) 
     let p2p = p2p.clone();
     let target = target.to_string();
     tokio::task::spawn(async move {
-        let _ = p2p.connect_to_peer(&target).await;
+        // send_bytes сам подключается, если соединения нет: раньше здесь
+        // вдобавок шёл connect_to_peer, и при перезапуске пира два соединения
+        // гонялись наперегонки за одну запись в карту.
         let _ = p2p.send_bytes(&target, &bytes).await;
     });
 }
@@ -89,10 +91,52 @@ fn bubble(ui: &mut egui::Ui, m: &ChatMessage, time: &str) {
     ui.add_space(6.0);
 }
 
+/// Смещение местного времени от UTC в секундах. Раньше часы были жёстко
+/// привязаны к UTC+3 — в другом поясе все сообщения показывались со сдвигом.
+fn local_offset_seconds() -> i64 {
+    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            // В windows 0.62 `GetLocalTime` живёт в SystemInformation и
+            // возвращает SYSTEMTIME напрямую; UTC берём из std.
+            use windows::Win32::Foundation::SYSTEMTIME;
+            use windows::Win32::System::SystemInformation::GetLocalTime;
+            fn to_secs(st: &SYSTEMTIME) -> i64 {
+                fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+                    let y = if m <= 2 { y - 1 } else { y };
+                    let era = if y >= 0 { y } else { y - 399 } / 400;
+                    let yoe = y - era * 400;
+                    let mp = (m + 9) % 12;
+                    let doy = (153 * mp + 2) / 5 + d - 1;
+                    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                    era * 146_097 + doe - 719_468
+                }
+                days_from_civil(st.wYear as i64, st.wMonth as i64, st.wDay as i64) * 86_400
+                    + st.wHour as i64 * 3600
+                    + st.wMinute as i64 * 60
+                    + st.wSecond as i64
+            }
+            unsafe {
+                let local = GetLocalTime();
+                let utc = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                to_secs(&local) - utc
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            0
+        }
+    })
+}
+
 fn clock(at_ms: u64) -> String {
-    let secs = at_ms / 1000;
+    let secs = (at_ms as i64 / 1000 + local_offset_seconds()).rem_euclid(86_400);
     let minutes = (secs / 60) % 60;
-    let hours = (secs / 3600 + 3) % 24;
+    let hours = secs / 3600;
     format!("{:02}:{:02}", hours, minutes)
 }
 

@@ -219,230 +219,236 @@ impl CallManager {
 
     /// Принять входящий звонок
     pub fn accept_incoming(&self) -> bool {
-        match self.take_phase() {
-            Some(CallPhase::Incoming {
+        let accepted = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return false;
+            };
+            if let CallPhase::Incoming {
                 peer,
                 nick,
                 call_id,
                 ..
-            }) => {
-                self.put_phase(CallPhase::Active {
+            } = &*phase
+            {
+                let call = (peer.clone(), *call_id);
+                *phase = CallPhase::Active {
                     peer: peer.clone(),
-                    nick,
-                    call_id,
+                    nick: nick.clone(),
+                    call_id: *call_id,
                     started: Instant::now(),
-                });
-                // Согласие получено — входим в эфир, снимаем блок и подтверждаем
-                // приём несколько раз: сообщение с Accept может потеряться.
-                self.room.join();
-                self.unblock(&peer);
-                self.send_accept_repeat(&peer, call_id);
-                true
+                };
+                Some(call)
+            } else {
+                None
             }
-            Some(other) => {
-                self.put_phase(other);
-                false
-            }
-            None => false,
-        }
+        };
+        let Some((peer, call_id)) = accepted else {
+            return false;
+        };
+        // Согласие получено — входим в эфир, снимаем блок и подтверждаем
+        // приём несколько раз: сообщение с Accept может потеряться.
+        self.room.join();
+        self.unblock(&peer);
+        self.send_accept_repeat(&peer, call_id);
+        true
     }
 
     pub fn decline_incoming(&self) -> bool {
-        match self.take_phase() {
-            Some(CallPhase::Incoming { peer, call_id, .. }) => {
-                self.send_decline(&peer, call_id, REASON_DECLINED);
-                self.mark_declined(&peer);
-                self.block(&peer, BLOCK_AFTER);
-                self.disconnect_later(&peer, 800);
-                true
+        let declined = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return false;
+            };
+            if let CallPhase::Incoming { peer, call_id, .. } = &*phase {
+                let call = (peer.clone(), *call_id);
+                *phase = CallPhase::Idle;
+                Some(call)
+            } else {
+                None
             }
-            Some(other) => {
-                self.put_phase(other);
-                false
-            }
-            None => false,
-        }
+        };
+        let Some((peer, call_id)) = declined else {
+            return false;
+        };
+        self.send_decline(&peer, call_id, REASON_DECLINED);
+        self.mark_declined(&peer);
+        self.block(&peer, BLOCK_AFTER);
+        self.disconnect_later(&peer, 800);
+        true
     }
 
     /// Отменить свой звонок, пока не ответили
     pub fn cancel_outgoing(&self) {
-        let Some(current) = self.take_phase() else {
+        let cancelled = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            if let CallPhase::Outgoing { peer, call_id, .. } = &*phase {
+                let call = (peer.clone(), *call_id);
+                *phase = CallPhase::Idle;
+                Some(call)
+            } else {
+                None
+            }
+        };
+        let Some((peer, call_id)) = cancelled else {
             return;
         };
-        match current {
-            CallPhase::Outgoing { peer, call_id, .. } => {
-                self.send_to(
-                    &peer,
-                    NetworkMessage::CallCancel {
-                        sender_id: self.my_id,
-                        call_id,
-                    },
-                );
-                self.block(&peer, BLOCK_AFTER);
-                self.drop_from_room(&peer);
-                self.disconnect_later(&peer, 600);
-            }
-            other => self.put_phase(other),
-        }
+        self.send_to(
+            &peer,
+            NetworkMessage::CallCancel {
+                sender_id: self.my_id,
+                call_id,
+            },
+        );
+        self.block(&peer, BLOCK_AFTER);
+        self.drop_from_room(&peer);
+        self.disconnect_later(&peer, 600);
     }
 
     /// Завершить состоявшийся разговор
     pub fn end_active(&self) {
-        let Some(current) = self.take_phase() else {
+        let ended = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            if let CallPhase::Active { peer, call_id, .. } = &*phase {
+                let call = (peer.clone(), *call_id);
+                *phase = CallPhase::Idle;
+                Some(call)
+            } else {
+                None
+            }
+        };
+        let Some((peer, call_id)) = ended else {
             return;
         };
-        match current {
-            CallPhase::Active { peer, call_id, .. } => {
-                self.send_to(
-                    &peer,
-                    NetworkMessage::CallEnd {
-                        sender_id: self.my_id,
-                        call_id,
-                    },
-                );
-                // Завершили — собеседник больше не участник эфира, пока не
-                // позвонят или не нажмут «Войти». Иначе его Heartbeat/IrohSync
-                // через секунду возвращал его в комнату.
-                self.block(&peer, BLOCK_AFTER);
-                self.drop_from_room(&peer);
-                self.disconnect_later(&peer, 600);
-            }
-            other => self.put_phase(other),
-        }
+        self.send_to(
+            &peer,
+            NetworkMessage::CallEnd {
+                sender_id: self.my_id,
+                call_id,
+            },
+        );
+        // Завершили — собеседник больше не участник эфира, пока не
+        // позвонят или не нажмут «Войти». Иначе его Heartbeat/IrohSync
+        // через секунду возвращал его в комнату.
+        self.block(&peer, BLOCK_AFTER);
+        self.drop_from_room(&peer);
+        self.disconnect_later(&peer, 600);
     }
 
     // ————— Входящие сообщения (из iroh_service) —————
 
     pub fn on_invite(&self, peer: &str, nick: &str, call_id: u32) {
-        let Some(current) = self.take_phase() else {
-            return;
-        };
-        match current {
-            CallPhase::Idle => {
-                if self.declined_now(peer) {
-                    // Повторный Invite после отказа — отвечаем отказом снова
-                    self.send_decline(peer, call_id, REASON_DECLINED);
-                } else {
-                    self.put_phase(CallPhase::Incoming {
-                        peer: peer.to_string(),
-                        nick: nick.to_string(),
-                        call_id,
-                        started: Instant::now(),
-                    });
-                }
-            }
-            CallPhase::Incoming {
-                peer: p,
-                nick: n,
-                call_id: c,
-                started,
-            } => {
-                if p == peer {
-                    // Повтор нашего же приглашения: звеним дальше
-                    if c == call_id {
-                        self.put_phase(CallPhase::Incoming {
-                            peer: p,
-                            nick: n,
-                            call_id: c,
-                            started,
-                        });
+        enum Act {
+            None,
+            Decline(u8),
+            /// Встречный звонок принят — подтвердить по call_id
+            Accept(u32),
+        }
+        let act = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            match &mut *phase {
+                CallPhase::Idle => {
+                    if self.declined_now(peer) {
+                        // Повторный Invite после отказа — отвечаем отказом снова
+                        Act::Decline(REASON_DECLINED)
                     } else {
-                        self.put_phase(CallPhase::Incoming {
-                            peer: p,
+                        *phase = CallPhase::Incoming {
+                            peer: peer.to_string(),
                             nick: nick.to_string(),
                             call_id,
                             started: Instant::now(),
-                        });
+                        };
+                        Act::None
                     }
-                } else {
-                    self.put_phase(CallPhase::Incoming {
-                        peer: p,
-                        nick: n,
-                        call_id: c,
-                        started,
-                    });
-                    self.send_decline(peer, call_id, REASON_BUSY);
+                }
+                CallPhase::Incoming {
+                    peer: p,
+                    nick: n,
+                    call_id: c,
+                    started,
+                } => {
+                    if p == peer {
+                        // Повтор нашего же приглашения: звеним дальше, но новый
+                        // call_id означает, что собеседник перезвонил заново
+                        if *c != call_id {
+                            *n = nick.to_string();
+                            *c = call_id;
+                            *started = Instant::now();
+                        }
+                        Act::None
+                    } else {
+                        Act::Decline(REASON_BUSY)
+                    }
+                }
+                CallPhase::Outgoing {
+                    peer: p, nick: n, ..
+                } => {
+                    if p == peer {
+                        // Оба позвонили одновременно: принимаем встречный звонок
+                        let peer = p.clone();
+                        let nick = n.clone();
+                        *phase = CallPhase::Active {
+                            peer,
+                            nick,
+                            call_id,
+                            started: Instant::now(),
+                        };
+                        Act::Accept(call_id)
+                    } else {
+                        Act::Decline(REASON_BUSY)
+                    }
+                }
+                CallPhase::Active { peer: p, call_id: c, .. } => {
+                    if p == peer {
+                        // Повторный Invite: звонящий не получил Accept
+                        Act::Accept(*c)
+                    } else {
+                        Act::Decline(REASON_BUSY)
+                    }
                 }
             }
-            CallPhase::Outgoing {
-                peer: p,
-                nick: n,
-                call_id: c,
-                started,
-                last_invite,
-            } => {
-                if p == peer {
-                    // Оба позвонили одновременно: принимаем встречный звонок
-                    self.put_phase(CallPhase::Active {
-                        peer: p,
-                        nick: n,
-                        call_id,
-                        started: Instant::now(),
-                    });
-                    println!("[ЗВОНКИ] Встречный звонок с {} — принимаем", short(peer));
-                    self.room.join();
-                    self.unblock(peer);
-                    self.send_accept_repeat(peer, call_id);
-                } else {
-                    self.put_phase(CallPhase::Outgoing {
-                        peer: p,
-                        nick: n,
-                        call_id: c,
-                        started,
-                        last_invite,
-                    });
-                    self.send_decline(peer, call_id, REASON_BUSY);
-                }
-            }
-            CallPhase::Active {
-                peer: p,
-                nick: n,
-                call_id: c,
-                started,
-            } => {
-                if p == peer {
-                    self.put_phase(CallPhase::Active {
-                        peer: p,
-                        nick: n,
-                        call_id: c,
-                        started,
-                    });
-                    // Повторный Invite: звонящий не получил Accept
-                    self.send_accept_repeat(peer, c);
-                } else {
-                    self.put_phase(CallPhase::Active {
-                        peer: p,
-                        nick: n,
-                        call_id: c,
-                        started,
-                    });
-                    self.send_decline(peer, call_id, REASON_BUSY);
-                }
+        };
+        match act {
+            Act::None => {}
+            Act::Decline(reason) => self.send_decline(peer, call_id, reason),
+            Act::Accept(cid) => {
+                println!("[ЗВОНКИ] Встречный звонок с {} — принимаем", short(peer));
+                self.room.join();
+                self.unblock(peer);
+                self.send_accept_repeat(peer, cid);
             }
         }
     }
 
-    pub fn on_accept(&self, peer: &str) {
-        let activated = match self.take_phase() {
-            Some(CallPhase::Outgoing {
-                peer: p,
-                nick,
-                call_id,
-                ..
-            }) if p == peer => {
-                self.put_phase(CallPhase::Active {
+    /// `call_id` должен совпасть: иначе запоздавший Accept от предыдущего
+    /// звонка поднимал бы новый (и оверлей «В звонке» без собеседника).
+    pub fn on_accept(&self, peer: &str, call_id: u32) {
+        let activated = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            match &mut *phase {
+                CallPhase::Outgoing {
                     peer: p,
                     nick,
-                    call_id,
-                    started: Instant::now(),
-                });
-                true
+                    call_id: c,
+                    ..
+                } if p == peer && *c == call_id => {
+                    let nick = nick.clone();
+                    *phase = CallPhase::Active {
+                        peer: p.clone(),
+                        nick,
+                        call_id,
+                        started: Instant::now(),
+                    };
+                    true
+                }
+                _ => false,
             }
-            Some(other) => {
-                self.put_phase(other);
-                false
-            }
-            None => false,
         };
         if activated {
             // Мы вошли в комнату собеседника, он — хост
@@ -453,14 +459,22 @@ impl CallManager {
         }
     }
 
-    pub fn on_decline(&self, peer: &str, reason: u8) {
-        let was_outgoing = match self.take_phase() {
-            Some(CallPhase::Outgoing { peer: p, .. }) if p == peer => true,
-            Some(other) => {
-                self.put_phase(other);
-                false
+    pub fn on_decline(&self, peer: &str, call_id: u32, reason: u8) {
+        let was_outgoing = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            match &mut *phase {
+                CallPhase::Outgoing {
+                    peer: p,
+                    call_id: c,
+                    ..
+                } if p == peer && *c == call_id => {
+                    *phase = CallPhase::Idle;
+                    true
+                }
+                _ => false,
             }
-            None => false,
         };
         if !was_outgoing {
             return;
@@ -477,16 +491,24 @@ impl CallManager {
         self.disconnect_later(peer, 400);
     }
 
-    pub fn on_cancel(&self, peer: &str) {
-        let nick = match self.take_phase() {
-            Some(CallPhase::Incoming {
-                peer: p, nick, ..
-            }) if p == peer => Some(nick),
-            Some(other) => {
-                self.put_phase(other);
-                None
+    pub fn on_cancel(&self, peer: &str, call_id: u32) {
+        let nick = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            match &mut *phase {
+                CallPhase::Incoming {
+                    peer: p,
+                    nick,
+                    call_id: c,
+                    ..
+                } if p == peer && *c == call_id => {
+                    let nick = nick.clone();
+                    *phase = CallPhase::Idle;
+                    Some(nick)
+                }
+                _ => None,
             }
-            None => None,
         };
         if let Some(nick) = nick {
             self.set_notice(format!("Пропущенный звонок: {nick}"));
@@ -495,18 +517,32 @@ impl CallManager {
         }
     }
 
-    pub fn on_end(&self, peer: &str) {
-        let ended = match self.take_phase() {
-            Some(
-                CallPhase::Active { peer: p, .. }
-                | CallPhase::Incoming { peer: p, .. }
-                | CallPhase::Outgoing { peer: p, .. },
-            ) if p == peer => true,
-            Some(other) => {
-                self.put_phase(other);
-                false
+    pub fn on_end(&self, peer: &str, call_id: u32) {
+        let ended = {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            match &mut *phase {
+                CallPhase::Active {
+                    peer: p,
+                    call_id: c,
+                    ..
+                }
+                | CallPhase::Incoming {
+                    peer: p,
+                    call_id: c,
+                    ..
+                }
+                | CallPhase::Outgoing {
+                    peer: p,
+                    call_id: c,
+                    ..
+                } if p == peer && *c == call_id => {
+                    *phase = CallPhase::Idle;
+                    true
+                }
+                _ => false,
             }
-            None => false,
         };
         if ended {
             self.set_notice("Звонок завершён".to_string());
@@ -518,45 +554,44 @@ impl CallManager {
 
     /// Раз в кадр: повтор приглашений и таймауты
     pub fn tick(&self) {
-        let Some(mut current) = self.take_phase() else {
-            return;
-        };
         let now = Instant::now();
         let mut resend: Option<(String, u32)> = None;
         let mut timed_out: Option<(String, String, bool)> = None; // peer, nick, исходящий
-
-        match &mut current {
-            CallPhase::Outgoing {
-                peer,
-                nick,
-                call_id,
-                started,
-                last_invite,
-            } => {
-                if now.duration_since(*started) >= OUTGOING_TIMEOUT {
-                    timed_out = Some((peer.clone(), nick.clone(), true));
-                } else if now.duration_since(*last_invite) >= INVITE_RESEND {
-                    *last_invite = now;
-                    resend = Some((peer.clone(), *call_id));
+        {
+            let Ok(mut phase) = self.phase.lock() else {
+                return;
+            };
+            match &mut *phase {
+                CallPhase::Outgoing {
+                    peer,
+                    nick,
+                    call_id,
+                    started,
+                    last_invite,
+                } => {
+                    if now.duration_since(*started) >= OUTGOING_TIMEOUT {
+                        timed_out = Some((peer.clone(), nick.clone(), true));
+                    } else if now.duration_since(*last_invite) >= INVITE_RESEND {
+                        *last_invite = now;
+                        resend = Some((peer.clone(), *call_id));
+                    }
                 }
-            }
-            CallPhase::Incoming {
-                peer,
-                nick,
-                started,
-                ..
-            } => {
-                if now.duration_since(*started) >= INCOMING_TIMEOUT {
-                    timed_out = Some((peer.clone(), nick.clone(), false));
+                CallPhase::Incoming {
+                    peer,
+                    nick,
+                    started,
+                    ..
+                } => {
+                    if now.duration_since(*started) >= INCOMING_TIMEOUT {
+                        timed_out = Some((peer.clone(), nick.clone(), false));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            if timed_out.is_some() {
+                *phase = CallPhase::Idle;
+            }
         }
-
-        if timed_out.is_some() {
-            current = CallPhase::Idle;
-        }
-        self.put_phase(current);
 
         if let Some((peer, call_id)) = resend {
             let my_nick = self.my_nick.lock().map(|n| n.clone()).unwrap_or_default();
@@ -573,6 +608,9 @@ impl CallManager {
         if let Some((peer, nick, was_outgoing)) = timed_out {
             if was_outgoing {
                 self.set_notice(format!("{nick} не ответил"));
+                // Без блокировки его IrohSync через секунду вернул бы его в
+                // комнату, хотя звонок так и не состоялся.
+                self.block(&peer, BLOCK_AFTER);
                 self.drop_from_room(&peer);
                 self.disconnect_later(&peer, 400);
             } else {
@@ -586,19 +624,6 @@ impl CallManager {
     }
 
     // ————— Внутреннее —————
-
-    fn take_phase(&self) -> Option<CallPhase> {
-        self.phase
-            .lock()
-            .ok()
-            .map(|mut g| std::mem::replace(&mut *g, CallPhase::Idle))
-    }
-
-    fn put_phase(&self, phase: CallPhase) {
-        if let Ok(mut g) = self.phase.lock() {
-            *g = phase;
-        }
-    }
 
     fn send_to(&self, peer: &str, msg: NetworkMessage) {
         let Some(p2p) = self.p2p.clone() else {
@@ -735,4 +760,139 @@ fn new_call_id() -> u32 {
 
 fn short(node_id: &str) -> &str {
     &node_id[..node_id.len().min(10)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager() -> CallManager {
+        CallManager::new(
+            1,
+            "Я".to_string(),
+            None,
+            Arc::new(RoomManager::new(1)),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    fn call_id_of(m: &CallManager) -> u32 {
+        match &*m.phase.lock().unwrap() {
+            CallPhase::Outgoing { call_id, .. }
+            | CallPhase::Incoming { call_id, .. }
+            | CallPhase::Active { call_id, .. } => *call_id,
+            CallPhase::Idle => panic!("фаза Idle"),
+        }
+    }
+
+    #[test]
+    fn outgoing_accept_requires_matching_call_id() {
+        let m = manager();
+        assert!(m.start_outgoing("peerA", "Друг", "Я"));
+        assert!(matches!(m.view(), CallView::Outgoing { .. }));
+
+        let id = call_id_of(&m);
+        // запоздавший Accept от прошлого звонка не должен поднимать новый
+        m.on_accept("peerA", id ^ u32::MAX);
+        assert!(matches!(m.view(), CallView::Outgoing { .. }));
+
+        m.on_accept("peerA", id);
+        assert!(matches!(m.view(), CallView::Active { .. }));
+        assert!(!m.is_blocked("peerA"));
+    }
+
+    #[test]
+    fn second_call_refused_while_busy() {
+        let m = manager();
+        assert!(m.start_outgoing("peerA", "А", "Я"));
+        assert!(!m.start_outgoing("peerB", "Б", "Я"));
+        assert_eq!(m.take_notice().as_deref(), Some("Вы уже в звонке"));
+    }
+
+    #[test]
+    fn decline_blocks_peer() {
+        let m = manager();
+        m.start_outgoing("peerA", "А", "Я");
+        let id = call_id_of(&m);
+        m.on_decline("peerA", id, REASON_DECLINED);
+        assert!(matches!(m.view(), CallView::Idle));
+        assert!(m.is_blocked("peerA"));
+        assert_eq!(m.take_notice().as_deref(), Some("Звонок отклонён"));
+    }
+
+    #[test]
+    fn busy_reason_notice() {
+        let m = manager();
+        m.start_outgoing("peerA", "А", "Я");
+        let id = call_id_of(&m);
+        m.on_decline("peerA", id, REASON_BUSY);
+        assert_eq!(m.take_notice().as_deref(), Some("Собеседник занят"));
+    }
+
+    #[test]
+    fn incoming_accept_and_end() {
+        let m = manager();
+        m.on_invite("peerB", "Б", 77);
+        assert!(matches!(m.view(), CallView::Incoming { .. }));
+        assert!(m.is_blocked("peerB"));
+
+        assert!(m.accept_incoming());
+        assert!(matches!(m.view(), CallView::Active { .. }));
+        assert!(!m.is_blocked("peerB"));
+
+        m.end_active();
+        assert!(matches!(m.view(), CallView::Idle));
+        assert!(m.is_blocked("peerB"), "после завершения собеседник вне комнаты");
+    }
+
+    #[test]
+    fn cancel_with_wrong_call_id_ignored() {
+        let m = manager();
+        m.on_invite("peerB", "Б", 5);
+        m.on_cancel("peerB", 6);
+        assert!(matches!(m.view(), CallView::Incoming { .. }));
+        m.on_cancel("peerB", 5);
+        assert!(matches!(m.view(), CallView::Idle));
+    }
+
+    #[test]
+    fn busy_declines_second_invite() {
+        let m = manager();
+        m.on_invite("peerB", "Б", 1);
+        m.on_invite("peerC", "В", 2);
+        match m.view() {
+            CallView::Incoming { nick, .. } => assert_eq!(nick, "Б"),
+            other => panic!("ожидали Incoming, получили {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simultaneous_call_becomes_active() {
+        let m = manager();
+        m.start_outgoing("peerA", "А", "Я");
+        m.on_invite("peerA", "А", 42);
+        assert!(matches!(m.view(), CallView::Active { .. }));
+    }
+
+    #[test]
+    fn decline_repeats_after_own_refusal() {
+        let m = manager();
+        m.on_invite("peerB", "Б", 9);
+        assert!(m.decline_incoming());
+        assert!(matches!(m.view(), CallView::Idle));
+        // звонящий повторяет Invite — снова отказ, карточка не всплывает
+        m.on_invite("peerB", "Б", 10);
+        assert!(matches!(m.view(), CallView::Idle));
+    }
+
+    #[test]
+    fn stale_end_ignored() {
+        let m = manager();
+        m.on_invite("peerB", "Б", 11);
+        assert!(m.accept_incoming());
+        m.on_end("peerB", 12);
+        assert!(matches!(m.view(), CallView::Active { .. }));
+        m.on_end("peerB", 11);
+        assert!(matches!(m.view(), CallView::Idle));
+    }
 }
