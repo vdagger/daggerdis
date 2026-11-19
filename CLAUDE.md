@@ -84,13 +84,13 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/identity.rs` | Pinned iroh `SecretKey` (`secret.key`), `my_id` = FNV-1a hash of NodeID, reset |
 | `src/friends.rs` | `FriendsManager`: `friends.json` (node_id/name/date), incoming/outgoing requests |
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
-| `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
+| `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), переходы под одним замком, проверка `call_id` в Accept/Decline/Cancel/End, приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
-| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, linear resample, Opus, noise gate + AGC, per-peer mix bus |
-| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
+| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, Opus, опциональные noise gate + AGC + лимитер (по умолчанию выкл.), per-peer mix bus |
+| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, тумблеры `dsp_enabled`/`rx_limiter_enabled` — оба по умолчанию выкл.), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
-| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume, `video_fps`) |
+| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume, `video_fps`, `mic_processing`, `rx_limiter`) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
@@ -131,8 +131,8 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 |-----|---------|--------------------|
 | 0 | `Heartbeat` | `sender_id` u64 LE, `is_host` u8 |
 | 3 | `AudioFrame` | `sender_id` u64 LE, `seq` u32 LE, `opus_data` (rest of payload) |
-| 4 | `HostMigration` | `new_host_id` u64 LE |
-| 5 | `IrohSync` | `sender_id` u64 LE, `is_host` u8, `len` u16 LE, `node_id` UTF-8 |
+| 4 | `HostMigration` | `sender_id` u64 LE, `new_host_id` u64 LE (принимается только если `sender_id == new_host_id` и совпадает с NodeID соединения) |
+| 5 | `IrohSync` | `sender_id` u64 LE, `is_host` u8, `hops` u8 (0 — от самого узла, 1 — переслан хостом, дальше не релеится), `len` u16 LE, `node_id` UTF-8 |
 | 6 | `FriendRequest` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 7 | `FriendAccept` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 8 | `FriendRemove` | `sender_id` u64 LE, `node_id` str |
@@ -220,16 +220,23 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
 - **Anti-impersonation:** `iroh_service.rs` recomputes `hash(QUIC NodeID)` for every
   received packet and drops any message whose `sender_id` doesn't match. The QUIC NodeID
   is authenticated by iroh's TLS.
-- **DSP chain, передача:** noise gate (−44 dBFS) → linear resampler (`resample_linear`,
-  preserves pitch across any card rate) → `TransmitAgc` (цель −20 dBFS RMS, усиление
-  −12…+24 дБ) → `Limiter` (−1 dBFS) → Opus 64 kbps.
-- **DSP chain, приём:** `Limiter` на каждый голос **не ставится** — персональная
+- **Обработка звука — опцией, по умолчанию выключена.** Тумблеры «Шумовой затвор,
+  AGC и лимитер» и «Лимитер приёма» в настройках звука (`mic_processing=1` /
+  `rx_limiter=1` в `config.ini`). Причина: у одного из собеседников тракт
+  загонял тихую речь в гейт и AGC, и его почти не было слышно, хотя обратный
+  канал звучал нормально. Сырой микрофон честнее; обработку включают по желанию.
+- **DSP chain, передача (при включённой обработке):** noise gate (−44 dBFS) →
+  linear resampler (`resample_linear`, preserves pitch across any card rate, работает
+  всегда) → `TransmitAgc` (цель −20 dBFS RMS, усиление −12…+24 дБ) → `Limiter`
+  (−1 dBFS) → Opus 64 kbps. Выключена — в Opus идёт сигнал после ресэмплера и мьюта.
+- **DSP chain, приём:** миксовый `Limiter` тоже опционален (`rx_limiter`).
+  `Limiter` на каждый голос **не ставится** — персональная
   громкость (слайдер в дБ, −30…+18) умножается на декодированный буфер, голоса
   складываются в общий микс, и уже микс проходит master gain + один `Limiter` (−1 dBFS).
   Порог пика у каждого голоса отдельно съедал персональный буст: при пиках 0.3 из
   +18 дБ оставалось ~+10, при 0.5 — ~+5.7, а если общая громкость уже стояла на 300%,
   персональная не добавляла почти ничего.
-- **AGC на передаче — это и есть «как в Discord»:** без него микрофон с речью на
+- **AGC на передаче (когда обработка включена) — это и есть «как в Discord»:** без него микрофон с речью на
   −20 dBFS уходил в эфир на −20 dBFS, и громкость добиралась уже у собеседника.
   Ниже −66 dBFS RMS усиление не трогается — тихая речь этого порога достигает,
   а шум в паузах до AGC не доходит вовсе: гейт обнуляет его раньше.
@@ -275,7 +282,15 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   одновременный вызов с двух сторон разрешается автоответом на встречное
   приглашение. Отклонение/«занято»/«не ответил» видны тостом; шапка звонка —
   оверлей `draw_call_overlay` с крупной красной кнопкой «Завершить звонок»
-  («Отменить звонок» у исходящего), `Esc` делает то же самое. На входящем звонке
+  («Отменить звонок» у исходящего), `Esc` делает то же самое. В активном
+  разговоре карточки-оверлея нет — только компактная пилюля в правом верхнем
+  углу (точка LIVE, ник, таймер, «Завершить»), она не закрывает трансляцию.
+  Карточка «Принять/Отклонить» раньше не исчезала после ответа: методы звонков
+  снимали фазу (`take_phase`) и клали её назад (`put_phase`), поэтому
+  устаревшая `Incoming` затирала только что установленную `Active`. Теперь все
+  переходы идут под одним замком, а `on_accept`/`on_decline`/`on_cancel`/`on_end`
+  дополнительно сверяют `call_id` — иначе запоздавший `Accept` прошлого звонка
+  поднимал новый. На входящем звонке
   окно один раз запрашивает внимание панели задач
   (`ViewportCommand::RequestUserAttention`), иначе свёрнутое приложение звонок
   «просто не слышно». Тон звонка синтезируется в колбэке воспроизведения
@@ -402,6 +417,18 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   default config, and `build_playback<T>` is generic over the sample type (the
   jitter buffer and decoders stay in f32 and are converted at the end of the
   callback). The chosen format is printed with the device line.
+- **The microphone stream must match the card's format too.** `create_input_stream`
+  used to build every stream from `f32` no matter what the device accepted — on a
+  mic that only takes `i16` the stream failed to open (or was built against a
+  config it cannot use), and the microphone silently stayed dead while reception
+  worked fine: exactly the "my friend can't hear me, but I hear him" case.
+  Candidates are now `f32@48k → i16@48k → i32@48k →` the device's default config,
+  and `build_input<T>` is generic over the sample type. Both the chosen format
+  and the device are logged (`[АУДИО] Открыт микрофон: …`).
+- **A saved device that has vanished falls back to the default one.** A USB mic
+  unplugged between sessions left the app with no input at all: `stream_control.rs`
+  now logs «Выбранное устройство не найдено … — берём … по умолчанию» and opens the
+  system default instead of failing.
 - **A multichannel endpoint gets the signal in two channels only.** On a
   virtual 7.1 output (`Динамики (7.1 Surround Sound)`, 8 channels) writing the
   same mono sample into all eight made the peer's speech a mush: the
