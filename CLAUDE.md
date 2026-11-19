@@ -60,8 +60,9 @@ normal terminal triggers a UAC prompt.
    - `packet_tx/rx: Vec<u8>` — outbound encoded voice.
    - `playback_tx/rx: (u64, u32, Vec<u8>)` — inbound `(sender_id, seq, opus)`.
 7. Spawn background tasks:
-   - `iroh_service::spawn_iroh_receiver` — Iroh listener + full-mesh + relay + friends + chat + calls.
+   - `iroh_service::spawn_iroh_receiver` — Iroh listener + full-mesh + relay + friends + chat + calls + presence.
    - `broadcast::spawn_audio_broadcast` — fan-out voice over Iroh.
+   - `presence::spawn_ping_loop` — пинг друзей раз в 4 с (`PresencePing`/`Pong`), только если iroh поднялся.
    - `MigrationManager::start_heartbeat_loop` — 1 s IrohSync / host failover.
 8. On Windows: `video_link::VideoLink::spawn(p2p, rt.handle())` — the video
    transport (its own ALPN). It must be spawned with the runtime `Handle`, not
@@ -83,6 +84,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/types.rs` | `Peer { id, address, is_host, last_heartbeat }` — `address` holds the bare NodeID |
 | `src/identity.rs` | Pinned iroh `SecretKey` (`secret.key`), `my_id` = FNV-1a hash of NodeID, reset |
 | `src/friends.rs` | `FriendsManager`: `friends.json` (node_id/name/date), incoming/outgoing requests |
+| `src/presence.rs` | `PresenceTracker`: кто из друзей недавно подавал признаки жизни (TTL 12 с) + фоновый ping-цикл раз в 4 с |
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
 | `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), переходы под одним замком, проверка `call_id` в Accept/Decline/Cancel/End, приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
@@ -142,6 +144,8 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 12 | `CallDecline` | `sender_id` u64 LE, `call_id` u32 LE, `reason` u8 (0 отклонён / 1 занято / 2 таймаут) |
 | 13 | `CallCancel` | `sender_id` u64 LE, `call_id` u32 LE |
 | 14 | `CallEnd` | `sender_id` u64 LE, `call_id` u32 LE |
+| 15 | `PresencePing` | `sender_id` u64 LE — «ты в сети?»; пинг живёт вне комнаты |
+| 16 | `PresencePong` | `sender_id` u64 LE — ответ на пинг |
 
 Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP mesh.
 
@@ -331,6 +335,17 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   потому что реестр cargo на сборочной машине принадлежит другому пользователю.
   Если в такой VM и DX12-адаптера нет (`Failed to create wgpu adapter`), GUI там
   не поднять вовсе — приложение проверяется на обычной машине.
+- **Онлайн-статус друзей — по пингу, а не по комнате.** `PresenceTracker`
+  (`src/presence.rs`) держит `HashMap<NodeID, Instant>` с TTL 12 с: `spawn_ping_loop`
+  раз в 4 с шлёт `PresencePing` друзьям без свежей отметки (отдельной задачей и с
+  таймаутом 6 с — `send_bytes` сам поднимает соединение по NodeID, поэтому друг,
+  только что запустивший приложение, загорается без ручного «Войти»). Любой
+  входящий пакет отмечает узел живым по `pkt.sender_id` — это NodeID соединения
+  из QUIC/TLS, а не поле пакета: релейный `IrohSync` несёт чужой `node_id`, и
+  отмечать его нельзя. На пинг отвечаем `PresencePong`. `Heartbeat`/`IrohSync` для
+  этого не годятся — они существуют только внутри комнаты. В панели друзей точка
+  зелёная/серая; «Позвонить» офлайн-другу не гудит 35 с в пустоту, а сразу
+  показывает тост «… не в сети».
 - **Chat (DM):** session-only and in-memory (`src/chat.rs`, never persisted) — by
   design, so chat history cannot leak to disk. Friends-only: messages from non-friends
   are dropped. Transport is iroh **datagrams** with a reliable uni-stream fallback in
