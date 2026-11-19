@@ -144,14 +144,50 @@ pub struct PeerMeter {
     pub peak: f32,
 }
 
+/// Профиль обработки входа: голосу нужны затвор и AGC, инструменту они вредят
+/// (AGC осаживает удары и «дышит» на затухающих нотах).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SlotProfile {
+    Voice = 0,
+    Instrument = 1,
+}
+
+impl SlotProfile {
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            1 => Self::Instrument,
+            _ => Self::Voice,
+        }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Voice => "Голос",
+            Self::Instrument => "Инструмент",
+        }
+    }
+
+    /// Затвор и AGC — только для голоса: инструмент с затвором теряет
+    /// затухающие ноты, а AGC выравнивает аккорды по громкости.
+    pub fn uses_voice_dsp(self) -> bool {
+        self == Self::Voice
+    }
+}
+
 /// Аудио-микшер для управления громкостью и мьютом
 #[derive(Debug)]
 pub struct AudioMixer {
     mic_muted: AtomicBool,
-    ch1_volume: AtomicU32, // Микрофон (Левый)
-    ch2_volume: AtomicU32, // Гитара (Правый)
+    ch1_volume: AtomicU32, // Вход 1
+    ch2_volume: AtomicU32, // Вход 2
     input1_channel: AtomicU32,
     input2_channel: AtomicU32,
+    input1_profile: AtomicU32,
+    input2_profile: AtomicU32,
     output_volume: AtomicU32,
     input1_peak: AtomicU32,
     input2_peak: AtomicU32,
@@ -181,6 +217,8 @@ impl AudioMixer {
             ch2_volume: AtomicU32::new(100),
             input1_channel: AtomicU32::new(0),
             input2_channel: AtomicU32::new(1),
+            input1_profile: AtomicU32::new(SlotProfile::Voice.as_u32()),
+            input2_profile: AtomicU32::new(SlotProfile::Instrument.as_u32()),
             output_volume: AtomicU32::new(100),
             input1_peak: AtomicU32::new(0),
             input2_peak: AtomicU32::new(0),
@@ -372,6 +410,24 @@ impl AudioMixer {
         self.input2_channel.store(channel, Ordering::Relaxed);
     }
 
+    /// Профиль обработки Входа 1: голос (затвор + AGC) или инструмент
+    pub fn input1_profile(&self) -> SlotProfile {
+        SlotProfile::from_u32(self.input1_profile.load(Ordering::Relaxed))
+    }
+
+    pub fn set_input1_profile(&self, profile: SlotProfile) {
+        self.input1_profile.store(profile.as_u32(), Ordering::Relaxed);
+    }
+
+    /// Профиль обработки Входа 2
+    pub fn input2_profile(&self) -> SlotProfile {
+        SlotProfile::from_u32(self.input2_profile.load(Ordering::Relaxed))
+    }
+
+    pub fn set_input2_profile(&self, profile: SlotProfile) {
+        self.input2_profile.store(profile.as_u32(), Ordering::Relaxed);
+    }
+
     pub fn output_volume(&self) -> u32 {
         self.output_volume.load(Ordering::Relaxed)
     }
@@ -469,5 +525,21 @@ mod tests {
         assert_eq!(m.get_peer_volume(7), 100);
         m.set_peer_volume(7, 9999);
         assert_eq!(m.get_peer_volume(7), 300);
+    }
+
+    #[test]
+    fn profile_defaults_and_roundtrip() {
+        let m = AudioMixer::new();
+        // Вход 1 — голос, второй (гитарный) — инструмент, как в старой раскладке.
+        assert_eq!(m.input1_profile(), SlotProfile::Voice);
+        assert_eq!(m.input2_profile(), SlotProfile::Instrument);
+        assert!(m.input1_profile().uses_voice_dsp());
+        assert!(!m.input2_profile().uses_voice_dsp());
+        m.set_input1_profile(SlotProfile::Instrument);
+        m.set_input2_profile(SlotProfile::Voice);
+        assert_eq!(m.input1_profile(), SlotProfile::Instrument);
+        assert_eq!(m.input2_profile(), SlotProfile::Voice);
+        // Мусор в конфиге не должен давать третьего профиля.
+        assert_eq!(SlotProfile::from_u32(42), SlotProfile::Voice);
     }
 }

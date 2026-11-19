@@ -19,6 +19,8 @@ pub fn draw_audio_settings(
     input_channel_counts: &[u32],
     output_devices: &[String],
     selected_input: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    selected_input2: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    input2_error: Option<&str>,
     selected_output: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     mixer: &crate::mixer::AudioMixer,
     ptt_bind: &mut Option<crate::keybind::PttBind>,
@@ -30,8 +32,8 @@ pub fn draw_audio_settings(
         .cloned()
         .unwrap_or_else(|| "Не выбрано".to_string());
 
-    // Входное устройство
-    t::section_label(ui, "ВХОДНОЕ УСТРОЙСТВО");
+    // Вход 1
+    t::section_label(ui, "ВХОД 1 · УСТРОЙСТВО");
     ui.add_space(4.0);
     egui::ComboBox::from_id_source("input_device_combo")
         .width(ui.available_width())
@@ -49,12 +51,12 @@ pub fn draw_audio_settings(
             }
         });
 
-    ui.add_space(14.0);
+    ui.add_space(6.0);
+    profile_chips(ui, mixer.input1_profile(), |p| mixer.set_input1_profile(p));
 
-    // Вход 1
-    input_block(
+    ui.add_space(6.0);
+    input_controls(
         ui,
-        "МИКРОФОН",
         mixer.input1_peak(),
         mixer.ch1_volume(),
         |v| mixer.set_ch1_volume(v),
@@ -64,20 +66,76 @@ pub fn draw_audio_settings(
         "ch1",
     );
 
-    ui.add_space(12.0);
+    ui.add_space(14.0);
 
-    // Вход 2
-    input_block(
+    // Вход 2: либо вторая дорожка первой карты, либо отдельное устройство
+    let in2_sel = selected_input2.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let in2_name = if in2_sel == 0 {
+        "То же устройство".to_string()
+    } else {
+        input_devices
+            .get(in2_sel - 1)
+            .cloned()
+            .unwrap_or_else(|| "Не выбрано".to_string())
+    };
+    let in2_count = if in2_sel == 0 {
+        in_count
+    } else {
+        input_channel_counts.get(in2_sel - 1).copied().unwrap_or(0) as usize
+    };
+
+    t::section_label(ui, "ВХОД 2 · УСТРОЙСТВО");
+    ui.add_space(4.0);
+    egui::ComboBox::from_id_source("input2_device_combo")
+        .width(ui.available_width())
+        .selected_text(truncate_name(&in2_name, 34))
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_value(
+                    &mut selected_input2.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "То же устройство",
+                )
+                .changed()
+            {
+                selected_input2.store(0, std::sync::atomic::Ordering::Relaxed);
+                println!("[АУДИО] Второй вход: та же карта");
+            }
+            for (i, device) in input_devices.iter().enumerate() {
+                let mut current = selected_input2.load(std::sync::atomic::Ordering::Relaxed);
+                if ui
+                    .selectable_value(&mut current, i as u32 + 1, device)
+                    .changed()
+                {
+                    selected_input2.store(current, std::sync::atomic::Ordering::Relaxed);
+                    println!("[АУДИО] Выбран второй вход: {}", device);
+                }
+            }
+        });
+
+    ui.add_space(6.0);
+    profile_chips(ui, mixer.input2_profile(), |p| mixer.set_input2_profile(p));
+
+    ui.add_space(6.0);
+    input_controls(
         ui,
-        "ГИТАРА",
         mixer.input2_peak(),
         mixer.ch2_volume(),
         |v| mixer.set_ch2_volume(v),
         mixer.input2_channel(),
         |c| mixer.set_input2_channel(c),
-        in_count,
+        in2_count,
         "ch2",
     );
+
+    if let Some(err) = input2_error {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!("Второй вход молчит: {}", err))
+                .size(9.5)
+                .color(t::REC),
+        );
+    }
 
     ui.add_space(16.0);
     ui.separator();
@@ -226,9 +284,33 @@ pub fn draw_audio_settings(
     );
 }
 
-fn input_block(
+/// Профиль обработки входа: голос (затвор + AGC) или инструмент (без них).
+/// Действует только при включённой обработке звука.
+fn profile_chips(
     ui: &mut egui::Ui,
-    title: &str,
+    current: crate::mixer::SlotProfile,
+    set: impl Fn(crate::mixer::SlotProfile),
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Профиль")
+                .size(10.5)
+                .color(t::TEXT_MUTED),
+        );
+        ui.add_space(4.0);
+        for profile in [
+            crate::mixer::SlotProfile::Voice,
+            crate::mixer::SlotProfile::Instrument,
+        ] {
+            if t::chip_button(ui, profile.label(), profile == current).clicked() {
+                set(profile);
+            }
+        }
+    });
+}
+
+fn input_controls(
+    ui: &mut egui::Ui,
     level: f32,
     volume: u32,
     set_volume: impl Fn(u32),
@@ -238,7 +320,11 @@ fn input_block(
     id: &str,
 ) {
     ui.horizontal(|ui| {
-        t::section_label(ui, title);
+        ui.label(
+            egui::RichText::new("Громкость")
+                .size(10.5)
+                .color(t::TEXT_MUTED),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 6.0), egui::Sense::hover());
             t::vu_meter(&ui.painter_at(rect), rect, level);

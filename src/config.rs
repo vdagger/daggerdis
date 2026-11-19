@@ -10,6 +10,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default)]
 pub struct AppConfig {
     pub input_device: Option<String>,
+    /// Второй физический вход. Пусто или совпадает с `input_device` — входы
+    /// берутся с двух каналов одной карты, как раньше.
+    pub input2_device: Option<String>,
     pub output_device: Option<String>,
     pub ptt_vk: Option<i32>,
     pub ch1_volume: Option<u32>,
@@ -17,6 +20,9 @@ pub struct AppConfig {
     pub output_volume: Option<u32>,
     pub input1_channel: Option<u32>,
     pub input2_channel: Option<u32>,
+    /// Профиль обработки входа: 0 — голос, 1 — инструмент.
+    pub input1_profile: Option<u32>,
+    pub input2_profile: Option<u32>,
     pub continuous_mode: Option<bool>,
     /// Частота трансляции экрана (30 или 60 fps); по умолчанию 60.
     pub video_fps: Option<u32>,
@@ -87,6 +93,10 @@ impl AppConfig {
             }
             match key {
                 "input_device" => cfg.input_device = Some(value.to_string()),
+                // Пустое значение — «второй вход с той же карты».
+                "input2_device" if !value.is_empty() => {
+                    cfg.input2_device = Some(value.to_string())
+                }
                 "output_device" => cfg.output_device = Some(value.to_string()),
                 "ptt_vk" => cfg.ptt_vk = value.parse().ok(),
                 "ch1_volume" => cfg.ch1_volume = value.parse().ok(),
@@ -94,6 +104,10 @@ impl AppConfig {
                 "output_volume" => cfg.output_volume = value.parse().ok(),
                 "input1_channel" => cfg.input1_channel = value.parse().ok(),
                 "input2_channel" => cfg.input2_channel = value.parse().ok(),
+                // Профили: всё, кроме 0 и 1, отбрасываем — неизвестный профиль
+                // молча стал бы третьим режимом обработки.
+                "input1_profile" => cfg.input1_profile = value.parse().ok().filter(|v| *v <= 1),
+                "input2_profile" => cfg.input2_profile = value.parse().ok().filter(|v| *v <= 1),
                 "continuous_mode" => cfg.continuous_mode = value.parse().ok(),
                 "video_fps" => cfg.video_fps = value.parse().ok(),
                 "nick" => cfg.nick = Some(value.to_string()),
@@ -109,6 +123,9 @@ impl AppConfig {
         let mut out = String::new();
         if let Some(value) = &self.input_device {
             out.push_str(&format!("input_device={}\n", value));
+        }
+        if let Some(value) = &self.input2_device {
+            out.push_str(&format!("input2_device={}\n", value));
         }
         if let Some(value) = &self.output_device {
             out.push_str(&format!("output_device={}\n", value));
@@ -131,6 +148,12 @@ impl AppConfig {
         if let Some(value) = self.input2_channel {
             out.push_str(&format!("input2_channel={}\n", value));
         }
+        if let Some(value) = self.input1_profile {
+            out.push_str(&format!("input1_profile={}\n", value));
+        }
+        if let Some(value) = self.input2_profile {
+            out.push_str(&format!("input2_profile={}\n", value));
+        }
         if let Some(value) = self.continuous_mode {
             out.push_str(&format!("continuous_mode={}\n", value));
         }
@@ -152,5 +175,47 @@ impl AppConfig {
             out.push_str(&format!("peer_{}_volume={}\n", id, vol));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_has_no_second_input() {
+        // Конфиг до появления второго входа должен читаться без сюрпризов.
+        let cfg = AppConfig::parse("input_device=Микрофон\ninput2_channel=1\nch1_volume=80\n");
+        assert_eq!(cfg.input_device.as_deref(), Some("Микрофон"));
+        assert!(cfg.input2_device.is_none());
+        assert_eq!(cfg.input1_profile, None);
+        assert_eq!(cfg.ch1_volume, Some(80));
+    }
+
+    #[test]
+    fn new_keys_roundtrip() {
+        let cfg = AppConfig::parse(
+            "input2_device=Focusrite\ninput1_profile=0\ninput2_profile=1\n",
+        );
+        assert_eq!(cfg.input2_device.as_deref(), Some("Focusrite"));
+        assert_eq!(cfg.input1_profile, Some(0));
+        assert_eq!(cfg.input2_profile, Some(1));
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.input2_device, cfg.input2_device);
+        assert_eq!(again.input1_profile, cfg.input1_profile);
+        assert_eq!(again.input2_profile, cfg.input2_profile);
+    }
+
+    #[test]
+    fn empty_second_device_is_none() {
+        let cfg = AppConfig::parse("input2_device=\n");
+        assert!(cfg.input2_device.is_none());
+    }
+
+    #[test]
+    fn out_of_range_profile_ignored() {
+        let cfg = AppConfig::parse("input1_profile=7\ninput2_profile=voice\n");
+        assert_eq!(cfg.input1_profile, None);
+        assert_eq!(cfg.input2_profile, None);
     }
 }

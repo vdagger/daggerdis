@@ -1,8 +1,13 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 pub struct UniversalAudioCapture;
+
+/// Канал считается выбранным, только если он существует на карте.
+/// На канал 0 при неверном индексе не откатываемся: иначе моно-микрофон
+/// со старым «вторым каналом» попал бы в оба входа.
+fn channel_usable(channel: u32, total_channels: usize) -> bool {
+    channel != u32::MAX && (channel as usize) < total_channels
+}
 
 /// Программный ресэмплер методом линейной интерполяции
 /// Преобразует аудиопоток из одной частоты дискретизации в другую без изменения тональности (питча)
@@ -37,12 +42,15 @@ impl UniversalAudioCapture {
         Ok(UniversalAudioCapture)
     }
 
+    /// Открывает входной поток. `fill` говорит, какие слоты шины этот поток
+    /// наполняет: `[true, true]` — одна карта на оба входа (как раньше),
+    /// `[true, false]`/`[false, true]` — отдельное физическое устройство.
     pub fn create_input_stream(
         &mut self,
         device: Option<cpal::Device>,
-        ptt_flag: Arc<AtomicBool>,
-        packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-        mixer: std::sync::Arc<crate::mixer::AudioMixer>,
+        tx: crate::txbus::TxContext,
+        fill: [bool; 2],
+        epochs: [u64; 2],
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
         let input_device = match device {
@@ -100,27 +108,15 @@ impl UniversalAudioCapture {
                 name, fmt, cfg.sample_rate.0, cfg.channels
             );
             let attempt = match fmt {
-                cpal::SampleFormat::F32 => Self::build_input::<f32>(
-                    &input_device,
-                    &cfg,
-                    ptt_flag.clone(),
-                    packet_tx.clone(),
-                    mixer.clone(),
-                ),
-                cpal::SampleFormat::I16 => Self::build_input::<i16>(
-                    &input_device,
-                    &cfg,
-                    ptt_flag.clone(),
-                    packet_tx.clone(),
-                    mixer.clone(),
-                ),
-                cpal::SampleFormat::I32 => Self::build_input::<i32>(
-                    &input_device,
-                    &cfg,
-                    ptt_flag.clone(),
-                    packet_tx.clone(),
-                    mixer.clone(),
-                ),
+                cpal::SampleFormat::F32 => {
+                    Self::build_input::<f32>(&input_device, &cfg, tx.clone(), fill, epochs)
+                }
+                cpal::SampleFormat::I16 => {
+                    Self::build_input::<i16>(&input_device, &cfg, tx.clone(), fill, epochs)
+                }
+                cpal::SampleFormat::I32 => {
+                    Self::build_input::<i32>(&input_device, &cfg, tx.clone(), fill, epochs)
+                }
                 other => {
                     eprintln!("[АУДИО] Формат {:?} для микрофона не поддержан", other);
                     continue;
@@ -128,9 +124,14 @@ impl UniversalAudioCapture {
             };
             match attempt {
                 Ok(stream) => {
+                    let slots = match fill {
+                        [true, true] => "1+2",
+                        [true, false] => "1",
+                        _ => "2",
+                    };
                     println!(
-                        "[АУДИО] Открыт микрофон: '{}', частота: {} Гц, каналов: {}, формат: {:?}",
-                        name, cfg.sample_rate.0, cfg.channels, fmt
+                        "[АУДИО] Открыт вход: '{}', частота: {} Гц, каналов: {}, формат: {:?}, слоты: {}",
+                        name, cfg.sample_rate.0, cfg.channels, fmt, slots
                     );
                     return Ok(stream);
                 }
@@ -149,9 +150,11 @@ impl UniversalAudioCapture {
     fn build_input<T>(
         input_device: &cpal::Device,
         config: &cpal::StreamConfig,
-        ptt_flag: Arc<AtomicBool>,
-        packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-        mixer: std::sync::Arc<crate::mixer::AudioMixer>,
+        tx: crate::txbus::TxContext,
+        fill: [bool; 2],
+        // Эпоха фиксируется при сборке потока: у старого колбэка после
+        // перезапуска она другая, и его сэмплы в шину уже не попадут.
+        epochs: [u64; 2],
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>>
     where
         T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -160,123 +163,67 @@ impl UniversalAudioCapture {
         let sample_rate = config.sample_rate.0;
         let total_channels = config.channels as usize;
 
-        // Создаем Opus-энкодер строго на 48000 Гц, 64 kbps
-        let mut encoder = rusty_opus::OpusEncoder::new(48000, 1, rusty_opus::Application::Voip)?;
-        encoder.bitrate_bps = 64_000;
-
-        let mut sample_acc: Vec<f32> = Vec::with_capacity(1920);
-        let mut mono_chunk: Vec<f32> = Vec::with_capacity(960);
-        let mut resample_pos: f64 = 0.0;
-        let mut gate_gain: f32 = 0.0;
-        let mut tx_agc = crate::mixer::TransmitAgc::new();
-        let mut tx_limiter = crate::mixer::Limiter::new(48000);
+        // У каждого слота свой ресэмплер: с общей позицией два независимых
+        // потока из одного колбэка съедали бы по сэмплу на каждой границе.
+        let mut mono: [Vec<f32>; 2] = [Vec::with_capacity(1024), Vec::with_capacity(1024)];
+        let mut resample_pos: [f64; 2] = [0.0, 0.0];
 
         let stream = input_device.build_input_stream(
             config,
             move |data: &[T], _| {
-                mono_chunk.clear();
-                let ch1 = mixer.input1_channel();
-                let ch2 = mixer.input2_channel();
-                let gain1 = mixer.ch1_volume() as f32 / 100.0;
-                let gain2 = mixer.ch2_volume() as f32 / 100.0;
-
-                let mut peak1 = 0.0f32;
-                let mut peak2 = 0.0f32;
-
-                // Сводим выбранные входы в моно с независимым усилением.
-                // Нормируем по числу активных каналов, чтобы сумма не превышала 1.0
-                // (иначе при двух каналах на 100% уровень удваивается и жёстко клиппится).
-                for chunk in data.chunks_exact(total_channels) {
-                    let mut sample = 0.0f32;
-                    let mut active = 0u32;
-                    if (ch1 as usize) < total_channels {
-                        let v1 = <f32 as cpal::FromSample<T>>::from_sample_(chunk[ch1 as usize]);
-                        peak1 = peak1.max(v1.abs());
-                        if gain1 > 0.0 {
-                            sample += v1 * gain1;
-                            active += 1;
-                        }
+                let mixer = &tx.mixer;
+                for slot in 0..2 {
+                    if !fill[slot] {
+                        continue;
                     }
-                    if (ch2 as usize) < total_channels {
-                        let v2 = <f32 as cpal::FromSample<T>>::from_sample_(chunk[ch2 as usize]);
-                        peak2 = peak2.max(v2.abs());
-                        if gain2 > 0.0 {
-                            sample += v2 * gain2;
-                            active += 1;
-                        }
-                    }
-                    if active > 1 {
-                        sample /= active as f32;
-                    }
-                    mono_chunk.push(sample.clamp(-1.0, 1.0));
-                }
+                    let channel = if slot == 0 {
+                        mixer.input1_channel()
+                    } else {
+                        mixer.input2_channel()
+                    };
+                    let volume = if slot == 0 {
+                        mixer.ch1_volume()
+                    } else {
+                        mixer.ch2_volume()
+                    };
+                    mono[slot].clear();
 
-                mixer.set_input1_peak_raw((peak1 * 100.0) as u32);
-                mixer.set_input2_peak_raw((peak2 * 100.0) as u32);
-
-                // Общий мьют
-                mixer.process_input(&mut mono_chunk);
-
-                // Если микрофон работает не на 48 кГц, ресэмплируем строго в 48 000 Гц
-                let normalized_chunk = if sample_rate != 48000 {
-                    resample_linear(&mono_chunk, sample_rate, 48000, &mut resample_pos)
-                } else {
-                    mono_chunk.clone()
-                };
-
-                let mut processed_chunk = normalized_chunk;
-
-                // Гейт, AGC и лимитер — опция из настроек, по умолчанию
-                // выключены: сырой микрофон на приёме честнее, а «проглоченный»
-                // компрессорами голос звучал глухо и тихо.
-                if mixer.is_dsp_enabled() {
-                    // Noise Gate (Шумовой затвор): порог ~ -44 dBFS (0.006)
-                    let chunk_peak = processed_chunk
-                        .iter()
-                        .map(|s| s.abs())
-                        .fold(0.0f32, f32::max);
-                    let target_gain = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
-
-                    for sample in processed_chunk.iter_mut() {
-                        if target_gain > gate_gain {
-                            gate_gain += (target_gain - gate_gain) * 0.1;
+                    // Индекс вне диапазона — «вход выключен». На канал 0 не
+                    // откатываемся: моно-микрофон с сохранённым вторым каналом
+                    // иначе попал бы в оба слота и звучал вдвое громче.
+                    if !channel_usable(channel, total_channels) {
+                        if slot == 0 {
+                            mixer.set_input1_peak_raw(0);
                         } else {
-                            gate_gain += (target_gain - gate_gain) * 0.002;
+                            mixer.set_input2_peak_raw(0);
                         }
-                        *sample *= gate_gain;
+                        continue;
                     }
 
-                    // AGC: тихий микрофон подтягивается до цели по RMS, громкий
-                    // осаживается. Следом страховочный лимитер: в Opus уходит
-                    // не громче −1 dBFS.
-                    tx_agc.process(&mut processed_chunk);
-                    tx_limiter.process(&mut processed_chunk);
-                } else {
-                    // Гейт выключен — не копим закрытый гейн к моменту включения
-                    gate_gain = 1.0;
-                }
-
-                // Прослушивание своего тракта: в динамики уходит ровно то,
-                // что после обработки уйдёт собеседнику.
-                // Не зависит от PTT — баланс микрофона и гитары можно
-                // настраивать, ничего не передавая.
-                mixer.push_monitor(&processed_chunk);
-
-                // Нарезаем ровно по 960 сэмплов (20 мс при 48 кГц) для Opus
-                if ptt_flag.load(Ordering::Relaxed) {
-                    sample_acc.extend_from_slice(&processed_chunk);
-                    while sample_acc.len() >= 960 {
-                        let frame: Vec<f32> = sample_acc.drain(..960).collect();
-                        let mut packet_buf = vec![0u8; 1024];
-                        if let Ok(encoded_len) = encoder.encode(&frame, 960, &mut packet_buf) {
-                            let _ = packet_tx.try_send(packet_buf[..encoded_len].to_vec());
-                        }
+                    // VU — сырой пик канала до усиления, как раньше.
+                    let ch = channel as usize;
+                    let gain = volume as f32 / 100.0;
+                    let mut peak = 0.0f32;
+                    for frame in data.chunks_exact(total_channels) {
+                        let v = <f32 as cpal::FromSample<T>>::from_sample_(frame[ch]);
+                        peak = peak.max(v.abs());
+                        mono[slot].push((v * gain).clamp(-1.0, 1.0));
                     }
-                    if sample_acc.len() > 4800 {
-                        sample_acc.clear();
+                    if slot == 0 {
+                        mixer.set_input1_peak_raw((peak * 100.0) as u32);
+                    } else {
+                        mixer.set_input2_peak_raw((peak * 100.0) as u32);
                     }
-                } else {
-                    sample_acc.clear();
+
+                    // Карта не на 48 кГц — приводим к 48 кГц здесь, чтобы шина
+                    // смешивала сэмплы из одного времени.
+                    if sample_rate != 48000 {
+                        let normalized =
+                            resample_linear(&mono[slot], sample_rate, 48000, &mut resample_pos[slot]);
+                        tx.bus.push(slot, epochs[slot], &normalized);
+                    } else {
+                        tx.bus.push(slot, epochs[slot], &mono[slot]);
+                    }
                 }
             },
             move |err| {
@@ -715,5 +662,23 @@ impl UniversalAudioCapture {
 
         stream.play()?;
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_bounds() {
+        // Выключенный канал
+        assert!(!channel_usable(u32::MAX, 2));
+        // Существующие каналы
+        assert!(channel_usable(0, 2));
+        assert!(channel_usable(1, 2));
+        // Второй канал у моно-микрофона: молчим, а не дублируем первый
+        assert!(!channel_usable(1, 1));
+        // Пустое устройство каналов не имеет
+        assert!(!channel_usable(0, 0));
     }
 }

@@ -4,45 +4,54 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::Stream;
 use std::sync::{Arc, Mutex};
 
-/// Перезапускает аудиопоток микрофона
+/// Перезапускает входной аудиопоток для указанных слотов шины.
+///
+/// Новый поток собирается до остановки старого: если устройство занято
+/// (например, гитарный интерфейс держит DAW в эксклюзивном режиме) или
+/// выдернуто, рабочий вход остаётся живым, а ошибка уходит в настройки.
+/// Для второго входа на «микрофон по умолчанию» не откатываемся — это молча
+/// записало бы в инструмент не тот источник.
 pub fn restart_audio_stream(
-    mic_stream: &Arc<Mutex<Option<Stream>>>,
+    stream_slot: &Arc<Mutex<Option<Stream>>>,
     mut audio: crate::audio::UniversalAudioCapture,
-    packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    ptt_flag: Arc<std::sync::atomic::AtomicBool>,
-    mixer: Arc<crate::mixer::AudioMixer>,
-    device_name: String,
-) {
-    let mut stream_lock = match mic_stream.lock() {
+    tx: crate::txbus::TxContext,
+    fill: [bool; 2],
+    device_name: Option<&str>,
+    allow_default_fallback: bool,
+) -> Result<(), String> {
+    let host = cpal::default_host();
+    let mut device = None;
+    if let Some(name) = device_name {
+        device = host
+            .input_devices()
+            .ok()
+            .and_then(|mut devs| devs.find(|d| d.name().unwrap_or_default() == name));
+        if device.is_none() {
+            if !allow_default_fallback {
+                return Err(format!("устройство не найдено: {}", name));
+            }
+            eprintln!(
+                "[АУДИО] Выбранное устройство не найдено: {} — берём микрофон по умолчанию",
+                name
+            );
+        }
+    }
+
+    // Эпоха подготавливается заранее, а применяется только после успешной
+    // сборки: неудачная попытка не должна оставлять без звука старый поток.
+    let epochs = tx.bus.next_epochs(fill);
+    let new_stream = audio
+        .create_input_stream(device, tx.clone(), fill, epochs)
+        .map_err(|e| e.to_string())?;
+    tx.bus.commit_epochs(fill, epochs);
+
+    let mut stream_lock = match stream_slot.lock() {
         Ok(l) => l,
         Err(p) => p.into_inner(),
     };
-    *stream_lock = None; // Останавливаем старый поток
-
-    // Находим устройство по имени. Если оно исчезло (USB-микрофон выдернули),
-    // молча оставались без звука — теперь откатываемся на устройство по
-    // умолчанию, а не оставляем пользователя без микрофона.
-    let host = cpal::default_host();
-    let device = match host.input_devices().ok().and_then(|mut devs| {
-        devs.find(|d| d.name().unwrap_or_default() == device_name)
-    }) {
-        Some(d) => Some(d),
-        None => {
-            eprintln!(
-                "[АУДИО] Выбранное устройство не найдено: {} — берём микрофон по умолчанию",
-                device_name
-            );
-            None
-        }
-    };
-
-    match audio.create_input_stream(device, ptt_flag, packet_tx, mixer) {
-        Ok(new_stream) => {
-            *stream_lock = Some(new_stream);
-            println!("[GUI] Аудиопоток успешно перезапущен.");
-        }
-        Err(e) => eprintln!("[ОШИБКА] Не удалось перезапустить поток: {}", e),
-    }
+    *stream_lock = Some(new_stream);
+    println!("[GUI] Вход успешно перезапущен.");
+    Ok(())
 }
 
 /// Перезапускает аудиопоток воспроизведения

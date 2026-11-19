@@ -102,6 +102,12 @@ fn main() {
     if let Some(c) = config.input2_channel {
         mixer.set_input2_channel(c);
     }
+    if let Some(p) = config.input1_profile {
+        mixer.set_input1_profile(albus::mixer::SlotProfile::from_u32(p));
+    }
+    if let Some(p) = config.input2_profile {
+        mixer.set_input2_profile(albus::mixer::SlotProfile::from_u32(p));
+    }
     for (id, vol) in &config.peer_volumes {
         mixer.set_peer_volume(*id, *vol);
     }
@@ -138,20 +144,75 @@ fn main() {
         ),
     }
 
+    // Один Opus-энкодер и один поток нарезки кадров — общие для обоих входов.
+    let tx = albus::txbus::TxContext::new(mixer.clone(), ptt_flag.clone(), packet_tx.clone());
+
+    // Входы: либо один поток с двух каналов одной карты (как раньше), либо два
+    // потока с разных устройств. Второй открываем только когда он выбран и
+    // действительно отличается от первого.
     let configured_input = config
         .input_device
         .as_deref()
         .and_then(DeviceSelector::find_input_device_by_name);
-    match audio.create_input_stream(
-        configured_input,
-        ptt_flag.clone(),
-        packet_tx.clone(),
-        mixer.clone(),
-    ) {
-        Ok(stream) => *mic_stream.lock().unwrap() = Some(stream),
-        Err(e) => eprintln!(
-            "[ОШИБКА] Микрофон не открылся: {e}. Вас не будет слышно — выберите другое устройство ввода в настройках."
-        ),
+    let second_name = config
+        .input2_device
+        .as_deref()
+        .filter(|name| config.input_device.as_deref() != Some(*name));
+    let mic_stream2 = Arc::new(Mutex::new(None));
+    let mut separate_inputs = false;
+    if let Some(second) = second_name {
+        match DeviceSelector::find_input_device_by_name(second) {
+            Some(second_device) => {
+                separate_inputs = true;
+                let epochs1 = tx.bus.next_epochs([true, false]);
+                match audio.create_input_stream(
+                    configured_input.clone(),
+                    tx.clone(),
+                    [true, false],
+                    epochs1,
+                ) {
+                    Ok(stream) => {
+                        tx.bus.commit_epochs([true, false], epochs1);
+                        *mic_stream.lock().unwrap() = Some(stream);
+                    }
+                    Err(e) => eprintln!(
+                        "[ОШИБКА] Вход 1 не открылся: {e}. Вас не будет слышно — выберите другое устройство ввода в настройках."
+                    ),
+                }
+                let epochs2 = tx.bus.next_epochs([false, true]);
+                match audio.create_input_stream(
+                    Some(second_device),
+                    tx.clone(),
+                    [false, true],
+                    epochs2,
+                ) {
+                    Ok(stream) => {
+                        tx.bus.commit_epochs([false, true], epochs2);
+                        *mic_stream2.lock().unwrap() = Some(stream);
+                    }
+                    Err(e) => eprintln!(
+                        "[ОШИБКА] Вход 2 ('{}') не открылся: {e}. Он останется молчать, пока устройство не освободится.",
+                        second
+                    ),
+                }
+            }
+            None => eprintln!(
+                "[АУДИО] Второй вход '{}' не найден — оба канала берутся с первой карты.",
+                second
+            ),
+        }
+    }
+    if !separate_inputs {
+        let epochs = tx.bus.next_epochs([true, true]);
+        match audio.create_input_stream(configured_input, tx.clone(), [true, true], epochs) {
+            Ok(stream) => {
+                tx.bus.commit_epochs([true, true], epochs);
+                *mic_stream.lock().unwrap() = Some(stream);
+            }
+            Err(e) => eprintln!(
+                "[ОШИБКА] Микрофон не открылся: {e}. Вас не будет слышно — выберите другое устройство ввода в настройках."
+            ),
+        }
     }
 
     // Звонки: приглашение → «Принять» → разговор; до согласия собеседник
@@ -247,7 +308,8 @@ fn main() {
                 iroh_p2p,
                 my_id,
                 mic_stream,
-                packet_tx,
+                mic_stream2,
+                tx,
                 input_devices,
                 input_channel_counts,
                 output_devices,

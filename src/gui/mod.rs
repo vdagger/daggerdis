@@ -28,8 +28,17 @@ pub struct RadioApp {
     iroh: Option<Arc<crate::network::p2p_iroh::IrohP2pManager>>,
     my_id: u64,
     mic_stream: Arc<Mutex<Option<cpal::Stream>>>,
+    /// Второй физический вход отдельным потоком; `None` — слот 2 читает
+    /// первый поток (две дорожки одной карты).
+    mic_stream2: Arc<Mutex<Option<cpal::Stream>>>,
+    /// Шина кадров: общий Opus-энкодер и нарезка по 20 мс для обоих входов.
+    tx: crate::txbus::TxContext,
     prev_input_index: std::sync::atomic::AtomicU32,
-    packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Выбор второго входа: 0 — «то же устройство», n — устройство n-1.
+    selected_input2: Arc<std::sync::atomic::AtomicU32>,
+    prev_input2: std::sync::atomic::AtomicU32,
+    /// Почему второй вход молчит (занят, выдернут) — строкой в настройках.
+    input2_error: Option<String>,
     input_devices: Vec<String>,
     input_channel_counts: Vec<u32>,
     output_devices: Vec<String>,
@@ -96,7 +105,8 @@ impl RadioApp {
         iroh: Option<Arc<crate::network::p2p_iroh::IrohP2pManager>>,
         my_id: u64,
         mic_stream: Arc<Mutex<Option<cpal::Stream>>>,
-        packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        mic_stream2: Arc<Mutex<Option<cpal::Stream>>>,
+        tx: crate::txbus::TxContext,
         input_devices: Vec<String>,
         input_channel_counts: Vec<u32>,
         output_devices: Vec<String>,
@@ -113,6 +123,12 @@ impl RadioApp {
     ) -> Self {
         let initial_input = selected_input.load(std::sync::atomic::Ordering::Relaxed);
         let initial_output = selected_output.load(std::sync::atomic::Ordering::Relaxed);
+        let initial_input2 = config
+            .input2_device
+            .as_deref()
+            .and_then(|name| input_devices.iter().position(|d| d == name))
+            .map(|i| i as u32 + 1)
+            .unwrap_or(0);
         let nick = config.nick.clone().unwrap_or_else(|| "Гость".to_string());
 
         Self {
@@ -126,8 +142,12 @@ impl RadioApp {
             iroh,
             my_id,
             mic_stream,
+            mic_stream2,
+            tx,
             prev_input_index: std::sync::atomic::AtomicU32::new(initial_input),
-            packet_tx,
+            selected_input2: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(initial_input2)),
+            prev_input2: std::sync::atomic::AtomicU32::new(initial_input2),
+            input2_error: None,
             input_devices,
             input_channel_counts,
             output_devices,
@@ -186,6 +206,94 @@ impl RadioApp {
     ) {
         self.video_link = Some(link);
         self.video_rt = Some(rt);
+    }
+
+    /// Подменяет входные потоки, когда в настройках выбрали другие устройства.
+    /// Второй поток существует только при отдельном устройстве; «То же
+    /// устройство» снова собирает один поток с двух каналов первой карты.
+    fn reconcile_inputs(&mut self) {
+        let current_input = self
+            .selected_input
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let current_input2 = self
+            .selected_input2
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let prev_input = self
+            .prev_input_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let prev_input2 = self.prev_input2.load(std::sync::atomic::Ordering::Relaxed);
+        if current_input == prev_input && current_input2 == prev_input2 {
+            return;
+        }
+        self.prev_input_index
+            .store(current_input, std::sync::atomic::Ordering::Relaxed);
+        self.prev_input2
+            .store(current_input2, std::sync::atomic::Ordering::Relaxed);
+
+        let Some(device1) = self.input_devices.get(current_input as usize).cloned() else {
+            return;
+        };
+        let device2 = if current_input2 == 0 {
+            None
+        } else {
+            self.input_devices
+                .get(current_input2 as usize - 1)
+                .cloned()
+        };
+        let separate = device2
+            .as_deref()
+            .map_or(false, |name| Some(name) != Some(device1.as_str()));
+
+        self.input2_error = None;
+        if separate {
+            let device2 = device2.unwrap_or_default();
+            // Первый поток с отдельным вторым устройством заполняет только
+            // свой слот: иначе канал первой карты попал бы в обе дорожки.
+            if let Err(e) = stream_control::restart_audio_stream(
+                &self.mic_stream,
+                crate::audio::UniversalAudioCapture::new().unwrap(),
+                self.tx.clone(),
+                [true, false],
+                Some(&device1),
+                true,
+            ) {
+                self.show_toast(&format!("Вход 1 не открылся: {}", e));
+            }
+            // Второму входу микрофон по умолчанию не подставляем: в инструмент
+            // молча пошёл бы не тот источник.
+            if let Err(e) = stream_control::restart_audio_stream(
+                &self.mic_stream2,
+                crate::audio::UniversalAudioCapture::new().unwrap(),
+                self.tx.clone(),
+                [false, true],
+                Some(&device2),
+                false,
+            ) {
+                self.input2_error = Some(e);
+            }
+            self.config.input_device = Some(device1);
+            self.config.input2_device = Some(device2);
+        } else {
+            // Сначала гасим второй поток, иначе он продолжит дописывать в слот 2
+            // поверх первого и смесь станет вдвое громче.
+            match self.mic_stream2.lock() {
+                Ok(mut s) => *s = None,
+                Err(p) => *p.into_inner() = None,
+            }
+            if let Err(e) = stream_control::restart_audio_stream(
+                &self.mic_stream,
+                crate::audio::UniversalAudioCapture::new().unwrap(),
+                self.tx.clone(),
+                [true, true],
+                Some(&device1),
+                true,
+            ) {
+                self.show_toast(&format!("Микрофон не открылся: {}", e));
+            }
+            self.config.input_device = Some(device1);
+            self.config.input2_device = None;
+        }
+        self.pending_save = true;
     }
 
     fn apply_theme(&mut self, ctx: &egui::Context) {
@@ -416,28 +524,7 @@ impl eframe::App for RadioApp {
             }
         }
 
-        let current_input_index = self
-            .selected_input
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let prev_input_index = self
-            .prev_input_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if current_input_index != prev_input_index {
-            if let Some(device_name) = self.input_devices.get(current_input_index as usize).cloned() {
-                stream_control::restart_audio_stream(
-                    &self.mic_stream,
-                    crate::audio::UniversalAudioCapture::new().unwrap(),
-                    self.packet_tx.clone(),
-                    self.ptt_flag.clone(),
-                    self.mixer.clone(),
-                    device_name.clone(),
-                );
-                self.config.input_device = Some(device_name);
-                self.pending_save = true;
-            }
-            self.prev_input_index
-                .store(current_input_index, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.reconcile_inputs();
 
         let current_output_index = self
             .selected_output
@@ -1032,8 +1119,12 @@ impl RadioApp {
                 let mut guitar = self.mixer.ch2_volume();
                 let mut peers = self.mixer.output_volume();
 
-                mixer_row(ui, "МИКРОФОН", &mut mic, self.mixer.input1_peak());
-                mixer_row(ui, "ГИТАРА", &mut guitar, self.mixer.input2_peak());
+                // Подпись — профиль обработки: с двумя картами «микрофон» и
+                // «гитара» уже не описывают входы.
+                let in1_label = self.mixer.input1_profile().label().to_uppercase();
+                let in2_label = self.mixer.input2_profile().label().to_uppercase();
+                mixer_row(ui, &in1_label, &mut mic, self.mixer.input1_peak());
+                mixer_row(ui, &in2_label, &mut guitar, self.mixer.input2_peak());
                 mixer_row(ui, "СОБЕСЕДНИКИ", &mut peers, 0.0);
 
                 self.mixer.set_ch1_volume(mic);
@@ -1257,6 +1348,8 @@ impl RadioApp {
                                     &self.input_channel_counts,
                                     &self.output_devices,
                                     &self.selected_input,
+                                    &self.selected_input2,
+                                    self.input2_error.as_deref(),
                                     &self.selected_output,
                                     &self.mixer,
                                     &mut self.ptt_bind,
@@ -1866,6 +1959,16 @@ impl RadioApp {
         let in2 = self.mixer.input2_channel();
         if self.config.input2_channel != Some(in2) {
             self.config.input2_channel = Some(in2);
+            changed = true;
+        }
+        let profile1 = self.mixer.input1_profile().as_u32();
+        if self.config.input1_profile != Some(profile1) {
+            self.config.input1_profile = Some(profile1);
+            changed = true;
+        }
+        let profile2 = self.mixer.input2_profile().as_u32();
+        if self.config.input2_profile != Some(profile2) {
+            self.config.input2_profile = Some(profile2);
             changed = true;
         }
         if self.config.continuous_mode != Some(self.continuous_mode) {
