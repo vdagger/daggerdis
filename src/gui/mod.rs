@@ -1971,6 +1971,11 @@ impl RadioApp {
             self.config.input2_profile = Some(profile2);
             changed = true;
         }
+        let bitrate = self.mixer.opus_bitrate();
+        if self.config.opus_bitrate != Some(bitrate) {
+            self.config.opus_bitrate = Some(bitrate);
+            changed = true;
+        }
         if self.config.continuous_mode != Some(self.continuous_mode) {
             self.config.continuous_mode = Some(self.continuous_mode);
             changed = true;

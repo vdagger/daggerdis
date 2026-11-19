@@ -206,7 +206,13 @@ pub struct AudioMixer {
     /// Страховочный лимитер на общем миксе собеседников. Тоже по умолчанию
     /// выключен: без него громкость приёма ровно такая, какую выставили.
     rx_limiter_enabled: AtomicBool,
+    /// Битрейт Opus на передачу: 64 кбит/с хватает речи, инструменту мало.
+    opus_bitrate: AtomicU32,
 }
+
+/// Допустимые битрейты передачи. Значение вне набора не даёт ничего, кроме
+/// непредсказуемого качества, поэтому и в конфиге, и в UI — только эти три.
+pub const OPUS_BITRATES: [u32; 3] = [64_000, 96_000, 128_000];
 
 impl AudioMixer {
     /// Создает новый аудио-микшер с дефолтными значениями
@@ -229,7 +235,24 @@ impl AudioMixer {
             ring_mode: AtomicU32::new(0),
             dsp_enabled: AtomicBool::new(false),
             rx_limiter_enabled: AtomicBool::new(false),
+            opus_bitrate: AtomicU32::new(64_000),
         }
+    }
+
+    /// Битрейт Opus на передачу (бит/с)
+    pub fn opus_bitrate(&self) -> u32 {
+        self.opus_bitrate.load(Ordering::Relaxed)
+    }
+
+    /// Ближайший допустимый битрейт: значение из настроек может быть старым
+    /// или испорченным, а энкодеру нужно одно из трёх.
+    pub fn set_opus_bitrate(&self, bps: u32) {
+        let nearest = OPUS_BITRATES
+            .iter()
+            .copied()
+            .min_by_key(|v| v.abs_diff(bps))
+            .unwrap_or(64_000);
+        self.opus_bitrate.store(nearest, Ordering::Relaxed);
     }
 
     /// Включена ли обработка микрофона (гейт + AGC + лимитер)
@@ -517,6 +540,18 @@ mod tests {
         m.set_rx_limiter_enabled(true);
         assert!(m.is_dsp_enabled());
         assert!(m.is_rx_limiter_enabled());
+    }
+
+    #[test]
+    fn opus_bitrate_default_and_snap() {
+        let m = AudioMixer::new();
+        assert_eq!(m.opus_bitrate(), 64_000);
+        m.set_opus_bitrate(97_000);
+        assert_eq!(m.opus_bitrate(), 96_000, "округляем до допустимого");
+        m.set_opus_bitrate(400_000);
+        assert_eq!(m.opus_bitrate(), 128_000, "потолок — 128 кбит/с");
+        m.set_opus_bitrate(0);
+        assert_eq!(m.opus_bitrate(), 64_000, "пол — 64 кбит/с");
     }
 
     #[test]

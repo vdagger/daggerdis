@@ -31,6 +31,8 @@ pub struct AppConfig {
     pub mic_processing: Option<bool>,
     /// Лимитер на общем миксе собеседников. По умолчанию выключено.
     pub rx_limiter: Option<bool>,
+    /// Битрейт Opus на передачу (64 000 / 96 000 / 128 000), по умолчанию 64k.
+    pub opus_bitrate: Option<u32>,
     pub peer_volumes: HashMap<u64, u32>,
 }
 
@@ -113,6 +115,11 @@ impl AppConfig {
                 "nick" => cfg.nick = Some(value.to_string()),
                 "mic_processing" => cfg.mic_processing = value.parse().ok(),
                 "rx_limiter" => cfg.rx_limiter = value.parse().ok(),
+                // Битрейт — только из допустимого набора: промежуточное значение
+                // просто округлится при загрузке в микшер, но хранить мусор незачем.
+                "opus_bitrate" => cfg.opus_bitrate = value.parse().ok().filter(|v| {
+                    crate::mixer::OPUS_BITRATES.contains(v)
+                }),
                 _ => {}
             }
         }
@@ -169,6 +176,9 @@ impl AppConfig {
         if let Some(value) = self.rx_limiter {
             out.push_str(&format!("rx_limiter={}\n", value));
         }
+        if let Some(value) = self.opus_bitrate {
+            out.push_str(&format!("opus_bitrate={}\n", value));
+        }
         let mut vols: Vec<(u64, u32)> = self.peer_volumes.iter().map(|(k, v)| (*k, *v)).collect();
         vols.sort();
         for (id, vol) in vols {
@@ -210,6 +220,16 @@ mod tests {
     fn empty_second_device_is_none() {
         let cfg = AppConfig::parse("input2_device=\n");
         assert!(cfg.input2_device.is_none());
+    }
+
+    #[test]
+    fn opus_bitrate_only_known_values() {
+        let cfg = AppConfig::parse("opus_bitrate=96000\n");
+        assert_eq!(cfg.opus_bitrate, Some(96_000));
+        let odd = AppConfig::parse("opus_bitrate=97000\n");
+        assert_eq!(odd.opus_bitrate, None, "промежуточное значение не храним");
+        let text = AppConfig::parse("opus_bitrate=128000\n").to_text();
+        assert!(text.contains("opus_bitrate=128000"));
     }
 
     #[test]

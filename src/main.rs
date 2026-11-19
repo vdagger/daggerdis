@@ -108,6 +108,9 @@ fn main() {
     if let Some(p) = config.input2_profile {
         mixer.set_input2_profile(albus::mixer::SlotProfile::from_u32(p));
     }
+    if let Some(bps) = config.opus_bitrate {
+        mixer.set_opus_bitrate(bps);
+    }
     for (id, vol) in &config.peer_volumes {
         mixer.set_peer_volume(*id, *vol);
     }

@@ -272,6 +272,38 @@ pub fn draw_audio_settings(
     ui.separator();
     ui.add_space(12.0);
 
+    // Битрейт передачи: речь на 64 кбит/с звучит как речь, гитара — уже нет
+    t::section_label(ui, "КАЧЕСТВО ПЕРЕДАЧИ");
+    ui.add_space(4.0);
+    let current_bitrate = mixer.opus_bitrate();
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Opus, кбит/с")
+                .size(11.5)
+                .color(t::TEXT),
+        );
+        ui.add_space(6.0);
+        for bps in crate::mixer::OPUS_BITRATES {
+            let label = format!("{}", bps / 1000);
+            if t::chip_button(ui, &label, current_bitrate == bps).clicked() {
+                mixer.set_opus_bitrate(bps);
+            }
+        }
+    });
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(
+            "Для голоса хватает 64. Выше — чище инструмент и меньше предэха \
+             на ударах, но в эфир уходит больше трафика: поток один на оба входа.",
+        )
+        .size(9.5)
+        .color(t::TEXT_MUTED),
+    );
+
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(12.0);
+
     // Рация
     t::section_label(ui, "РАЦИЯ");
     ui.add_space(4.0);

@@ -247,6 +247,8 @@ pub(crate) struct TxWorker {
     limiter: Limiter,
     agcs: [TransmitAgc; 2],
     gates: [f32; 2],
+    /// Текущий битрейт энкодера — чтобы не переписывать его каждый кадр.
+    bitrate: u32,
     held: [f32; 2],
     have_held: [bool; 2],
     slot_buf: Vec<f32>,
@@ -263,6 +265,7 @@ impl TxWorker {
             limiter: Limiter::new(48_000),
             agcs: [TransmitAgc::new(), TransmitAgc::new()],
             gates: [0.0, 0.0],
+            bitrate: 64_000,
             held: [0.0, 0.0],
             have_held: [false, false],
             slot_buf: Vec::with_capacity(FRAME),
@@ -353,8 +356,16 @@ impl TxWorker {
         if !ptt {
             return None;
         }
+        // Битрейт читается на каждом кадре, а пишется в энкодер только при
+        // смене: переключение в настройках действует без перезапуска потока.
+        // 1276 — максимум одного кадра Opus при любом битрейте.
+        let bitrate = mixer.opus_bitrate();
+        if bitrate != self.bitrate {
+            self.encoder.bitrate_bps = bitrate as i32;
+            self.bitrate = bitrate;
+        }
         self.packet_buf.clear();
-        self.packet_buf.resize(1024, 0);
+        self.packet_buf.resize(1276, 0);
         match self.encoder.encode(&self.mixed, FRAME, &mut self.packet_buf) {
             Ok(len) => Some(self.packet_buf[..len].to_vec()),
             Err(_) => None,
@@ -546,6 +557,17 @@ mod tests {
         let mut w = worker(&mixer);
         bus.push(0, bus.epoch(0), &vec![0.3; FRAME]);
         assert!(w.render_frame(&bus, &mixer, true).is_some());
+    }
+
+    #[test]
+    fn bitrate_reaches_encoder() {
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        bus.push(0, bus.epoch(0), &vec![0.2; FRAME]);
+        mixer.set_opus_bitrate(128_000);
+        assert!(w.render_frame(&bus, &mixer, true).is_some());
+        assert_eq!(w.encoder.bitrate_bps, 128_000);
     }
 
     #[test]
