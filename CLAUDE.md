@@ -92,7 +92,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
 | `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices, PTT, mixer, nick, per-peer volume, `video_fps`, `mic_processing`, `rx_limiter`) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
-| `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule |
+| `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule for the current exe — идемпотентно (лишние одноимённые записи чистятся) |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
 | `src/network/mod.rs` | Re-exports `NetworkMessage`; declares `broadcast`, `iroh_service`, `message`, `p2p_iroh` |
 | `src/network/p2p_iroh.rs` | `IrohP2pManager`: QUIC datagrams + uni-стримы (`send_bytes` с переподключением, `spawn_stream_receiver`), connect by NodeID, `broadcast_bytes`, `disconnect_peer`/`disconnect_all` |
@@ -211,6 +211,16 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   кольцо 0.30 диска, точка и скобка справа, «P2P» моноширинным ниже. Дымка в
   кольце рисуется `radial_ring` от 0 (уходит под диск) — иначе у края диска
   видна резкая кромка и диск читается «мишенью».
+- **Правило брандмауэра ставится идемпотентно.** `netsh advfirewall firewall add
+  rule name=DiscordRF` не считает повтором уже существующее правило с тем же
+  именем: старый код добавлял новую запись при каждом запуске, и в брандмауэре
+  копились десятки одинаковых. Теперь `setup_firewall_rules` сначала ищет в
+  `show rule name=DiscordRF verbose` полный путь текущего exe и при совпадении
+  ничего не делает; если правила для этого exe нет — удаляет все одноимённые
+  (в том числе от старых копий с другим путём) и добавляет одно. Код возврата
+  netsh как признак «правила нет» использовать нельзя: он равен 0 и когда
+  правил не найдено, поэтому сравнение идёт по тексту вывода (путь ASCII
+  переживает OEM-кодировку).
 - **Git ownership (critical):** the checkout is owned by `vPC\mcdag`, but Claude runs
   over SSH as `vPC\Claude-Worker`, so plain `git` fails with "dubious ownership". Always
   prefix: `git -c safe.directory=C:/Claude-Exchange/DISCORDRF <cmd>`.
