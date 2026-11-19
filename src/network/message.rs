@@ -63,6 +63,15 @@ pub enum NetworkMessage {
         sender_id: u64,
         call_id: u32,
     },
+    /// «Я в сети»: друг проверяет, доступен ли узел. Ответ — `PresencePong`.
+    /// Отдельный пакет, а не Heartbeat: тот живёт только внутри комнаты.
+    PresencePing {
+        sender_id: u64,
+    },
+    /// Ответ на `PresencePing` — сам пинг отправителю тоже не нужен.
+    PresencePong {
+        sender_id: u64,
+    },
 }
 
 /// Пишет строку как `длина u16 LE` + байты UTF-8 (единый формат для текстовых полей).
@@ -192,6 +201,14 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             data.extend_from_slice(&sender_id.to_le_bytes());
             data.extend_from_slice(&call_id.to_le_bytes());
         }
+        NetworkMessage::PresencePing { sender_id } => {
+            data.push(15);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+        }
+        NetworkMessage::PresencePong { sender_id } => {
+            data.push(16);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+        }
     }
     data
 }
@@ -311,6 +328,14 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
             let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
             Some(NetworkMessage::CallEnd { sender_id, call_id })
         }
+        15 if bytes.len() >= 9 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            Some(NetworkMessage::PresencePing { sender_id })
+        }
+        16 if bytes.len() >= 9 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            Some(NetworkMessage::PresencePong { sender_id })
+        }
         _ => None,
     }
 }
@@ -386,6 +411,21 @@ mod tests {
             sender_id: 9,
             call_id: 12,
         });
+        roundtrip(NetworkMessage::PresencePing { sender_id: 10 });
+        roundtrip(NetworkMessage::PresencePong {
+            sender_id: 0xFFFF_FFFF_FFFF_FFFF,
+        });
+    }
+
+    #[test]
+    fn presence_needs_9_bytes() {
+        let ping = serialize_msg(&NetworkMessage::PresencePing { sender_id: 5 });
+        assert_eq!(ping.len(), 9);
+        assert_eq!(&ping[..1], &[15]);
+        assert!(deserialize_msg(&ping[..8]).is_none());
+        let pong = serialize_msg(&NetworkMessage::PresencePong { sender_id: 5 });
+        assert_eq!(&pong[..1], &[16]);
+        assert!(deserialize_msg(&pong[..8]).is_none());
     }
 
     #[test]

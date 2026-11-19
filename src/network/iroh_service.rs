@@ -29,6 +29,7 @@ pub fn spawn_iroh_receiver(
     friends: Arc<FriendsManager>,
     chat_log: Arc<ChatLog>,
     calls: Arc<CallManager>,
+    presence: Arc<crate::presence::PresenceTracker>,
 ) {
     if let Some(p2p) = iroh_p2p {
         let p2p_recv = p2p.clone();
@@ -38,6 +39,8 @@ pub fn spawn_iroh_receiver(
         let friends_iroh = friends.clone();
         let chat_log_iroh = chat_log.clone();
         let calls_iroh = calls.clone();
+        let presence_iroh = presence.clone();
+        let my_id = crate::identity::my_id_from_node_id(&p2p.my_node_id).unwrap_or(0);
 
         rt.spawn(async move {
             println!("[IROH] Слушатель входящих P2P пакетов активен.");
@@ -49,6 +52,12 @@ pub fn spawn_iroh_receiver(
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
+
+                    // Любой пакет от узла — доказательство, что он в сети.
+                    // Отмечаем именно `pkt.sender_id`: это NodeID соединения
+                    // из QUIC/TLS, а не поле пакета (его может подделать
+                    // релейный IrohSync с чужим node_id).
+                    presence_iroh.touch(&pkt.sender_id);
 
                     match msg {
                         NetworkMessage::IrohSync {
@@ -352,6 +361,26 @@ pub fn spawn_iroh_receiver(
                                 continue;
                             }
                             calls_iroh.on_end(&pkt.sender_id, call_id);
+                        }
+                        NetworkMessage::PresencePing { sender_id } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            presence_iroh.touch(&pkt.sender_id);
+                            let bytes = crate::network::message::serialize_msg(
+                                &NetworkMessage::PresencePong { sender_id: my_id },
+                            );
+                            let p2p = p2p_recv.clone();
+                            let target = pkt.sender_id.clone();
+                            tokio::spawn(async move {
+                                let _ = p2p.send_bytes(&target, &bytes).await;
+                            });
+                        }
+                        NetworkMessage::PresencePong { sender_id } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            presence_iroh.touch(&pkt.sender_id);
                         }
                     }
                 }

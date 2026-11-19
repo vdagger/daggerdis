@@ -79,6 +79,8 @@ pub fn draw_friends_panel(
     active_chat: &mut Option<String>,
     chat_open: &mut bool,
     calls: &Arc<crate::calls::CallManager>,
+    presence: &Arc<crate::presence::PresenceTracker>,
+    offline_toast: &mut Option<String>,
 ) {
     let row_width = ui.available_width();
     let p2p = iroh;
@@ -181,6 +183,7 @@ pub fn draw_friends_panel(
             ui.add_space(2.0);
         }
 
+        let online = presence.is_online(&friend.node_id);
         ui.horizontal(|ui| {
             t::avatar(ui, &friend.name, 32.0, false);
             ui.add_space(8.0);
@@ -203,12 +206,22 @@ pub fn draw_friends_panel(
                         );
                     }
                 });
-                ui.label(
-                    egui::RichText::new(short_node_id(&friend.node_id))
-                        .monospace()
-                        .size(8.5)
-                        .color(t::TEXT_MUTED),
-                );
+                ui.horizontal(|ui| {
+                    // Точка онлайна: зелёная — узел недавно отвечал на пинг,
+                    // серая — офлайн (или о нём ещё ничего не слышно).
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        dot.center(),
+                        2.5,
+                        if online { t::LIVE } else { t::TEXT_MUTED },
+                    );
+                    ui.label(
+                        egui::RichText::new(short_node_id(&friend.node_id))
+                            .monospace()
+                            .size(8.5)
+                            .color(t::TEXT_MUTED),
+                    );
+                });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let more = t::icon_button(ui, t::Icon::More, 22.0, false).on_hover_text("Ещё");
@@ -243,12 +256,22 @@ pub fn draw_friends_panel(
                     *chat_open = true;
                 }
                 if t::icon_button(ui, t::Icon::Phone, 22.0, false)
-                    .on_hover_text("Позвонить")
+                    .on_hover_text(if online {
+                        "Позвонить"
+                    } else {
+                        "Не в сети"
+                    })
                     .clicked()
                 {
-                    // Собеседник получает приглашение и сам решает, отвечать ли:
-                    // в комнату он попадает только после «Принять».
-                    calls.start_outgoing(&friend.node_id, &friend.name, nick);
+                    if online {
+                        // Собеседник получает приглашение и сам решает, отвечать ли:
+                        // в комнату он попадает только после «Принять».
+                        calls.start_outgoing(&friend.node_id, &friend.name, nick);
+                    } else {
+                        // Иначе гудок шёл бы 35 секунд в никуда: друг либо
+                        // выключил приложение, либо ещё не замечен пингом.
+                        *offline_toast = Some(format!("{} не в сети", friend.name));
+                    }
                 }
             });
         });

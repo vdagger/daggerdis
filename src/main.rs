@@ -164,6 +164,9 @@ fn main() {
         is_host.clone(),
     ));
 
+    // Онлайн-статус друзей: кто недавно подавал признаки жизни
+    let presence = Arc::new(albus::presence::PresenceTracker::new());
+
     // 4. Запуск фоновых сервисов
     albus::network::iroh_service::spawn_iroh_receiver(
         &rt,
@@ -174,7 +177,17 @@ fn main() {
         friends.clone(),
         chat_log.clone(),
         calls.clone(),
+        presence.clone(),
     );
+    if let Some(ref p2p) = iroh_p2p {
+        albus::presence::spawn_ping_loop(
+            rt.handle(),
+            p2p.clone(),
+            friends.clone(),
+            presence.clone(),
+            my_id,
+        );
+    }
     albus::network::broadcast::spawn_audio_broadcast(&rt, packet_rx, iroh_p2p.clone(), my_id);
 
     let migration_loop = migration.clone();
@@ -247,6 +260,7 @@ fn main() {
                 my_node_id,
                 network_error,
                 calls,
+                presence,
             );
 
             #[cfg(windows)]

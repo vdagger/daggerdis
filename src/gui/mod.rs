@@ -47,6 +47,8 @@ pub struct RadioApp {
     friends: Arc<crate::friends::FriendsManager>,
     chat_log: Arc<crate::chat::ChatLog>,
     calls: Arc<crate::calls::CallManager>,
+    /// Кто из друзей недавно подавал признаки жизни (ping/pong).
+    presence: Arc<crate::presence::PresenceTracker>,
     active_chat: Option<String>,
     /// Собеседник, для которого сейчас набран `chat_input`. Смена диалога
     /// чистит черновик, а не переносит его в чужую переписку.
@@ -107,6 +109,7 @@ impl RadioApp {
         my_node_id: String,
         network_error: Option<String>,
         calls: Arc<crate::calls::CallManager>,
+        presence: Arc<crate::presence::PresenceTracker>,
     ) -> Self {
         let initial_input = selected_input.load(std::sync::atomic::Ordering::Relaxed);
         let initial_output = selected_output.load(std::sync::atomic::Ordering::Relaxed);
@@ -142,6 +145,7 @@ impl RadioApp {
             friends,
             chat_log,
             calls,
+            presence,
             active_chat: None,
             chat_target: None,
             chat_input: String::new(),
@@ -1097,6 +1101,7 @@ impl RadioApp {
                         });
                         rail_divider(ui);
 
+                        let mut offline_toast: Option<String> = None;
                         rail_section(ui, |ui| {
                             crate::widgets::friends_panel::draw_friends_panel(
                                 ui,
@@ -1110,8 +1115,13 @@ impl RadioApp {
                                 &mut self.active_chat,
                                 &mut self.chat_open,
                                 &self.calls,
+                                &self.presence,
+                                &mut offline_toast,
                             );
                         });
+                        if let Some(text) = offline_toast {
+                            self.show_toast(&text);
+                        }
                         if self.chat_open {
                             self.settings_open = false;
                         }

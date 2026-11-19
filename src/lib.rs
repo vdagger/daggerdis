@@ -12,6 +12,7 @@ pub mod menu;
 pub mod migration;
 pub mod mixer;
 pub mod network;
+pub mod presence;
 pub mod room;
 pub mod types;
 pub mod video;
