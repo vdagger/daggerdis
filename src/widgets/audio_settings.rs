@@ -54,6 +54,15 @@ pub fn draw_audio_settings(
     ui.add_space(6.0);
     profile_chips(ui, mixer.input1_profile(), |p| mixer.set_input1_profile(p));
 
+    ui.add_space(4.0);
+    effect_switches(
+        ui,
+        mixer.input1_gate(),
+        |v| mixer.set_input1_gate(v),
+        mixer.input1_agc(),
+        |v| mixer.set_input1_agc(v),
+    );
+
     ui.add_space(6.0);
     input_controls(
         ui,
@@ -115,6 +124,15 @@ pub fn draw_audio_settings(
 
     ui.add_space(6.0);
     profile_chips(ui, mixer.input2_profile(), |p| mixer.set_input2_profile(p));
+
+    ui.add_space(4.0);
+    effect_switches(
+        ui,
+        mixer.input2_gate(),
+        |v| mixer.set_input2_gate(v),
+        mixer.input2_agc(),
+        |v| mixer.set_input2_agc(v),
+    );
 
     ui.add_space(6.0);
     input_controls(
@@ -218,27 +236,28 @@ pub fn draw_audio_settings(
     ui.separator();
     ui.add_space(12.0);
 
-    // Обработка звука: по умолчанию всё выключено — сырой тракт честнее
+    // Лимитер передачи: отдельно от эффектов входов — страховка от клиппинга
+    // не должна требовать ещё и затвора с AGC в тракте.
     t::section_label(ui, "ОБРАБОТКА ЗВУКА");
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new("Шумовой затвор, AGC и лимитер")
+            egui::RichText::new("Лимитер передачи")
                 .size(11.5)
                 .color(t::TEXT),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut on = mixer.is_dsp_enabled();
+            let mut on = mixer.is_tx_limiter_enabled();
             if t::switch(ui, &mut on).changed() {
-                mixer.set_dsp_enabled(on);
+                mixer.set_tx_limiter_enabled(on);
             }
         });
     });
     ui.add_space(2.0);
     ui.label(
         egui::RichText::new(
-            "Тише шум в паузах и ровнее громкость микрофона, но голос звучит \
-             плотнее и глуше. Выключено: в эфир идёт чистый микрофон.",
+            "Осаживает общий микс микрофона и инструмента под −1 dBFS. \
+             Выключено: в эфир идёт уровень ровно такой, как выставлен.",
         )
         .size(9.5)
         .color(t::TEXT_MUTED),
@@ -316,8 +335,8 @@ pub fn draw_audio_settings(
     );
 }
 
-/// Профиль обработки входа: голос (затвор + AGC) или инструмент (без них).
-/// Действует только при включённой обработке звука.
+/// Пресеты эффектов: «Голос» включает затвор и AGC, «Инструмент» — выключает.
+/// После ручной правки тумблеров ниже не подсвечен ни один — профиль «Свой».
 fn profile_chips(
     ui: &mut egui::Ui,
     current: crate::mixer::SlotProfile,
@@ -337,6 +356,33 @@ fn profile_chips(
             if t::chip_button(ui, profile.label(), profile == current).clicked() {
                 set(profile);
             }
+        }
+    });
+}
+
+/// Тумблеры эффектов одного входа: затвор и AGC включаются независимо.
+fn effect_switches(
+    ui: &mut egui::Ui,
+    gate: bool,
+    set_gate: impl Fn(bool),
+    agc: bool,
+    set_agc: impl Fn(bool),
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Затвор")
+                .size(10.5)
+                .color(t::TEXT_MUTED),
+        );
+        let mut on = gate;
+        if t::switch(ui, &mut on).changed() {
+            set_gate(on);
+        }
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("AGC").size(10.5).color(t::TEXT_MUTED));
+        let mut on = agc;
+        if t::switch(ui, &mut on).changed() {
+            set_agc(on);
         }
     });
 }

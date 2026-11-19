@@ -1119,12 +1119,10 @@ impl RadioApp {
                 let mut guitar = self.mixer.ch2_volume();
                 let mut peers = self.mixer.output_volume();
 
-                // Подпись — профиль обработки: с двумя картами «микрофон» и
-                // «гитара» уже не описывают входы.
-                let in1_label = self.mixer.input1_profile().label().to_uppercase();
-                let in2_label = self.mixer.input2_profile().label().to_uppercase();
-                mixer_row(ui, &in1_label, &mut mic, self.mixer.input1_peak());
-                mixer_row(ui, &in2_label, &mut guitar, self.mixer.input2_peak());
+                // Подпись — номер входа: профиль обработки живёт в настройках,
+                // а по громкости видно, что за вход перед вами.
+                mixer_row(ui, "ВХОД 1", &mut mic, self.mixer.input1_peak());
+                mixer_row(ui, "ВХОД 2", &mut guitar, self.mixer.input2_peak());
                 mixer_row(ui, "СОБЕСЕДНИКИ", &mut peers, 0.0);
 
                 self.mixer.set_ch1_volume(mic);
@@ -1961,15 +1959,42 @@ impl RadioApp {
             self.config.input2_channel = Some(in2);
             changed = true;
         }
-        let profile1 = self.mixer.input1_profile().as_u32();
-        if self.config.input1_profile != Some(profile1) {
-            self.config.input1_profile = Some(profile1);
+        // Профиль — пресет тумблеров; в файл пишем сами тумблеры, а старый
+        // ключ профиля — только пока он однозначен (для старых exe).
+        let profile1 = self.mixer.input1_profile();
+        let legacy1 = match profile1 {
+            crate::mixer::SlotProfile::Custom => None,
+            p => Some(p.as_u32()),
+        };
+        if self.config.input1_profile != legacy1 {
+            self.config.input1_profile = legacy1;
             changed = true;
         }
-        let profile2 = self.mixer.input2_profile().as_u32();
-        if self.config.input2_profile != Some(profile2) {
-            self.config.input2_profile = Some(profile2);
+        let profile2 = self.mixer.input2_profile();
+        let legacy2 = match profile2 {
+            crate::mixer::SlotProfile::Custom => None,
+            p => Some(p.as_u32()),
+        };
+        if self.config.input2_profile != legacy2 {
+            self.config.input2_profile = legacy2;
             changed = true;
+        }
+        for (key, value) in [
+            ("input1_gate", self.mixer.input1_gate()),
+            ("input1_agc", self.mixer.input1_agc()),
+            ("input2_gate", self.mixer.input2_gate()),
+            ("input2_agc", self.mixer.input2_agc()),
+        ] {
+            let slot = match key {
+                "input1_gate" => &mut self.config.input1_gate,
+                "input1_agc" => &mut self.config.input1_agc,
+                "input2_gate" => &mut self.config.input2_gate,
+                _ => &mut self.config.input2_agc,
+            };
+            if *slot != Some(value) {
+                *slot = Some(value);
+                changed = true;
+            }
         }
         let bitrate = self.mixer.opus_bitrate();
         if self.config.opus_bitrate != Some(bitrate) {
@@ -1989,9 +2014,20 @@ impl RadioApp {
             self.config.nick = Some(self.nick.clone());
             changed = true;
         }
-        let dsp = self.mixer.is_dsp_enabled();
-        if self.config.mic_processing != Some(dsp) {
-            self.config.mic_processing = Some(dsp);
+        let tx_limiter = self.mixer.is_tx_limiter_enabled();
+        if self.config.tx_limiter != Some(tx_limiter) {
+            self.config.tx_limiter = Some(tx_limiter);
+            changed = true;
+        }
+        // Старый общий тумблер — «есть ли хоть один эффект»: так его поймёт
+        // exe прежней версии, а наш загрузчик его проигнорирует, если есть
+        // новые ключи.
+        let legacy_dsp = self.mixer.input1_gate()
+            || self.mixer.input1_agc()
+            || self.mixer.input2_gate()
+            || self.mixer.input2_agc();
+        if self.config.mic_processing != Some(legacy_dsp) {
+            self.config.mic_processing = Some(legacy_dsp);
             changed = true;
         }
         let rx_limiter = self.mixer.is_rx_limiter_enabled();

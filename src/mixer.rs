@@ -146,16 +146,22 @@ pub struct PeerMeter {
 
 /// Профиль обработки входа: голосу нужны затвор и AGC, инструменту они вредят
 /// (AGC осаживает удары и «дышит» на затухающих нотах).
+///
+/// Профиль — только пресет для двух тумблеров: «Голос» включает затвор и AGC,
+/// «Инструмент» выключает оба. Если тумблеры выставлены вручную не парой,
+/// профиль становится `Custom` — так в настройках видно, что пресет изменён.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotProfile {
     Voice = 0,
     Instrument = 1,
+    Custom = 2,
 }
 
 impl SlotProfile {
     pub fn from_u32(v: u32) -> Self {
         match v {
             1 => Self::Instrument,
+            2 => Self::Custom,
             _ => Self::Voice,
         }
     }
@@ -168,6 +174,7 @@ impl SlotProfile {
         match self {
             Self::Voice => "Голос",
             Self::Instrument => "Инструмент",
+            Self::Custom => "Свой",
         }
     }
 
@@ -175,6 +182,23 @@ impl SlotProfile {
     /// затухающие ноты, а AGC выравнивает аккорды по громкости.
     pub fn uses_voice_dsp(self) -> bool {
         self == Self::Voice
+    }
+
+    /// Пресет тумблеров: `Voice` — оба включены, `Instrument` — оба выключены.
+    pub fn effects(self) -> (bool, bool) {
+        match self {
+            Self::Voice => (true, true),
+            Self::Instrument | Self::Custom => (false, false),
+        }
+    }
+
+    /// Профиль по состоянию тумблеров; `Custom` — когда они не пара.
+    pub fn from_effects(gate: bool, agc: bool) -> Self {
+        match (gate, agc) {
+            (true, true) => Self::Voice,
+            (false, false) => Self::Instrument,
+            _ => Self::Custom,
+        }
     }
 }
 
@@ -186,8 +210,11 @@ pub struct AudioMixer {
     ch2_volume: AtomicU32, // Вход 2
     input1_channel: AtomicU32,
     input2_channel: AtomicU32,
-    input1_profile: AtomicU32,
-    input2_profile: AtomicU32,
+    /// Эффекты входа 1: затвор и AGC — независимо друг от друга.
+    input1_gate: AtomicBool,
+    input1_agc: AtomicBool,
+    input2_gate: AtomicBool,
+    input2_agc: AtomicBool,
     output_volume: AtomicU32,
     input1_peak: AtomicU32,
     input2_peak: AtomicU32,
@@ -199,10 +226,11 @@ pub struct AudioMixer {
     monitor_buf: Mutex<VecDeque<f32>>,
     /// Гудок звонка: 0 — тихо, 1 — входящий, 2 — «звоним…»
     ring_mode: AtomicU32,
-    /// Обработка своего голоса перед отправкой: гейт + AGC + лимитер.
-    /// По умолчанию выключена — сырой микрофон слышно честнее, а «проглоченный»
-    /// компрессорами голос на приёме звучал глухо и тихо.
-    dsp_enabled: AtomicBool,
+    /// Лимитер на передаваемом миксе. Раньше он жил под общим тумблером
+    /// «обработка звука» вместе с затвором и AGC — теперь включается сам:
+    /// страховка от клиппинга не должна требовать ещё и гейта в тракте.
+    /// По умолчанию выключен: уровень ровно такой, каким его выставили.
+    tx_limiter_enabled: AtomicBool,
     /// Страховочный лимитер на общем миксе собеседников. Тоже по умолчанию
     /// выключен: без него громкость приёма ровно такая, какую выставили.
     rx_limiter_enabled: AtomicBool,
@@ -223,8 +251,10 @@ impl AudioMixer {
             ch2_volume: AtomicU32::new(100),
             input1_channel: AtomicU32::new(0),
             input2_channel: AtomicU32::new(1),
-            input1_profile: AtomicU32::new(SlotProfile::Voice.as_u32()),
-            input2_profile: AtomicU32::new(SlotProfile::Instrument.as_u32()),
+            input1_gate: AtomicBool::new(false),
+            input1_agc: AtomicBool::new(false),
+            input2_gate: AtomicBool::new(false),
+            input2_agc: AtomicBool::new(false),
             output_volume: AtomicU32::new(100),
             input1_peak: AtomicU32::new(0),
             input2_peak: AtomicU32::new(0),
@@ -233,7 +263,7 @@ impl AudioMixer {
             monitor_enabled: AtomicBool::new(false),
             monitor_buf: Mutex::new(VecDeque::new()),
             ring_mode: AtomicU32::new(0),
-            dsp_enabled: AtomicBool::new(false),
+            tx_limiter_enabled: AtomicBool::new(false),
             rx_limiter_enabled: AtomicBool::new(false),
             opus_bitrate: AtomicU32::new(64_000),
         }
@@ -255,13 +285,45 @@ impl AudioMixer {
         self.opus_bitrate.store(nearest, Ordering::Relaxed);
     }
 
-    /// Включена ли обработка микрофона (гейт + AGC + лимитер)
-    pub fn is_dsp_enabled(&self) -> bool {
-        self.dsp_enabled.load(Ordering::Relaxed)
+    /// Включён ли лимитер на передаваемом миксе
+    pub fn is_tx_limiter_enabled(&self) -> bool {
+        self.tx_limiter_enabled.load(Ordering::Relaxed)
     }
 
-    pub fn set_dsp_enabled(&self, on: bool) {
-        self.dsp_enabled.store(on, Ordering::Relaxed);
+    pub fn set_tx_limiter_enabled(&self, on: bool) {
+        self.tx_limiter_enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn input1_gate(&self) -> bool {
+        self.input1_gate.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input1_gate(&self, on: bool) {
+        self.input1_gate.store(on, Ordering::Relaxed);
+    }
+
+    pub fn input1_agc(&self) -> bool {
+        self.input1_agc.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input1_agc(&self, on: bool) {
+        self.input1_agc.store(on, Ordering::Relaxed);
+    }
+
+    pub fn input2_gate(&self) -> bool {
+        self.input2_gate.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input2_gate(&self, on: bool) {
+        self.input2_gate.store(on, Ordering::Relaxed);
+    }
+
+    pub fn input2_agc(&self) -> bool {
+        self.input2_agc.load(Ordering::Relaxed)
+    }
+
+    pub fn set_input2_agc(&self, on: bool) {
+        self.input2_agc.store(on, Ordering::Relaxed);
     }
 
     /// Включён ли лимитер на общем миксе собеседников
@@ -433,22 +495,28 @@ impl AudioMixer {
         self.input2_channel.store(channel, Ordering::Relaxed);
     }
 
-    /// Профиль обработки Входа 1: голос (затвор + AGC) или инструмент
+    /// Профиль Входа 1, выведенный из тумблеров: «Голос» (оба включены),
+    /// «Инструмент» (оба выключены) или «Свой».
     pub fn input1_profile(&self) -> SlotProfile {
-        SlotProfile::from_u32(self.input1_profile.load(Ordering::Relaxed))
+        SlotProfile::from_effects(self.input1_gate(), self.input1_agc())
     }
 
+    /// Пресет: «Голос» включает затвор и AGC, «Инструмент» выключает оба.
     pub fn set_input1_profile(&self, profile: SlotProfile) {
-        self.input1_profile.store(profile.as_u32(), Ordering::Relaxed);
+        let (gate, agc) = profile.effects();
+        self.set_input1_gate(gate);
+        self.set_input1_agc(agc);
     }
 
-    /// Профиль обработки Входа 2
+    /// Профиль Входа 2
     pub fn input2_profile(&self) -> SlotProfile {
-        SlotProfile::from_u32(self.input2_profile.load(Ordering::Relaxed))
+        SlotProfile::from_effects(self.input2_gate(), self.input2_agc())
     }
 
     pub fn set_input2_profile(&self, profile: SlotProfile) {
-        self.input2_profile.store(profile.as_u32(), Ordering::Relaxed);
+        let (gate, agc) = profile.effects();
+        self.set_input2_gate(gate);
+        self.set_input2_agc(agc);
     }
 
     pub fn output_volume(&self) -> u32 {
@@ -532,13 +600,17 @@ mod tests {
     }
 
     #[test]
-    fn processing_off_by_default() {
+    fn effects_off_by_default() {
         let m = AudioMixer::new();
-        assert!(!m.is_dsp_enabled(), "обработка микрофона должна быть выключена");
+        assert!(!m.input1_gate() && !m.input1_agc(), "вход 1 должен быть сырым");
+        assert!(!m.input2_gate() && !m.input2_agc(), "вход 2 должен быть сырым");
+        assert!(!m.is_tx_limiter_enabled(), "лимитер передачи должен быть выключен");
         assert!(!m.is_rx_limiter_enabled(), "лимитер приёма должен быть выключен");
-        m.set_dsp_enabled(true);
+        m.set_input1_gate(true);
+        m.set_tx_limiter_enabled(true);
         m.set_rx_limiter_enabled(true);
-        assert!(m.is_dsp_enabled());
+        assert!(m.input1_gate());
+        assert!(m.is_tx_limiter_enabled());
         assert!(m.is_rx_limiter_enabled());
     }
 
@@ -563,18 +635,23 @@ mod tests {
     }
 
     #[test]
-    fn profile_defaults_and_roundtrip() {
+    fn profile_presets_and_custom() {
         let m = AudioMixer::new();
-        // Вход 1 — голос, второй (гитарный) — инструмент, как в старой раскладке.
-        assert_eq!(m.input1_profile(), SlotProfile::Voice);
-        assert_eq!(m.input2_profile(), SlotProfile::Instrument);
-        assert!(m.input1_profile().uses_voice_dsp());
-        assert!(!m.input2_profile().uses_voice_dsp());
-        m.set_input1_profile(SlotProfile::Instrument);
-        m.set_input2_profile(SlotProfile::Voice);
+        // По умолчанию эффекты выключены — профиль выходит «Инструмент».
         assert_eq!(m.input1_profile(), SlotProfile::Instrument);
+        m.set_input1_profile(SlotProfile::Voice);
+        assert!(m.input1_gate() && m.input1_agc());
+        assert_eq!(m.input1_profile(), SlotProfile::Voice);
+        m.set_input2_profile(SlotProfile::Voice);
         assert_eq!(m.input2_profile(), SlotProfile::Voice);
-        // Мусор в конфиге не должен давать третьего профиля.
+        // Ручной тумблер ломает пару — профиль больше не пресет.
+        m.set_input1_agc(false);
+        assert_eq!(m.input1_profile(), SlotProfile::Custom);
+        assert_eq!(m.input1_profile().label(), "Свой");
+        m.set_input1_profile(SlotProfile::Instrument);
+        assert!(!m.input1_gate() && !m.input1_agc());
+        // Мусор в конфиге не должен давать произвольного профиля.
         assert_eq!(SlotProfile::from_u32(42), SlotProfile::Voice);
+        assert_eq!(SlotProfile::from_u32(2), SlotProfile::Custom);
     }
 }

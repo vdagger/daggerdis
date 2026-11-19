@@ -20,15 +20,24 @@ pub struct AppConfig {
     pub output_volume: Option<u32>,
     pub input1_channel: Option<u32>,
     pub input2_channel: Option<u32>,
-    /// Профиль обработки входа: 0 — голос, 1 — инструмент.
+    /// Профиль обработки входа: 0 — голос, 1 — инструмент. Читается только
+    /// из старых конфигов: профиль теперь выводится из тумблеров ниже.
     pub input1_profile: Option<u32>,
     pub input2_profile: Option<u32>,
+    /// Эффекты каждого входа: затвор и AGC включаются независимо.
+    pub input1_gate: Option<bool>,
+    pub input1_agc: Option<bool>,
+    pub input2_gate: Option<bool>,
+    pub input2_agc: Option<bool>,
     pub continuous_mode: Option<bool>,
     /// Частота трансляции экрана (30 или 60 fps); по умолчанию 60.
     pub video_fps: Option<u32>,
     pub nick: Option<String>,
-    /// Гейт + AGC + лимитер на микрофоне. По умолчанию выключено.
+    /// Старый общий тумблер «обработка звука» (гейт + AGC + лимитер).
+    /// Читается, только когда новых ключей эффектов в файле нет.
     pub mic_processing: Option<bool>,
+    /// Лимитер на передаваемом миксе. По умолчанию выключено.
+    pub tx_limiter: Option<bool>,
     /// Лимитер на общем миксе собеседников. По умолчанию выключено.
     pub rx_limiter: Option<bool>,
     /// Битрейт Opus на передачу (64 000 / 96 000 / 128 000), по умолчанию 64k.
@@ -110,10 +119,15 @@ impl AppConfig {
                 // молча стал бы третьим режимом обработки.
                 "input1_profile" => cfg.input1_profile = value.parse().ok().filter(|v| *v <= 1),
                 "input2_profile" => cfg.input2_profile = value.parse().ok().filter(|v| *v <= 1),
+                "input1_gate" => cfg.input1_gate = value.parse().ok(),
+                "input1_agc" => cfg.input1_agc = value.parse().ok(),
+                "input2_gate" => cfg.input2_gate = value.parse().ok(),
+                "input2_agc" => cfg.input2_agc = value.parse().ok(),
                 "continuous_mode" => cfg.continuous_mode = value.parse().ok(),
                 "video_fps" => cfg.video_fps = value.parse().ok(),
                 "nick" => cfg.nick = Some(value.to_string()),
                 "mic_processing" => cfg.mic_processing = value.parse().ok(),
+                "tx_limiter" => cfg.tx_limiter = value.parse().ok(),
                 "rx_limiter" => cfg.rx_limiter = value.parse().ok(),
                 // Битрейт — только из допустимого набора: промежуточное значение
                 // просто округлится при загрузке в микшер, но хранить мусор незачем.
@@ -161,6 +175,16 @@ impl AppConfig {
         if let Some(value) = self.input2_profile {
             out.push_str(&format!("input2_profile={}\n", value));
         }
+        for (key, value) in [
+            ("input1_gate", self.input1_gate),
+            ("input1_agc", self.input1_agc),
+            ("input2_gate", self.input2_gate),
+            ("input2_agc", self.input2_agc),
+        ] {
+            if let Some(value) = value {
+                out.push_str(&format!("{}={}\n", key, value));
+            }
+        }
         if let Some(value) = self.continuous_mode {
             out.push_str(&format!("continuous_mode={}\n", value));
         }
@@ -172,6 +196,9 @@ impl AppConfig {
         }
         if let Some(value) = self.mic_processing {
             out.push_str(&format!("mic_processing={}\n", value));
+        }
+        if let Some(value) = self.tx_limiter {
+            out.push_str(&format!("tx_limiter={}\n", value));
         }
         if let Some(value) = self.rx_limiter {
             out.push_str(&format!("rx_limiter={}\n", value));
@@ -237,5 +264,30 @@ mod tests {
         let cfg = AppConfig::parse("input1_profile=7\ninput2_profile=voice\n");
         assert_eq!(cfg.input1_profile, None);
         assert_eq!(cfg.input2_profile, None);
+    }
+
+    #[test]
+    fn effect_keys_roundtrip() {
+        let cfg = AppConfig::parse(
+            "input1_gate=true\ninput1_agc=false\ninput2_gate=true\ntx_limiter=true\ninput2_agc=yes\n",
+        );
+        assert_eq!(cfg.input1_gate, Some(true));
+        assert_eq!(cfg.input1_agc, Some(false));
+        assert_eq!(cfg.input2_gate, Some(true));
+        assert_eq!(cfg.tx_limiter, Some(true));
+        assert_eq!(cfg.input2_agc, None, "мусор в bool не должен включать эффект");
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.input1_gate, cfg.input1_gate);
+        assert_eq!(again.input1_agc, cfg.input1_agc);
+        assert_eq!(again.input2_gate, cfg.input2_gate);
+        assert_eq!(again.tx_limiter, cfg.tx_limiter);
+    }
+
+    #[test]
+    fn legacy_mic_processing_still_parsed() {
+        let cfg = AppConfig::parse("mic_processing=true\ninput1_profile=0\n");
+        assert_eq!(cfg.mic_processing, Some(true));
+        assert_eq!(cfg.input1_profile, Some(0));
+        assert_eq!(cfg.input1_gate, None, "новых ключей нет — старые решают");
     }
 }

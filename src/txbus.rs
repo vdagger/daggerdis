@@ -280,16 +280,15 @@ impl TxWorker {
         mixer: &AudioMixer,
         ptt: bool,
     ) -> Option<Vec<u8>> {
-        let dsp = mixer.is_dsp_enabled();
         self.mixed.clear();
         self.mixed.resize(FRAME, 0.0);
         let mut contributing = 0u32;
 
         for slot in 0..2 {
-            let (gain, profile) = if slot == 0 {
-                (mixer.ch1_volume(), mixer.input1_profile())
+            let (gain, gate, agc) = if slot == 0 {
+                (mixer.ch1_volume(), mixer.input1_gate(), mixer.input1_agc())
             } else {
-                (mixer.ch2_volume(), mixer.input2_profile())
+                (mixer.ch2_volume(), mixer.input2_gate(), mixer.input2_agc())
             };
 
             if !bus.take(slot, &mut self.slot_buf) {
@@ -322,8 +321,8 @@ impl TxWorker {
                 self.have_held[slot] = true;
             }
 
-            if dsp && profile.uses_voice_dsp() {
-                self.apply_voice_dsp(slot);
+            if gate || agc {
+                self.apply_effects(slot, gate, agc);
             }
 
             if gain > 0 {
@@ -344,9 +343,9 @@ impl TxWorker {
         }
 
         mixer.process_input(&mut self.mixed);
-        // Лимитер — часть обработки микрофона: при выключенной обработке
-        // уровень должен быть ровно таким, каким его выставили.
-        if dsp {
+        // Лимитер передачи — свой тумблер: включить страховку от клиппинга
+        // можно и без затвора с AGC.
+        if mixer.is_tx_limiter_enabled() {
             self.limiter.process(&mut self.mixed);
         }
         // Прослушивание своего тракта — всегда, независимо от PTT: баланс
@@ -372,33 +371,42 @@ impl TxWorker {
         }
     }
 
-    /// Затвор + AGC — только для голосового профиля. Коэффициенты вполовину
-    /// мягче прежних: старый колбэк обрабатывал ~480 сэмплов, здесь 960.
-    fn apply_voice_dsp(&mut self, slot: usize) {
-        let chunk_peak = self
-            .slot_buf
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
-        let target = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
-        let mut gain = self.gates[slot];
-        for sample in self.slot_buf.iter_mut() {
-            if target > gain {
-                gain += (target - gain) * 0.05;
-            } else {
-                gain += (target - gain) * 0.001;
+    /// Эффекты одного входа. Затвор и AGC включаются независимо: можно оставить
+    /// только затвор (шум в паузах), только AGC (ровная громкость) или оба.
+    /// Коэффициенты вполовину мягче прежних: старый колбэк обрабатывал
+    /// ~480 сэмплов, здесь 960.
+    fn apply_effects(&mut self, slot: usize, gate: bool, agc: bool) {
+        if gate {
+            let chunk_peak = self
+                .slot_buf
+                .iter()
+                .map(|s| s.abs())
+                .fold(0.0f32, f32::max);
+            let target = if chunk_peak > 0.006 { 1.0f32 } else { 0.0f32 };
+            let mut gain = self.gates[slot];
+            for sample in self.slot_buf.iter_mut() {
+                if target > gain {
+                    gain += (target - gain) * 0.05;
+                } else {
+                    gain += (target - gain) * 0.001;
+                }
+                *sample *= gain;
             }
-            *sample *= gain;
+            self.gates[slot] = gain;
+        } else {
+            // Затвор выключен: при следующем включении он начнёт открытым,
+            // а не с нуля.
+            self.gates[slot] = 1.0;
         }
-        self.gates[slot] = gain;
-        self.agcs[slot].process(&mut self.slot_buf);
+        if agc {
+            self.agcs[slot].process(&mut self.slot_buf);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mixer::SlotProfile;
 
     /// Шина без воркера: кадры собираем вручную, ничего не тикает параллельно.
     fn silent_bus() -> Arc<InputBus> {
@@ -504,39 +512,59 @@ mod tests {
     }
 
     #[test]
-    fn limiter_only_when_dsp_enabled() {
+    fn tx_limiter_has_own_switch() {
         let bus = silent_bus();
         let mixer = AudioMixer::new();
         let mut w = worker(&mixer);
-        // Один вход на 0.95 при выключенной обработке остаётся 0.95.
+        // Лимитер выключен — громкий вход остаётся как есть.
         bus.push(0, bus.epoch(0), &vec![0.95; FRAME]);
         w.render_frame(&bus, &mixer, false);
         assert!(monitor(&mixer)[0] > 0.9);
 
-        // С обработкой тот же вход опускается под −1 dBFS.
+        // Включили только лимитер, без затвора и AGC: тот же вход
+        // опускается под −1 dBFS.
         let bus2 = silent_bus();
         let mixer2 = AudioMixer::new();
         let mut w2 = worker(&mixer2);
-        mixer2.set_dsp_enabled(true);
+        mixer2.set_tx_limiter_enabled(true);
         bus2.push(0, bus2.epoch(0), &vec![0.95; FRAME]);
         w2.render_frame(&bus2, &mixer2, false);
         assert!(monitor(&mixer2)[0] <= 0.891 + 1e-6);
     }
 
     #[test]
-    fn instrument_profile_skips_gate_and_agc() {
+    fn gate_and_agc_switch_independently() {
+        // Только затвор: сигнал тише порога закрывается полностью.
         let bus = silent_bus();
         let mixer = AudioMixer::new();
         let mut w = worker(&mixer);
-        mixer.set_dsp_enabled(true);
-        mixer.set_input1_profile(SlotProfile::Instrument);
-        // Тихий инструмент проходит как есть: ни затвор его не режет,
-        // ни AGC не разгоняет.
+        mixer.set_input1_gate(true);
+        bus.push(0, bus.epoch(0), &vec![0.002; FRAME]);
+        w.render_frame(&bus, &mixer, false);
+        assert!(monitor(&mixer).iter().all(|s| s.abs() < 1e-6));
+
+        // Только AGC: тот же тихий сигнал не режется, а подтягивается.
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        mixer.set_input1_agc(true);
         bus.push(0, bus.epoch(0), &vec![0.002; FRAME]);
         w.render_frame(&bus, &mixer, false);
         let out = monitor(&mixer);
-        assert!((out[0] - 0.002).abs() < 1e-5, "{}", out[0]);
-        assert!(!SlotProfile::Instrument.uses_voice_dsp());
+        assert!(out[0] > 0.0015, "AGC не должен резать сигнал: {}", out[0]);
+        assert!(
+            *out.last().unwrap() > 0.0025,
+            "AGC должен подтянуть сигнал: {:?}",
+            out.last()
+        );
+
+        // Оба выключены — сырой тракт, как у инструмента.
+        let bus = silent_bus();
+        let mixer = AudioMixer::new();
+        let mut w = worker(&mixer);
+        bus.push(0, bus.epoch(0), &vec![0.002; FRAME]);
+        w.render_frame(&bus, &mixer, false);
+        assert!((monitor(&mixer)[0] - 0.002).abs() < 1e-5);
     }
 
     #[test]

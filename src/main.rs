@@ -102,20 +102,35 @@ fn main() {
     if let Some(c) = config.input2_channel {
         mixer.set_input2_channel(c);
     }
-    if let Some(p) = config.input1_profile {
-        mixer.set_input1_profile(albus::mixer::SlotProfile::from_u32(p));
-    }
-    if let Some(p) = config.input2_profile {
-        mixer.set_input2_profile(albus::mixer::SlotProfile::from_u32(p));
-    }
     if let Some(bps) = config.opus_bitrate {
         mixer.set_opus_bitrate(bps);
     }
     for (id, vol) in &config.peer_volumes {
         mixer.set_peer_volume(*id, *vol);
     }
-    // Обработка звука — опция, по умолчанию выключена
-    mixer.set_dsp_enabled(config.mic_processing.unwrap_or(false));
+    // Эффекты — опция, по умолчанию выключены. Старый конфиг знал только
+    // общий тумблер «обработка звука» и профиль: из них выводим начальное
+    // состояние независимых тумблеров, новые ключи важнее.
+    let legacy_dsp = config.mic_processing.unwrap_or(false);
+    let legacy_effects = |profile: Option<u32>, default: albus::mixer::SlotProfile| {
+        let profile = profile
+            .map(albus::mixer::SlotProfile::from_u32)
+            .unwrap_or(default);
+        legacy_dsp && profile.uses_voice_dsp()
+    };
+    let voice1 = legacy_effects(
+        config.input1_profile,
+        albus::mixer::SlotProfile::Voice,
+    );
+    let voice2 = legacy_effects(
+        config.input2_profile,
+        albus::mixer::SlotProfile::Instrument,
+    );
+    mixer.set_input1_gate(config.input1_gate.unwrap_or(voice1));
+    mixer.set_input1_agc(config.input1_agc.unwrap_or(voice1));
+    mixer.set_input2_gate(config.input2_gate.unwrap_or(voice2));
+    mixer.set_input2_agc(config.input2_agc.unwrap_or(voice2));
+    mixer.set_tx_limiter_enabled(config.tx_limiter.unwrap_or(legacy_dsp));
     mixer.set_rx_limiter_enabled(config.rx_limiter.unwrap_or(false));
     if let Some(vk) = config.ptt_vk {
         albus::keybind::CURRENT_VK.store(vk, std::sync::atomic::Ordering::Relaxed);
