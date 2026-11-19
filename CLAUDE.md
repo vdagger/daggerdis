@@ -91,11 +91,11 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), переходы под одним замком, проверка `call_id` в Accept/Decline/Cancel/End, приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
-| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, per-peer mix bus. Вход пишет сэмплы своего устройства в слоты `txbus`; Opus-энкодера и DSP в колбэке больше нет |
-| `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), эффекты входов по тумблерам (шумодав RNNoise, затвор и AGC независимо), лимитер передачи, монитор, Opus 64/96/128 кбит/с |
-| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, тумблеры `input1_denoise`/`input1_gate`/`input1_agc`/`input2_denoise`/`input2_gate`/`input2_agc`/`tx_limiter_enabled`/`rx_limiter_enabled` — все по умолчанию выкл., битрейт `opus_bitrate`), `SlotProfile` (пресет тумблеров), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
+| `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, per-peer mix bus. Вход пишет сэмплы своего устройства в слоты `txbus`, вывод кладёт в `echo_ref` опору AEC; Opus-энкодера и DSP в колбэке больше нет |
+| `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), эффекты входов по тумблерам (эхо-подавление AEC3, шумодав RNNoise, затвор и AGC независимо), лимитер передачи, монитор, Opus 64/96/128 кбит/с |
+| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, кольцо опоры `echo_ref`, тумблеры `input1_denoise`/`input1_gate`/`input1_agc`/`input1_aec`/`input2_denoise`/`input2_gate`/`input2_agc`/`input2_aec`/`tx_limiter_enabled`/`rx_limiter_enabled` — все по умолчанию выкл., битрейт `opus_bitrate`), `SlotProfile` (пресет тумблеров), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
-| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, эффекты `input1_denoise`/`input1_gate`/`input1_agc`/`input2_denoise`/`input2_gate`/`input2_agc`/`tx_limiter`, nick, per-peer volume, `video_fps`, `rx_limiter`; старые `mic_processing` и `input*_profile` читаются для совместимости) |
+| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, эффекты `input1_denoise`/`input1_gate`/`input1_agc`/`input1_aec`/`input2_denoise`/`input2_gate`/`input2_agc`/`input2_aec`/`tx_limiter`, nick, per-peer volume, `video_fps`, `rx_limiter`; старые `mic_processing` и `input*_profile` читаются для совместимости) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule for the current exe — идемпотентно (лишние одноимённые записи чистятся) |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
@@ -238,9 +238,10 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   received packet and drops any message whose `sender_id` doesn't match. The QUIC NodeID
   is authenticated by iroh's TLS.
 - **Эффекты — опцией, по умолчанию выключены.** У каждого входа свои тумблеры
-  «Шумодав», «Затвор» и «AGC», плюс общий «Лимитер передачи» в настройках звука
-  (`input1_denoise`, `input1_gate`, `input1_agc`, `input2_denoise`, `input2_gate`,
-  `input2_agc`, `tx_limiter` в `config.ini`). Профили «Голос»/«Инструмент» —
+  «Шумодав», «Затвор» и «AGC», плюс «Эхо» (AEC, отдельно от профилей) и общий
+  «Лимитер передачи» в настройках звука (`input1_denoise`, `input1_gate`,
+  `input1_agc`, `input1_aec`, `input2_denoise`, `input2_gate`, `input2_agc`,
+  `input2_aec`, `tx_limiter` в `config.ini`). Профили «Голос»/«Инструмент» —
   пресеты, которые ставят все три тумблера разом; после ручной правки виден
   профиль «Свой». Причина, по которой
   всё по умолчанию выключено: у одного из собеседников тракт загонял тихую речь
@@ -248,8 +249,9 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   нормально. Сырой микрофон честнее; обработку включают по желанию.
 - **DSP chain, передача:** linear resampler (`resample_linear`, preserves pitch
   across any card rate, работает всегда, у каждого входа свой `resample_pos`)
-  → по тумблерам слота: шумодав RNNoise, затем noise gate (−44 dBFS) и/или
-  `TransmitAgc` (цель −20 dBFS RMS, усиление −12…+24 дБ) → сумма входов,
+  → по тумблерам слота: AEC3 (эхо из колонок), затем шумодав RNNoise, затем
+  noise gate (−44 dBFS) и/или `TransmitAgc` (цель −20 dBFS RMS, усиление
+  −12…+24 дБ) → сумма входов,
   нормированная по числу звучащих → `Limiter` (−1 dBFS) при включённом
   «Лимитере передачи» → Opus 64/96/128 кбит/с. Выключенный эффект пропускается
   как есть; у инструмента обычно выключены все.
@@ -263,6 +265,20 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   выключенный шумодав не держит в памяти ни модель, ни хвост. Первый кадр
   после включения содержит затухание модели (артефакт входа), это раз на
   включение.
+- **Эхо-подавление — AEC3 на чистом Rust (`aec3_rs`).** Когда собеседники
+  звучат в колонках, микрофон слышит их голоса и отправляет обратно — человек
+  слышит сам себя с эхом. Затвор и шумодав тут не помогают: эхо идёт вместе с
+  речью. AEC3 вычитает из микрофона то, что играют колонки: адаптивный фильтр
+  подстраивается под акустику комнаты и задержку, а его подавитель гасит
+  остаток. Опорный сигнал — моно-микс голосов собеседников из колбэка вывода
+  (`out_scratch` после общей громкости, до монитора и гудка): монитор в опору
+  не входит, иначе AEC вычитал бы из микрофона свой же голос. Карта не на
+  48 кГц — опора ресэмплится в колбэке. Воркер забирает 960 сэмплов опоры
+  каждый тик и режет их вместе с кадром на половинки AEC3 (480 сэмплов,
+  10 мс); состояние создаётся лениво у каждого входа, при выключении тумблера
+  выбрасывается. Слот с AEC прокачивается и молчащим входом — история
+  фильтра не рвётся. Тумблер «Эхо» не входит в профили: он нужен только тем,
+  кто слушает без наушников.
 - **Битрейт Opus на передачу выбирается: 64 / 96 / 128 кбит/с.** Речь живёт на
   64, гитара — нет: на 64 кбит/с моно удары получают предэхо, а затухающие ноты
   «варблят». Поток один на оба входа, поэтому битрейт общий. Значение хранится
