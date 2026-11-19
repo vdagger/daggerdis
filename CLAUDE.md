@@ -92,8 +92,8 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, per-peer mix bus. Вход пишет сэмплы своего устройства в слоты `txbus`; Opus-энкодера и DSP в колбэке больше нет |
-| `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), профили «Голос/Инструмент», лимитер, монитор, Opus 64 кбит/с |
-| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, тумблеры `dsp_enabled`/`rx_limiter_enabled` — оба по умолчанию выкл.), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
+| `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), профили «Голос/Инструмент», лимитер, монитор, Opus 64/96/128 кбит/с |
+| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, тумблеры `dsp_enabled`/`rx_limiter_enabled` — оба по умолчанию выкл., битрейт `opus_bitrate`), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
 | `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, профили `input1_profile`/`input2_profile`, nick, per-peer volume, `video_fps`, `mic_processing`, `rx_limiter`) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
@@ -249,6 +249,14 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   нормированная по числу звучащих → `Limiter` (−1 dBFS) → Opus 64 kbps.
   Инструмент идёт без гейта и AGC. Выключена — в Opus идёт сигнал после
   ресэмплера, суммы и мьюта, без лимитера.
+- **Битрейт Opus на передачу выбирается: 64 / 96 / 128 кбит/с.** Речь живёт на
+  64, гитара — нет: на 64 кбит/с моно удары получают предэхо, а затухающие ноты
+  «варблят». Поток один на оба входа, поэтому битрейт общий. Значение хранится
+  в `config.ini` как `opus_bitrate`, неизвестное отбрасывается, а в микшере
+  округляется до ближайшего из трёх (`OPUS_BITRATES`). `txbus` переписывает
+  `encoder.bitrate_bps` только при смене — переключение действует без
+  перезапуска потока и без изменения протокола (декодер каналы и битрейт
+  узнаёт из самого Opus-пакета).
 - **Один энкодер и один поток кадров на оба входа (`src/txbus.rs`).** Каждый
   аудиоколбэк только читает свой канал, применяет громкость слота, ресэмплит в
   48 кГц и кладёт сэмплы в кольцо на 4800 сэмплов (`try_send` в notify и
@@ -300,7 +308,8 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   (plain `key=value`; a broken file is ignored). Devices are matched by **name** (cpal
   indices shift). `input2_device` missing, empty or equal to `input_device` means one
   stream reads both channels of one card; profiles are `input1_profile` /
-  `input2_profile` (0 — голос, 1 — инструмент, прочее отбрасывается). Per-peer volume
+  `input2_profile` (0 — голос, 1 — инструмент, прочее отбрасывается). `opus_bitrate`
+  is 64000, 96000 or 128000 (anything else is dropped). Per-peer volume
   is stored as `peer_<id>_volume` keyed by the stable `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
   written on change with a 400 ms throttle, never on exit.
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
