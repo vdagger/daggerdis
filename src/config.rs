@@ -38,6 +38,8 @@ pub struct AppConfig {
     pub continuous_mode: Option<bool>,
     /// Частота трансляции экрана (30 или 60 fps); по умолчанию 60.
     pub video_fps: Option<u32>,
+    /// Буфер показа видео у зрителя, мс (0…5000); по умолчанию 2000.
+    pub video_buffer_ms: Option<u32>,
     pub nick: Option<String>,
     /// Старый общий тумблер «обработка звука» (гейт + AGC + лимитер).
     /// Читается, только когда новых ключей эффектов в файле нет.
@@ -135,6 +137,11 @@ impl AppConfig {
                 "input2_agc" => cfg.input2_agc = value.parse().ok(),
                 "continuous_mode" => cfg.continuous_mode = value.parse().ok(),
                 "video_fps" => cfg.video_fps = value.parse().ok(),
+                // Буфер за пределами диапазона — порча файла, а не настройка:
+                // 5 с и так максимум, а отрицательное значение бессмысленно.
+                "video_buffer_ms" => {
+                    cfg.video_buffer_ms = value.parse().ok().map(|v: u32| v.min(5000))
+                }
                 "nick" => cfg.nick = Some(value.to_string()),
                 "mic_processing" => cfg.mic_processing = value.parse().ok(),
                 "tx_limiter" => cfg.tx_limiter = value.parse().ok(),
@@ -204,6 +211,9 @@ impl AppConfig {
         }
         if let Some(value) = self.video_fps {
             out.push_str(&format!("video_fps={}\n", value));
+        }
+        if let Some(value) = self.video_buffer_ms {
+            out.push_str(&format!("video_buffer_ms={}\n", value));
         }
         if let Some(value) = &self.nick {
             out.push_str(&format!("nick={}\n", value));
@@ -303,6 +313,20 @@ mod tests {
         assert_eq!(again.input1_agc, cfg.input1_agc);
         assert_eq!(again.input2_gate, cfg.input2_gate);
         assert_eq!(again.tx_limiter, cfg.tx_limiter);
+    }
+
+    #[test]
+    fn video_buffer_roundtrip_and_range() {
+        let cfg = AppConfig::parse("video_buffer_ms=1500\n");
+        assert_eq!(cfg.video_buffer_ms, Some(1500));
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.video_buffer_ms, Some(1500));
+        assert!(cfg.to_text().contains("video_buffer_ms=1500"));
+
+        let missing = AppConfig::parse("video_fps=30\n");
+        assert_eq!(missing.video_buffer_ms, None, "старый конфиг — буфер по умолчанию");
+        assert_eq!(AppConfig::parse("video_buffer_ms=99999\n").video_buffer_ms, Some(5000));
+        assert_eq!(AppConfig::parse("video_buffer_ms=abc\n").video_buffer_ms, None);
     }
 
     #[test]

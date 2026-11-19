@@ -30,6 +30,7 @@ pub fn spawn_iroh_receiver(
     chat_log: Arc<ChatLog>,
     calls: Arc<CallManager>,
     presence: Arc<crate::presence::PresenceTracker>,
+    video: Arc<crate::network::video_directory::VideoDirectory>,
 ) {
     if let Some(p2p) = iroh_p2p {
         let p2p_recv = p2p.clone();
@@ -40,6 +41,7 @@ pub fn spawn_iroh_receiver(
         let chat_log_iroh = chat_log.clone();
         let calls_iroh = calls.clone();
         let presence_iroh = presence.clone();
+        let video_iroh = video.clone();
         let my_id = crate::identity::my_id_from_node_id(&p2p.my_node_id).unwrap_or(0);
 
         rt.spawn(async move {
@@ -65,6 +67,7 @@ pub fn spawn_iroh_receiver(
                             node_id,
                             is_host: peer_is_host,
                             hops,
+                            video_gen,
                         } => {
                             if hops > 0 {
                                 // Релей: хост пересылает IrohSync тем, с кем этот
@@ -112,6 +115,11 @@ pub fn spawn_iroh_receiver(
                                 continue;
                             }
 
+                            // Анонс трансляции — только после проверок подлинности:
+                            // подделанный sender_id не должен подсунуть зрителю
+                            // чужой поток. Номер 0 снимает анонс.
+                            video_iroh.observe(&node_id, video_gen);
+
                             // 1. Сохраняем пира с ПОЛНЫМ 64-символьным NodeID
                             room_iroh.update_peer(crate::types::Peer {
                                 id: sender_id,
@@ -153,6 +161,9 @@ pub fn spawn_iroh_receiver(
                                     node_id: node_id.clone(),
                                     is_host: peer_is_host,
                                     hops: hops + 1,
+                                    // без поколения зритель за релеем не узнает
+                                    // о трансляции — пакет собирается заново
+                                    video_gen,
                                 };
                                 let bytes = crate::network::message::serialize_msg(&relay);
                                 p2p_recv

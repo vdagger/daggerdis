@@ -20,6 +20,9 @@ pub enum NetworkMessage {
         /// 0 — пакет от самого узла, 1 — переслан хостом. Дальше одного релея
         /// не идёт: иначе IrohSync ходил бы по кругу между хостами.
         hops: u8,
+        /// Номер текущей трансляции экрана: 0 — не транслирует. По нему
+        /// зритель находит живой поток и переподписывается при перезапуске.
+        video_gen: u32,
     },
     FriendRequest {
         sender_id: u64,
@@ -127,6 +130,7 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             node_id,
             is_host,
             hops,
+            video_gen,
         } => {
             data.push(5);
             data.extend_from_slice(&sender_id.to_le_bytes());
@@ -135,6 +139,9 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
             let node_bytes = node_id.as_bytes();
             data.extend_from_slice(&(node_bytes.len() as u16).to_le_bytes());
             data.extend_from_slice(node_bytes);
+            // Поколение трансляции — в конец: старые парсеры читают только
+            // NodeID и лишние байты игнорируют, новый читает 0, если их нет.
+            data.extend_from_slice(&video_gen.to_le_bytes());
         }
         NetworkMessage::FriendRequest {
             sender_id,
@@ -249,11 +256,18 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
             let len = u16::from_le_bytes([bytes[11], bytes[12]]) as usize;
             if bytes.len() >= 13 + len {
                 let node_id = String::from_utf8(bytes[13..13 + len].to_vec()).ok()?;
+                // Пакет старой версии кончается на NodeID — поколения нет.
+                let video_gen = if bytes.len() >= 17 + len {
+                    u32::from_le_bytes(bytes[13 + len..17 + len].try_into().ok()?)
+                } else {
+                    0
+                };
                 Some(NetworkMessage::IrohSync {
                     sender_id,
                     node_id,
                     is_host,
                     hops,
+                    video_gen,
                 })
             } else {
                 None
@@ -370,6 +384,7 @@ mod tests {
             node_id: "ab".repeat(32),
             is_host: true,
             hops: 1,
+            video_gen: 0x1234_5678,
         });
         roundtrip(NetworkMessage::FriendRequest {
             sender_id: 1,
@@ -447,18 +462,39 @@ mod tests {
             node_id: "node".into(),
             is_host: true,
             hops: 1,
+            video_gen: 7,
         });
         assert_eq!(&bytes[..1], &[5]);
         assert_eq!(bytes[9], 1); // is_host
         assert_eq!(bytes[10], 1); // hops
         assert_eq!(u16::from_le_bytes([bytes[11], bytes[12]]), 4);
-        assert_eq!(&bytes[13..], b"node");
+        assert_eq!(&bytes[13..17], b"node");
+        assert_eq!(u32::from_le_bytes(bytes[17..21].try_into().unwrap()), 7);
 
         // обрезанный node_id — отказ, а не пакет с пустым NodeID
         assert!(deserialize_msg(&bytes[..15]).is_none());
         let mut cut = bytes.clone();
         cut.truncate(13);
         assert!(deserialize_msg(&cut).is_none());
+    }
+
+    #[test]
+    fn iroh_sync_old_format_has_no_video() {
+        // Пакет предыдущей версии: всё то же, но без video_gen в конце.
+        let mut bytes = serialize_msg(&NetworkMessage::IrohSync {
+            sender_id: 0xAA,
+            node_id: "node".into(),
+            is_host: false,
+            hops: 0,
+            video_gen: 9,
+        });
+        bytes.truncate(17);
+        match deserialize_msg(&bytes) {
+            Some(NetworkMessage::IrohSync { video_gen, .. }) => {
+                assert_eq!(video_gen, 0, "старый пакет не должен объявлять трансляцию")
+            }
+            other => panic!("старый IrohSync разобран неверно: {other:?}"),
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::network::p2p_iroh::IrohP2pManager;
+use crate::network::video_directory::VideoDirectory;
 use crate::network::NetworkMessage;
 use crate::room::RoomManager;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,11 +11,24 @@ pub struct MigrationManager {
     room: Arc<RoomManager>,
     iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,
+    /// Каталог трансляций: в каждом IrohSync уходит номер своей трансляции,
+    /// чтобы вошедшие в комнату позже узнали о ней без отдельного сообщения.
+    video: Arc<VideoDirectory>,
 }
 
 impl MigrationManager {
-    pub fn new(my_id: u64, room: Arc<RoomManager>, iroh: Option<Arc<IrohP2pManager>>) -> Self {
-        MigrationManager { room, iroh, my_id }
+    pub fn new(
+        my_id: u64,
+        room: Arc<RoomManager>,
+        iroh: Option<Arc<IrohP2pManager>>,
+        video: Arc<VideoDirectory>,
+    ) -> Self {
+        MigrationManager {
+            room,
+            iroh,
+            my_id,
+            video,
+        }
     }
 
     pub async fn start_heartbeat_loop(&self, is_host: Arc<AtomicBool>) {
@@ -30,6 +44,7 @@ impl MigrationManager {
                     node_id: p2p.my_node_id.clone(),
                     is_host: my_is_host,
                     hops: 0,
+                    video_gen: self.video.my_gen(),
                 };
                 let serialized = crate::network::message::serialize_msg(&sync_msg);
                 p2p.broadcast_bytes(&serialized).await;

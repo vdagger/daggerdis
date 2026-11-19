@@ -86,6 +86,9 @@ fn main() {
     });
 
     let room = Arc::new(RoomManager::new(my_id));
+    // Каталог трансляций: издатель кладёт туда номер своей, зрители — анонсы
+    // соседей. Общий для миграции, сервиса приёма и видео-транспорта.
+    let video_directory = Arc::new(albus::network::video_directory::VideoDirectory::new());
     let mixer = Arc::new(AudioMixer::new());
     if let Some(v) = config.ch1_volume {
         mixer.set_ch1_volume(v);
@@ -142,7 +145,12 @@ fn main() {
         albus::keybind::CURRENT_VK.store(vk, std::sync::atomic::Ordering::Relaxed);
     }
     let mut audio = UniversalAudioCapture::new().unwrap();
-    let migration = Arc::new(MigrationManager::new(my_id, room.clone(), iroh_p2p.clone()));
+    let migration = Arc::new(MigrationManager::new(
+        my_id,
+        room.clone(),
+        iroh_p2p.clone(),
+        video_directory.clone(),
+    ));
 
     // 3. Каналы передачи аудио
     let (packet_tx, packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
@@ -263,6 +271,7 @@ fn main() {
         chat_log.clone(),
         calls.clone(),
         presence.clone(),
+        video_directory.clone(),
     );
     if let Some(ref p2p) = iroh_p2p {
         albus::presence::spawn_ping_loop(
@@ -311,10 +320,16 @@ fn main() {
     let rt_handle = rt.handle().clone();
     #[cfg(windows)]
     let video_link = iroh_p2p.as_ref().map(|p2p| {
-        albus::network::video_link::VideoLink::spawn(p2p.clone(), rt_handle.clone())
+        albus::network::video_link::VideoLink::spawn(
+            p2p.clone(),
+            rt_handle.clone(),
+            video_directory.clone(),
+        )
     });
     #[cfg(windows)]
     let video_link_gui = video_link.clone();
+    #[cfg(windows)]
+    let video_directory_gui = video_directory.clone();
 
     let _guard = rt.enter();
     let _runtime_guard = rt;
@@ -351,7 +366,7 @@ fn main() {
 
             #[cfg(windows)]
             if let Some(link) = video_link_gui {
-                app.attach_video(link, rt_handle.clone());
+                app.attach_video(link, video_directory_gui.clone());
             }
 
             Ok(Box::new(app))

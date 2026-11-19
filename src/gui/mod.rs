@@ -89,8 +89,10 @@ pub struct RadioApp {
     remote: Option<video_session::RemoteView>,
     #[cfg(windows)]
     video_link: Option<Arc<crate::network::video_link::VideoLink>>,
+    /// Кто в комнате сейчас в эфире: по этой карте зритель выбирает поток
+    /// и переподписывается при перезапуске чужой трансляции.
     #[cfg(windows)]
-    video_rt: Option<tokio::runtime::Handle>,
+    video_directory: Option<Arc<crate::network::video_directory::VideoDirectory>>,
 }
 
 impl RadioApp {
@@ -193,7 +195,7 @@ impl RadioApp {
             #[cfg(windows)]
             video_link: None,
             #[cfg(windows)]
-            video_rt: None,
+            video_directory: None,
         }
     }
 
@@ -202,10 +204,10 @@ impl RadioApp {
     pub fn attach_video(
         &mut self,
         link: Arc<crate::network::video_link::VideoLink>,
-        rt: tokio::runtime::Handle,
+        directory: Arc<crate::network::video_directory::VideoDirectory>,
     ) {
         self.video_link = Some(link);
-        self.video_rt = Some(rt);
+        self.video_directory = Some(directory);
     }
 
     /// Подменяет входные потоки, когда в настройках выбрали другие устройства.
@@ -488,12 +490,52 @@ impl eframe::App for RadioApp {
                 }
             }
 
+            if let Some(link) = &self.video_link {
+                link.set_buffer_ms(
+                    self.config
+                        .video_buffer_ms
+                        .unwrap_or(crate::network::video_link::DEFAULT_BUFFER_MS),
+                );
+
+                // Своя трансляция возобновляет анонс, если он потерялся:
+                // «Выйти из эфира» снимает его, а видео при этом не гаснет.
+                if self.video.is_some() && !self.room.is_left() {
+                    if let Some(dir) = &self.video_directory {
+                        if dir.my_gen() == 0 {
+                            link.begin_stream();
+                        }
+                    }
+                }
+
+                // Живой поток комнаты: один на всех, свой не показываем.
+                let target = if self.room.is_left() {
+                    None
+                } else {
+                    self.video_directory.as_ref().and_then(|dir| {
+                        dir.live(Instant::now())
+                            .into_iter()
+                            .find(|(node, _)| *node != self.my_node_id)
+                    })
+                };
+                link.sync_viewing(target.clone());
+
+                // Источник пропал или сменился — старое окно показывать нечего.
+                let remote_stale = match (&self.remote, &target) {
+                    (Some(remote), Some((node, _))) => *node != remote.peer,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if remote_stale {
+                    self.remote = None;
+                }
+            }
+
             // чужие кадры из сети; за один апдейт не больше нескольких,
             // чтобы очередь декодирования не растягивала кадр GUI
             if let Some(link) = &self.video_link {
                 let mut budget = 4;
                 while budget > 0 {
-                    let Some(frame) = link.try_recv_remote() else {
+                    let Some(frame) = link.try_recv_due() else {
                         break;
                     };
                     budget -= 1;
@@ -1034,7 +1076,7 @@ impl RadioApp {
                                     self.video = None;
                                     self.video_fullscreen = false;
                                     if let Some(link) = &self.video_link {
-                                        link.stop_viewers();
+                                        link.end_stream();
                                     }
                                 } else {
                                     let fps = match self.config.video_fps {
@@ -1045,18 +1087,11 @@ impl RadioApp {
                                         Ok(v) => {
                                             self.video = Some(v);
                                             self.video_error = None;
-                                            if let (Some(link), Some(rt)) =
-                                                (self.video_link.clone(), self.video_rt.clone())
-                                            {
-                                                for peer in self.room.get_all_peers() {
-                                                    if peer.address != self.my_node_id {
-                                                        let link = link.clone();
-                                                        let target = peer.address.clone();
-                                                        rt.spawn(async move {
-                                                            link.add_viewer(target).await;
-                                                        });
-                                                    }
-                                                }
+                                            // Анонс новой трансляции: зрители
+                                            // найдут её в каталоге и подпишутся
+                                            // сами, в том числе вошедшие позже.
+                                            if let Some(link) = &self.video_link {
+                                                link.begin_stream();
                                             }
                                         }
                                         Err(e) => self.video_error = Some(e),
@@ -1253,6 +1288,17 @@ impl RadioApp {
         // Флаг «вышли» ставится до обрыва соединений: иначе их последний
         // IrohSync ещё успел бы вернуть собеседника в комнату.
         self.room.leave();
+        // Видео вне комнаты не живёт: своя трансляция снимается с анонса,
+        // чужая — снимается подписка и очищается очередь.
+        #[cfg(windows)]
+        if let Some(link) = &self.video_link {
+            link.end_stream();
+            link.unsubscribe();
+        }
+        #[cfg(windows)]
+        {
+            self.remote = None;
+        }
         self.is_host.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(p2p) = self.iroh.clone() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1379,6 +1425,40 @@ impl RadioApp {
                                         self.pending_save = true;
                                     }
                                 });
+
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Буфер показа")
+                                            .size(10.5)
+                                            .color(t::TEXT_MUTED),
+                                    );
+                                    ui.add_space(8.0);
+                                    let mut buffer = self.config.video_buffer_ms.unwrap_or(
+                                        crate::network::video_link::DEFAULT_BUFFER_MS,
+                                    );
+                                    let changed = ui
+                                        .add(
+                                            egui::Slider::new(&mut buffer, 0..=5000u32)
+                                                .step_by(100.0)
+                                                .suffix(" мс"),
+                                        )
+                                        .changed();
+                                    if changed {
+                                        self.config.video_buffer_ms = Some(buffer);
+                                        self.pending_save = true;
+                                        if let Some(link) = &self.video_link {
+                                            link.set_buffer_ms(buffer);
+                                        }
+                                    }
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Буфер зрителя: сеть успевает отдать отставший кадр. 0 — показывать сразу.",
+                                    )
+                                    .size(8.5)
+                                    .color(t::TEXT_MUTED),
+                                );
 
                                 ui.add_space(14.0);
                                 t::divider(ui);
@@ -1837,11 +1917,18 @@ impl RadioApp {
                                     // миллисекунды по этапам: по ним зритель видит,
                                     // упирается показ в его же компьютер или в сеть
                                     let (decode, gpu, image) = remote.timings();
+                                    let buffer = self
+                                        .config
+                                        .video_buffer_ms
+                                        .unwrap_or(crate::network::video_link::DEFAULT_BUFFER_MS)
+                                        as f32
+                                        / 1000.0;
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "Смотрит: {} · {:.0} FPS · декод {:.1} / GPU {:.1} / картинка {:.1} мс",
+                                            "Смотрит: {} · {:.0} FPS · буфер {:.1} с · декод {:.1} / GPU {:.1} / картинка {:.1} мс",
                                             remote.peer,
                                             remote.fps(),
+                                            buffer,
                                             decode,
                                             gpu,
                                             image
