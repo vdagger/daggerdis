@@ -92,10 +92,10 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, per-peer mix bus. Вход пишет сэмплы своего устройства в слоты `txbus`; Opus-энкодера и DSP в колбэке больше нет |
-| `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), профили «Голос/Инструмент», лимитер, монитор, Opus 64/96/128 кбит/с |
-| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, тумблеры `dsp_enabled`/`rx_limiter_enabled` — оба по умолчанию выкл., битрейт `opus_bitrate`), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
+| `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), эффекты входов по тумблерам (затвор и AGC независимо), лимитер передачи, монитор, Opus 64/96/128 кбит/с |
+| `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, тумблеры `input1_gate`/`input1_agc`/`input2_gate`/`input2_agc`/`tx_limiter_enabled`/`rx_limiter_enabled` — все по умолчанию выкл., битрейт `opus_bitrate`), `SlotProfile` (пресет тумблеров), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
 | `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
-| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, профили `input1_profile`/`input2_profile`, nick, per-peer volume, `video_fps`, `mic_processing`, `rx_limiter`) |
+| `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, эффекты `input1_gate`/`input1_agc`/`input2_gate`/`input2_agc`/`tx_limiter`, nick, per-peer volume, `video_fps`, `rx_limiter`; старые `mic_processing` и `input*_profile` читаются для совместимости) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule for the current exe — идемпотентно (лишние одноимённые записи чистятся) |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
@@ -237,18 +237,21 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
 - **Anti-impersonation:** `iroh_service.rs` recomputes `hash(QUIC NodeID)` for every
   received packet and drops any message whose `sender_id` doesn't match. The QUIC NodeID
   is authenticated by iroh's TLS.
-- **Обработка звука — опцией, по умолчанию выключена.** Тумблеры «Шумовой затвор,
-  AGC и лимитер» и «Лимитер приёма» в настройках звука (`mic_processing=1` /
-  `rx_limiter=1` в `config.ini`). Причина: у одного из собеседников тракт
-  загонял тихую речь в гейт и AGC, и его почти не было слышно, хотя обратный
-  канал звучал нормально. Сырой микрофон честнее; обработку включают по желанию.
-- **DSP chain, передача (при включённой обработке):** linear resampler
-  (`resample_linear`, preserves pitch across any card rate, работает всегда, у
-  каждого входа свой `resample_pos`) → для профиля «Голос» noise gate (−44 dBFS)
-  → `TransmitAgc` (цель −20 dBFS RMS, усиление −12…+24 дБ) → сумма входов,
-  нормированная по числу звучащих → `Limiter` (−1 dBFS) → Opus 64 kbps.
-  Инструмент идёт без гейта и AGC. Выключена — в Opus идёт сигнал после
-  ресэмплера, суммы и мьюта, без лимитера.
+- **Эффекты — опцией, по умолчанию выключены.** У каждого входа свои тумблеры
+  «Затвор» и «AGC», плюс общий «Лимитер передачи» в настройках звука
+  (`input1_gate`, `input1_agc`, `input2_gate`, `input2_agc`, `tx_limiter`
+  в `config.ini`). Профили «Голос»/«Инструмент» — пресеты, которые ставят оба
+  тумблера разом; после ручной правки виден профиль «Свой». Причина, по которой
+  всё по умолчанию выключено: у одного из собеседников тракт загонял тихую речь
+  в гейт и AGC, и его почти не было слышно, хотя обратный канал звучал
+  нормально. Сырой микрофон честнее; обработку включают по желанию.
+- **DSP chain, передача:** linear resampler (`resample_linear`, preserves pitch
+  across any card rate, работает всегда, у каждого входа свой `resample_pos`)
+  → по тумблерам слота: noise gate (−44 dBFS) и/или `TransmitAgc`
+  (цель −20 dBFS RMS, усиление −12…+24 дБ) → сумма входов, нормированная по
+  числу звучащих → `Limiter` (−1 dBFS) при включённом «Лимитере передачи» →
+  Opus 64/96/128 кбит/с. Выключенный эффект пропускается как есть; у
+  инструмента обычно выключены оба.
 - **Битрейт Opus на передачу выбирается: 64 / 96 / 128 кбит/с.** Речь живёт на
   64, гитара — нет: на 64 кбит/с моно удары получают предэхо, а затухающие ноты
   «варблят». Поток один на оба входа, поэтому битрейт общий. Значение хранится
@@ -281,17 +284,17 @@ NodeID. On the receiving side a finished stream drops that sender's queued frame
   Порог пика у каждого голоса отдельно съедал персональный буст: при пиках 0.3 из
   +18 дБ оставалось ~+10, при 0.5 — ~+5.7, а если общая громкость уже стояла на 300%,
   персональная не добавляла почти ничего.
-- **AGC на передаче (когда обработка включена) — это и есть «как в Discord»:** без него микрофон с речью на
+- **AGC на передаче (когда тумблер AGC включён) — это и есть «как в Discord»:** без него микрофон с речью на
   −20 dBFS уходил в эфир на −20 dBFS, и громкость добиралась уже у собеседника.
   Ниже −66 dBFS RMS усиление не трогается — тихая речь этого порога достигает,
-  а шум в паузах до AGC не доходит вовсе: гейт обнуляет его раньше.
+  а шум в паузах до AGC не доходит, если включён затвор: он обнуляет его раньше.
   Вниз усиление идёт почти мгновенно (0.7 за колбэк), вверх — медленно (0.05):
   при медленном спаде первая доля громкой фразы проходила некомпрессированной,
   и в мониторинге это слышалось как «громко, затем резко тише».
   Огибающая RMS захватывается быстро (0.8), отпускает медленно (0.1).
 - **Прослушивание своего тракта (self-monitor):** тумблер «Слышать свой тракт» в
   настройках звука. В `AudioMixer.monitor_buf` кладётся каждый собранный кадр
-  (`txbus`) — то есть ровно то, что уйдёт в Opus: после гейта/AGC профиля,
+  (`txbus`) — то есть ровно то, что уйдёт в Opus: после включённых эффектов входа,
   суммы и лимитера, поэтому прослушивание не зависит от PTT. В колбэке воспроизведения он подмешивается к
   миксу **после** master gain (уровень монитора не зависит от громкости собеседников)
   и **до** миксового лимитера, с ресэмплингом 48 кГц → частота карты. Буфер ограничен
