@@ -66,12 +66,14 @@ normal terminal triggers a UAC prompt.
    - `broadcast::spawn_audio_broadcast` — fan-out voice over Iroh.
    - `presence::spawn_ping_loop` — пинг друзей раз в 4 с (`PresencePing`/`Pong`), только если iroh поднялся.
    - `MigrationManager::start_heartbeat_loop` — 1 s IrohSync / host failover.
-8. On Windows: `video_link::VideoLink::spawn(p2p, rt.handle(), video_directory)` —
-   the video transport (its own ALPN) sharing the `VideoDirectory` that carries
-   the live-broadcast announcements (IrohSync `video_gen`). It must be spawned with
-   the runtime `Handle`, not bare `tokio::spawn` — at this point `main` has not
-   entered the runtime yet. The GUI receives both via
-   `RadioApp::attach_video(link, directory)`.
+8. On Windows: `video_link::VideoLink::spawn(p2p, rt.handle(), video_directory,
+   is_host, room)` — the video transport (its own ALPN) sharing the
+   `VideoDirectory` that carries the live-broadcast announcements (IrohSync
+   `video_gen`). It needs `is_host` and `room` because the room host accepts a
+   publisher's feed and relays it, and admissions must stop after «Выйти из
+   эфира». It must be spawned with the runtime `Handle`, not bare `tokio::spawn` —
+   at this point `main` has not entered the runtime yet. The GUI receives link +
+   directory via `RadioApp::attach_video(link, directory)`.
 9. `eframe::run_native("Albus Audio", ...)` → `gui::RadioApp`.
 
 Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun.rs`,
@@ -123,7 +125,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/video/win_decode.rs` | H.264 decoder MFT — both async and sync paths; NV12 repack 1088→1080 |
 | `src/video/publisher.rs` | `video-publisher` thread: capture at the chosen fps (30/60) → NV12 → encode → mpsc of `EncodedUnit`; `encode_fps` counter for diagnostics |
 | `src/network/video_directory.rs` | `VideoDirectory`: номер своей трансляции (`my_gen`) + анонсы соседей из IrohSync (`video_gen`), TTL 5 с; общая для миграции, сервиса приёма и видео |
-| `src/network/video_link.rs` | `discordrf-video/1`: протокол подписки (контроль `kind=2/3` в первом bi-стриме), окно недавних кадров (180 / 64 МиБ, отдача с последнего ключевого), broadcast подписчикам, очередь зрителя со сдвигом показа на буфер |
+| `src/network/video_link.rs` | `discordrf-video/1`: контроль `kind=2/3/4/5` (подписка, ответ, feed издателя, релей-подписка) в первом bi-стриме, окно недавних кадров и relay под одним замком (180 / 64 МиБ, отдача с последнего ключевого), релей хоста без ре-энкода, маршрутизация зрителя, очередь зрителя со сдвигом показа на буфер |
 | `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
 | `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
 | `src/widgets/room_panel.rs` | Секции рейла: вход по NodeID, «Мой NodeID» + копирование, участники плоскими строками, громкость собеседника |
@@ -175,22 +177,51 @@ Annex-B H.264 payload:
 | 24 | u32 | payload length |
 | 28 | bytes | SPS/PPS (if flag 2), then H.264 |
 
-**Subscription protocol.** The connection opens the *viewer*, and only to a
-broadcast it has found in `VideoDirectory`. The first bidirectional stream is
-the control channel: viewer → `u8 kind=2, u32 gen`; publisher → `u8 kind=3,
-u8 status` (0 = accepted, 1 = not broadcasting / other gen), `u32 gen`. On 0 the
-publisher starts a send task on that connection; on 1 it closes it. The viewer
-closes its control send side right after subscribing, so the publisher detects
-its departure with `Connection::closed()`, not with EOF. A viewer whose control
-answer takes longer than 3 s retries no sooner than 2 s later.
+**Control protocol.** The client opens the connection — a viewer, or a publisher
+sending its feed to the host. The first bidirectional stream is the control
+channel; the first byte says what it is (read limit 256 bytes):
+
+| kind | direction | layout |
+|------|-----------|--------|
+| 2 | viewer → publisher | `gen u32` — direct subscription |
+| 3 | answer | `status u8` (0 = accepted, 1 = refused), `gen u32` |
+| 4 | publisher → host | `gen u32` — feed |
+| 5 | viewer → host | `gen u32`, `len u16`, publisher NodeID (64 hex) — relay subscription |
+
+On acceptance the node starts the right task on that connection (sender for a
+viewer, `read_feed` for a feed); on refusal it closes the connection. The client
+closes its control send side right after the request, so the server detects its
+departure with `Connection::closed()`, not with EOF. An answer that takes longer
+than 3 s is retried no sooner than 2 s later. The publisher NodeID in kind 5 is
+mandatory: `gen` is taken from the clock, two publishers collide in the same
+second, and `decide_control` compares the pair (publisher, gen) against the
+current relay.
+
+**Topology is a star.** The publisher sends **one** stream to the room host
+(kind 4); the host forwards the same compressed bytes to every viewer (kind 5)
+and into its own preview window — no re-encode. Publisher upload is 1 × bitrate,
+host upload is N × bitrate; the extra hop is absorbed by the viewer's buffer.
+A host that broadcasts itself takes no relay and is not used as one: viewers
+open a direct subscription (kind 2) to it. There is no fallback to the direct
+path — `choose_view_route` either finds a route or leaves the viewer empty, as
+the builds must match by stamp anyway. The host admits a feed only when
+`is_host && !room.is_left() && my_gen == 0 && directory.is_live(from, gen)`; a
+new feed replaces the old one (its task receives `stop`, `Recent` is cleared),
+and the old read task removes the relay only when `relay.id` is still its own.
 
 The publisher announces `my_gen` in `IrohSync` (tag 5, `video_gen`, sent once a
 second); `VideoDirectory` keeps the announcements of neighbours with a 5 s TTL
-and `live(now)` returns `(node_id, gen)` pairs. The GUI takes the first live
-broadcast not its own and calls `VideoLink::sync_viewing(Some((node, gen)))`;
-`None` (no live broadcast, or `room.is_left()`) stops the subscription and clears
-the remote window. So a peer who joins the room mid-stream subscribes within
+and `live(now)` returns `(node_id, gen)` pairs. Every node picks the first live
+announcement not its own, so all converge on one stream: `choose_view_route`
+gives `Relay` through the host (when the host exists, is not the publisher and
+is not broadcasting), `FeedWatch` to the host itself, and `Direct` otherwise;
+`choose_feed_target` makes a publisher feed the host only when no other live
+announcement exists. So a peer who joins the room mid-stream subscribes within
 about a second without any manual recipient picker.
+
+`RoomManager::host_peer()` returns the peer with the lowest `id` among
+`is_host` — the same rule `migration.rs` uses to elect a host. Self is not in
+`peers`, so `None` means "I am the host, or there is no host yet".
 
 **Late joiners start from a keyframe.** `publish` always keeps a ring of the
 last 180 frames / 64 MiB (`Recent`), keyed by an in-memory `seq`, even when
@@ -201,8 +232,16 @@ skipped (if the ring has no keyframe, the task waits for the next IDR). The
 broadcast capacity is 240 frames; after `Lagged` the task takes a fresh handoff
 instead of continuing from a P-frame. The wire frame format is unchanged.
 
+The ring and the relay live under **one mutex** (`Window { recent, relay }`):
+`publish_own` re-checks `directory.my_gen()` under the lock, `publish_relay`
+requires `my_gen == 0` and its own relay id, so a frame from a stopped stream
+can never land in a new one and a subscription never sees two streams mixed.
+`remote_epoch` is bumped on every queue reset — the GUI drops `RemoteView` even
+when the source name did not change.
+
 Stopping a broadcast calls `VideoLink::end_stream()` (gen 0, `stop_viewers()`,
-ring cleared); the GUI does it in the same click that drops `self.video` and in
+ring cleared, outgoing feed stopped, relay and viewer queue dropped); the GUI
+does it in the same click that drops `self.video` and in
 `leave_voice`. Each viewer connection lives inside a send task that selects on a
 `watch` stop signal; when it fires, the task ends and with it the QUIC
 connection — without this every stop/start cycle left the old connections alive
