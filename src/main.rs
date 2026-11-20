@@ -319,11 +319,15 @@ fn main() {
     #[cfg(windows)]
     let rt_handle = rt.handle().clone();
     #[cfg(windows)]
+    // Хост комнаты принимает feed издателя и раздаёт его зрителям: транспорт
+    // должен знать, хост ли мы, и не обслуживать запросы после «Выйти».
     let video_link = iroh_p2p.as_ref().map(|p2p| {
         albus::network::video_link::VideoLink::spawn(
             p2p.clone(),
             rt_handle.clone(),
             video_directory.clone(),
+            is_host.clone(),
+            room.clone(),
         )
     });
     #[cfg(windows)]

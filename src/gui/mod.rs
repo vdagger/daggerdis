@@ -87,6 +87,10 @@ pub struct RadioApp {
     video_window: bool,
     #[cfg(windows)]
     remote: Option<video_session::RemoteView>,
+    /// Счётчик сбросов очереди зрителя на прошлом кадре: сменился — прошлую
+    /// картинку не показываем, даже если источник тот же.
+    #[cfg(windows)]
+    remote_epoch_seen: u64,
     #[cfg(windows)]
     video_link: Option<Arc<crate::network::video_link::VideoLink>>,
     /// Кто в комнате сейчас в эфире: по этой карте зритель выбирает поток
@@ -192,6 +196,8 @@ impl RadioApp {
             video_window: false,
             #[cfg(windows)]
             remote: None,
+            #[cfg(windows)]
+            remote_epoch_seen: 0,
             #[cfg(windows)]
             video_link: None,
             #[cfg(windows)]
@@ -507,27 +513,59 @@ impl eframe::App for RadioApp {
                     }
                 }
 
-                // Живой поток комнаты: один на всех, свой не показываем.
-                let target = if self.room.is_left() {
+                // Маршрут по комнате: живой поток, хост и свои флаги.
+                // Топология звездой — издатель отдаёт поток хосту, зрители
+                // идут к хосту; показ и свой feed считаются от одного набора.
+                let left = self.room.is_left();
+                let my_gen = self
+                    .video_directory
+                    .as_ref()
+                    .map(|dir| dir.my_gen())
+                    .unwrap_or(0);
+                let is_host = self.is_host.load(std::sync::atomic::Ordering::Relaxed);
+                let live: Vec<(String, u32)> = match (&self.video_directory, left) {
+                    (Some(dir), false) => dir
+                        .live(Instant::now())
+                        .into_iter()
+                        .filter(|(node, _)| *node != self.my_node_id)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let host = if left {
                     None
                 } else {
-                    self.video_directory.as_ref().and_then(|dir| {
-                        dir.live(Instant::now())
-                            .into_iter()
-                            .find(|(node, _)| *node != self.my_node_id)
-                    })
+                    self.room.host_peer().map(|peer| peer.address)
                 };
-                link.sync_viewing(target.clone());
+                // Вещающий хост релеем быть не может: его окно занято своим
+                // потоком. Живой анонс хоста — признак того, что он вещает.
+                let host_busy = host
+                    .as_deref()
+                    .map(|h| live.iter().any(|(node, _)| node == h))
+                    .unwrap_or(false);
+                let host_ref = host.as_deref();
+
+                let route = crate::network::video_link::choose_view_route(
+                    is_host, left, my_gen, &live, host_ref, host_busy,
+                );
+                link.sync_viewing(route.target());
+                let feed_target = crate::network::video_link::choose_feed_target(
+                    is_host, my_gen, &live, host_ref, host_busy,
+                );
+                link.sync_feed(feed_target);
 
                 // Источник пропал или сменился — старое окно показывать нечего.
-                let remote_stale = match (&self.remote, &target) {
-                    (Some(remote), Some((node, _))) => *node != remote.peer,
+                // Сброс очереди (обрыв, переподключение) тоже гасит картинку:
+                // последний кадр прошлой подписки иначе висел бы на экране.
+                let stale_peer = match (&self.remote, route.expected_peer()) {
+                    (Some(remote), Some(peer)) => peer != remote.peer,
                     (Some(_), None) => true,
-                    _ => false,
+                    (None, _) => false,
                 };
-                if remote_stale {
+                let stale_epoch = link.remote_epoch() != self.remote_epoch_seen;
+                if stale_peer || stale_epoch {
                     self.remote = None;
                 }
+                self.remote_epoch_seen = link.remote_epoch();
             }
 
             // чужие кадры из сети; за один апдейт не больше нескольких,
