@@ -48,6 +48,10 @@ pub struct Renderer {
     /// кадров выбросили из очереди показа. Это и есть ответ на «почему не 60».
     readback_waits: u32,
     dropped: u32,
+    /// Дамп уже сделан (диагностика ALBUS_VIDEO_DUMP).
+    /// Дампы уже сделаны (диагностика ALBUS_VIDEO_DUMP).
+    dump_nv12: bool,
+    dump_bgra: bool,
     pub last_error: Option<String>,
 }
 
@@ -97,6 +101,8 @@ impl Renderer {
             queued: std::collections::VecDeque::new(),
             readback_waits: 0,
             dropped: 0,
+            dump_nv12: false,
+            dump_bgra: false,
             last_error: None,
         })
     }
@@ -117,13 +123,32 @@ impl Renderer {
                 }
             }
         }
+        // Диагностика: один дамп декодированного кадра и картинки в BGRA,
+        // ALBUS_VIDEO_DUMP=<префикс>. Нужно для «стрим показывает полосы».
+        if !self.dump_nv12 {
+            if let Ok(prefix) = std::env::var("ALBUS_VIDEO_DUMP") {
+                if let Some(nv12) = latest.as_ref() {
+                    let _ = std::fs::write(format!("{prefix}.feed.nv12"), nv12);
+                    println!(
+                        "[ВИДЕО-DBG] NV12 {} байт, ожидалось {} ({}x{})",
+                        nv12.len(),
+                        self.width as usize * self.height as usize * 3 / 2,
+                        self.width,
+                        self.height
+                    );
+                    self.dump_nv12 = true;
+                }
+            }
+        }
 
         if !units.is_empty() {
             self.decode_ms = t_decode.elapsed().as_secs_f32() * 1000.0;
         }
 
         // Короткий кадр (ошибка декодера) нельзя отдавать в D3D: UpdateSubresource
-        // прочитает за концом буфера. Лучше пропустить кадр.
+        // прочитает за концом буфера. Лишние байты — тоже признак беды (например,
+        // декодер отдал BGRA, а его читают как NV12): получились бы диагональные
+        // полосы. Лучше пропустить кадр и сказать об этом.
         if let Some(nv12) = latest {
             let need = self.width as usize * self.height as usize * 3 / 2;
             if nv12.len() < need {
@@ -131,6 +156,14 @@ impl Renderer {
                     "короткий NV12-кадр: {} из {} байт",
                     nv12.len(),
                     need
+                ));
+            } else if nv12.len() > need + 64 {
+                self.last_error = Some(format!(
+                    "кадр не того формата: {} байт вместо {} ({}x{})",
+                    nv12.len(),
+                    need,
+                    self.width,
+                    self.height
                 ));
             } else {
                 // Показ берёт не больше одного кадра за апдейт, поэтому
@@ -218,6 +251,19 @@ impl Renderer {
         self.pending_since = None;
 
         let t_image = Instant::now();
+        if let Ok(prefix) = std::env::var("ALBUS_VIDEO_DUMP") {
+            if !self.dump_bgra {
+                let _ = std::fs::write(format!("{prefix}.show.bgra"), &bgra);
+                println!(
+                    "[ВИДЕО-DBG] BGRA {} байт, ожидалось {} ({}x{})",
+                    bgra.len(),
+                    self.out_width as usize * self.out_height as usize * 4,
+                    self.out_width,
+                    self.out_height
+                );
+                self.dump_bgra = true;
+            }
+        }
         let image = bgra_to_image(&bgra, self.out_width, self.out_height);
         match &mut self.texture {
             Some(t) => t.set(image, egui::TextureOptions::LINEAR),

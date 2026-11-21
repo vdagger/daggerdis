@@ -226,7 +226,7 @@ fn run(
         fps: target.fps,
         sequence_header: encoder.sequence_header.clone(),
     };
-    let source = format!("{label} → {}x{}", target.width, target.height);
+    let source = format!("{label} · поток {}x{}", target.width, target.height);
     let base_bitrate = target.bitrate_bps;
     let _ = init.send(Ok((info, source, base_bitrate, used)));
     // Какой битрейт сейчас стоит у энкодера: меняем только при отличии.

@@ -158,7 +158,21 @@ impl WindowCapture {
                         self.converter.convert_and_read(&texture)
                     })();
                     let _ = unsafe { frame.Close() };
-                    return converted.map(Some);
+                    // Проверка размера: конвертер обязан отдать плотный NV12
+                    // ровно w×h. Иначе кадр будет мусором на экране, и лучше
+                    // сказать это словами, чем показать полосы.
+                    let expected = (self.width * self.height * 3 / 2) as usize;
+                    return match converted {
+                        Ok(buf) if buf.len() == expected => Ok(Some(buf)),
+                        Ok(buf) => Err(format!(
+                            "WGC: кадр {} байт вместо {} ({}x{})",
+                            buf.len(),
+                            expected,
+                            self.width,
+                            self.height
+                        )),
+                        Err(e) => Err(e),
+                    };
                 }
                 Err(_) => {
                     if Instant::now() >= deadline {

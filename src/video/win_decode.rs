@@ -42,6 +42,11 @@ pub struct MfDecoder {
     width: u32,
     height: u32,
     fps: u32,
+    /// Ширина строки NV12 на выходе декодера. Декодер выравнивает ширину
+    /// (1108 → 1120), и читать его кадр как плотный нельзя: строки уезжают
+    /// на (stride − width) байт за кадр, картинка идёт диагональными полосами.
+    /// Берём из `MF_MT_DEFAULT_STRIDE`, а если его нет — считаем из размера.
+    stride: Option<u32>,
     pub mft_name: String,
     pub notes: Vec<String>,
 }
@@ -151,6 +156,13 @@ impl MfDecoder {
         let output_info = transform
             .GetOutputStreamInfo(0)
             .map_err(|e| format!("{name}: GetOutputStreamInfo: {e}"))?;
+        // Шаг строки на выходе: у Microsoft-декодера ширина выравнивается до
+        // 16 (1108 → 1120), и без этого атрибута кадр читается со сдвигом.
+        let stride = transform
+            .GetOutputCurrentType(0)
+            .ok()
+            .and_then(|t| t.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok())
+            .map(|v| (v as i32).unsigned_abs());
 
         transform
             .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
@@ -169,6 +181,7 @@ impl MfDecoder {
             width: info.width,
             height: info.height,
             fps: info.fps,
+            stride,
             mft_name: name,
             notes,
         })
@@ -176,6 +189,11 @@ impl MfDecoder {
 
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Ширина строки NV12 на выходе (диагностика и проба).
+    pub fn output_stride(&self) -> Option<u32> {
+        self.stride
     }
 
     /// Отдаёт один сжатый кадр, возвращает все декодированные NV12-кадры.
@@ -386,7 +404,7 @@ impl MfDecoder {
                 .map_err(|e| format!("Lock output: {e}"))?;
             let raw = std::slice::from_raw_parts(ptr, current as usize).to_vec();
             buf.Unlock().map_err(|e| e.to_string())?;
-            Ok(Output::Frame(repack_nv12(raw, self.width, self.height)))
+            Ok(Output::Frame(repack_nv12(raw, self.width, self.height, self.stride)))
         }
     }
 
@@ -408,6 +426,13 @@ impl MfDecoder {
                 .transform
                 .GetOutputStreamInfo(0)
                 .map_err(|e| e.to_string())?;
+            // Ширина строки могла измениться вместе с типом.
+            self.stride = self
+                .transform
+                .GetOutputCurrentType(0)
+                .ok()
+                .and_then(|t| t.GetUINT32(&MF_MT_DEFAULT_STRIDE).ok())
+                .map(|v| (v as i32).unsigned_abs());
             Ok(())
         }
     }
@@ -468,31 +493,169 @@ unsafe fn activation_name(act: &IMFActivate) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end.min(buf.len())]))
 }
 
-/// Декодер отдаёт высоту, выровненную по 16 (1088 вместо 1080), и UV-плоскость
-/// начинается ниже. Для показа нужен плотный кадр ровно w×h.
-fn repack_nv12(data: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+/// Декодер отдаёт NV12 не плотным: высота выровнена по 16 (1088 вместо 1080),
+/// а ширина — по 16 самим декодером (1108 → 1120). Плотный кадр нужен и
+/// `upload_nv12`, и проверке длины, поэтому разбираем буфер по шагу строки, а
+/// не «как есть»: иначе каждая строка уезжает на (шаг − ширина) байт и
+/// картинка идёт диагональными полосами (видно на окнах с шириной не кратной
+/// 16 — 1108x610).
+///
+/// `stride` — ширина строки с выхода (`MF_MT_DEFAULT_STRIDE`): сам декодер
+/// знает её точно. Если атрибута нет, шаг выводится из размера буфера.
+fn repack_nv12(data: Vec<u8>, w: u32, h: u32, stride: Option<u32>) -> Vec<u8> {
     let w = w as usize;
     let h = h as usize;
     let need = w * h * 3 / 2;
-    if data.len() == need {
+    let hinted = stride.map(|s| s as usize).filter(|s| *s >= w);
+    // Уже плотный кадр: самая частая ветка (ширина кратна выравниванию).
+    if data.len() == need && hinted.map(|s| s == w).unwrap_or(true) {
         return data;
     }
-    let real_h = (data.len() * 2 / 3) / w;
-    if real_h <= h || data.len() < need {
-        let mut v = data;
-        v.truncate(need.min(v.len()));
-        return v;
-    }
-    let mut out = Vec::with_capacity(need);
-    out.extend_from_slice(&data[..w * h]);
-    let uv_start = w * real_h;
-    let uv_len = w * (h / 2);
-    if data.len() >= uv_start + uv_len {
-        out.extend_from_slice(&data[uv_start..uv_start + uv_len]);
-    }
+    let pitch = hinted.unwrap_or_else(|| guess_pitch(data.len(), w, h));
+    let rows = if pitch >= w { data.len() / pitch } else { 0 };
+    // Шаг из атрибута может не совпасть с фактическим буфером (декодер отдал
+    // плотный кадр, но шаг в типе выровнен) — тогда читаем как плотный.
+    let (pitch, rows) = if pitch >= w && rows >= h + h / 2 {
+        (pitch, rows)
+    } else {
+        let p = guess_pitch(data.len(), w, h);
+        if p >= w {
+            (p, data.len() / p)
+        } else {
+            let mut v = data;
+            v.resize(need, 0);
+            v.truncate(need);
+            return v;
+        }
+    };
+    // Высота Y-плоскости в буфере: буфер = шаг × (h' + h'/2).
+    let aligned_h = rows * 2 / 3;
+    let mut out = vec![0u8; need];
+    let copy_rows = |dst: &mut [u8], src_row: usize, count: usize, dst_off: usize| {
+        for y in 0..count {
+            let src = (src_row + y) * pitch;
+            if src + w > data.len() || dst_off + y * w + w > dst.len() {
+                break;
+            }
+            dst[dst_off + y * w..dst_off + y * w + w]
+                .copy_from_slice(&data[src..src + w]);
+        }
+    };
+    copy_rows(&mut out, 0, h, 0);
+    copy_rows(&mut out, aligned_h, h / 2, w * h);
     out
+}
+
+/// Шаг строки по размеру буфера, если декодер не сказал его прямо:
+/// ищем наименьшее выравнивание, при котором буфер раскладывается в NV12.
+fn guess_pitch(len: usize, w: usize, h: usize) -> usize {
+    if len == w * h * 3 / 2 {
+        return w;
+    }
+    // Выровнена только высота: буфер = w × (h' + h'/2).
+    if len.is_multiple_of(w) {
+        let rows = len / w;
+        if rows.is_multiple_of(3) && rows * 2 / 3 >= h {
+            return w;
+        }
+    }
+    for align in [16usize, 32, 64, 128, 256] {
+        let p = w.next_multiple_of(align);
+        if p < w || !len.is_multiple_of(p) {
+            continue;
+        }
+        let rows = len / p;
+        // rows = h' + h'/2 = h'·3/2, то есть делится на 3.
+        if rows.is_multiple_of(3) && rows * 2 / 3 >= h {
+            return p;
+        }
+    }
+    0
 }
 
 fn pack2(a: u32, b: u32) -> u64 {
     ((a as u64) << 32) | b as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repack_nv12;
+
+    /// Кадр 14x4 в буфере с шагом 16: Y — по строкам `y*10 + x`, UV — 128 полос,
+    /// чтобы сдвиг шага был виден и по цвету.
+    fn padded_buffer() -> Vec<u8> {
+        let (pitch, h) = (16usize, 4usize);
+        let mut buf = vec![0u8; pitch * (h + h / 2)];
+        for y in 0..h {
+            for x in 0..14 {
+                buf[y * pitch + x] = (y * 10 + x) as u8;
+            }
+        }
+        for y in 0..h / 2 {
+            for x in 0..14 {
+                buf[(h + y) * pitch + x] = 100 + y as u8;
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn repack_uses_decoder_stride_not_width() {
+        // Именно этот случай давал диагональные полосы: 14 при выравнивании 16.
+        let out = repack_nv12(padded_buffer(), 14, 4, Some(16));
+        assert_eq!(out.len(), 14 * 4 * 3 / 2);
+        for y in 0..4 {
+            for x in 0..14 {
+                assert_eq!(out[y * 14 + x], (y * 10 + x) as u8, "Y ({x},{y})");
+            }
+        }
+        for y in 0..2 {
+            for x in 0..14 {
+                assert_eq!(
+                    out[14 * 4 + y * 14 + x],
+                    100 + y as u8,
+                    "UV ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repack_guesses_stride_without_attribute() {
+        let out = repack_nv12(padded_buffer(), 14, 4, None);
+        assert_eq!(out[1], 1, "строка читается со своим шагом");
+        assert_eq!(out[14 + 3], 13);
+        assert_eq!(out[2 * 14 + 5], 25);
+    }
+
+    #[test]
+    fn repack_keeps_packed_frame() {
+        // Плотный кадр 1920x1080 возвращается байт в байт, без копий.
+        let buf = vec![7u8; 1920 * 1080 * 3 / 2];
+        let out = repack_nv12(buf.clone(), 1920, 1080, Some(1920));
+        assert_eq!(out, buf);
+        let out = repack_nv12(buf.clone(), 1920, 1080, None);
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn repack_handles_height_padding_without_stride() {
+        // Декодер выровнял только высоту: 4 → 8 строк Y.
+        let (w, h, pitch) = (14usize, 4usize, 14usize);
+        let mut buf = vec![0u8; pitch * (8 + 4)];
+        for y in 0..4 {
+            for x in 0..w {
+                buf[y * pitch + x] = (y * 10 + x) as u8;
+            }
+        }
+        for y in 0..2 {
+            for x in 0..w {
+                buf[(8 + y) * pitch + x] = 200 + y as u8;
+            }
+        }
+        let out = repack_nv12(buf, w as u32, h as u32, None);
+        assert_eq!(out.len(), w * h * 3 / 2);
+        assert_eq!(out[2 * w + 1], 21);
+        assert_eq!(out[w * h + w], 201, "UV начинается ниже выровненной высоты");
+    }
 }
