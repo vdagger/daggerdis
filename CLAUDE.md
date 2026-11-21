@@ -508,14 +508,15 @@ is `video_buffer_ms` (0..5000, default 400; larger values are clamped), preset i
 - **Video pipeline (Windows):** DXGI capture (BGRA, GPU) → `ID3D11VideoProcessor`
   converts/scales to NV12 on the GPU → hardware H.264 MFT → iroh → decoder MFT →
   NV12 → Video Processor → BGRA → egui texture. Bitrate is `pixels × fps ×
-  bits_per_pixel` (Low 0.04 / Balanced 0.07 / Quality 0.12, capped 1.5–40 Mbps),
-  so 1080p60 ≈ 5 / 8.7 / 14.9 Mbps; пресет выбирается в карточке трансляции
+  bits_per_pixel` (Low 0.05 / Balanced 0.10 / Quality 0.16, пол 2.5 и потолок
+  40 Мбит/с), so 1080p60 ≈ 6 / 12 / 20 Mbps, а окно 1108x610x30 — 2.5 / 2.5 /
+  3.2 Мбит/с; пресет выбирается в карточке трансляции
   (`video_preset`, «Авто» — по разрешению источника). Энкодер просит CABAC,
   0 B-кадров, «качество/скорость» 50 и VBV (пик 1.25 среднего, буфер 0.5 с);
   NVIDIA MFT не принимает `AVEncCommonRealTime` и `DefaultBPictureCount` — это
-  видно строкой `ICodecAPI: [...]`, поток не рвётся. GOP 1 с: вошедший зритель
-  получает картинку сразу (IDR по подписке), потеря лечится без двухсекундного
-  ожидания. Битрейт **адаптивный**: потери feed-канала опускают его
+  видно строкой `ICodecAPI: [...]`, поток не рвётся. GOP 1 с (2 с ниже 4 Мбит/с):
+  зритель получает свежий IDR по подписке, а не ждёт планового. Битрейт
+  **адаптивный**: потери feed-канала опускают его
   (`watch_feed_bitrate`, вниз 15 %/с, вверх после 5 чистых секунд). Источник —
   весь экран или одно окно: прямоугольник окна вырезается из кадра стола через
   `VideoProcessorSetStreamSourceRect`; через WGC (`win_wgc.rs`) окно снимается
@@ -682,7 +683,7 @@ is `video_buffer_ms` (0..5000, default 400; larger values are clamped), preset i
   kept a frame-sized allocation per call (~3 MB at 1080p), which showed up as
   growth both during a stream and across broadcast start/stop cycles (the
   driver frees it late). `win_d3d.rs` now `ManuallyDrop::take`s it on every
-  `Blt` outcome. Проверка утечек: `tools/video_probe` (`ALBUS_NO_ADMIN_MANIFEST=1`).
+  `Blt` outcome. Проверка утечек: `tools/video_probe`.
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
 - `Cargo.lock` is committed and must stay committed (binary app — do **not** gitignore it).

@@ -73,14 +73,16 @@ impl VideoPreset {
         [VideoPreset::Low, VideoPreset::Balanced, VideoPreset::Quality]
     }
 
-    /// Биты на пиксель кадра при H.264 и длинном GOP.
-    /// Рабочий стол и текст требуют больше, чем видео: 0.12 при 1920x1080x60
-    /// даёт ~15 Мбит/с, при 2560x1440x60 — ~27 Мбит/с.
+    /// Биты на пиксель кадра при H.264 и CBR.
+    /// Рабочий стол и текст требуют больше, чем видео с камеры: при 0.10
+    /// 1920x1080x60 даёт ~12 Мбит/с, 2560x1440x60 — ~22 Мбит/с, а окно
+    /// 1108x610x30 — ~2 Мбит/с (для читаемого текста этого мало, поэтому внизу
+    /// есть пол по битрейту). Quality 0.16: 1080p60 ≈ 20 Мбит/с, окно ≈ 3.2.
     pub fn bits_per_pixel(self) -> f64 {
         match self {
-            VideoPreset::Low => 0.04,
-            VideoPreset::Balanced => 0.07,
-            VideoPreset::Quality => 0.12,
+            VideoPreset::Low => 0.05,
+            VideoPreset::Balanced => 0.10,
+            VideoPreset::Quality => 0.16,
         }
     }
 
@@ -112,23 +114,71 @@ pub struct VideoTarget {
 }
 
 impl VideoTarget {
+    /// Пол по битрейту: ниже него H.264 «мылит» текст в кашу, и никакой пресет
+    /// этого не исправит. Окно 1108x610x30 по формуле (0.10) дало бы 2.0 Мбит/с,
+    /// а на 1.5 Мбит/с (прежний пол) браузер и Discord выглядели мутно.
+    const MIN_BITRATE: u32 = 2_500_000;
+    /// До этого битрейта ключевой кадр выдаётся раз в 2 с: на малом потоке
+    /// IDR каждую секунду съедает заметную долю битрейта и мылит картинку.
+    const SMALL_STREAM_BPS: u32 = 4_000_000;
+
     pub fn new(width: u32, height: u32, fps: u32, preset: VideoPreset) -> Self {
         // NV12 требует чётных размеров, H.264 — тоже
         let width = (width & !1).max(2);
         let height = (height & !1).max(2);
         let fps = fps.clamp(1, 120);
         let raw = (width as f64) * (height as f64) * (fps as f64) * preset.bits_per_pixel();
+        let bitrate_bps = (raw as u32).clamp(Self::MIN_BITRATE, 40_000_000);
         Self {
             width,
             height,
             fps,
-            bitrate_bps: (raw as u32).clamp(1_500_000, 40_000_000),
-            // Ключевой кадр раз в секунду: с ним зритель, вошедший в середину
-            // трансляции, начинает показ не позже секунды, а потеря кадров
-            // лечится пересылкой IDR, а не ожиданием двух секунд. При CBR
-            // лишний IDR стоит 2-3 % битрейта — незаметно.
-            keyframe_secs: 1,
+            bitrate_bps,
+            // Ключевой кадр: 2 с на малом потоке, 1 с на большом. Зритель,
+            // вошедший в середину, всё равно получает свежий IDR по подписке
+            // (`force_keyframe`), так что плановый интервал можно удлинить.
+            keyframe_secs: if bitrate_bps < Self::SMALL_STREAM_BPS {
+                2
+            } else {
+                1
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preset_bitrates_scale_with_pixels_and_fps() {
+        // 1080p60 — опорные значения, по ним карточка показывает ориентир.
+        let hd = VideoTarget::new(1920, 1080, 60, VideoPreset::Balanced);
+        assert_eq!(hd.bitrate_bps, 12_441_600); // 2.07 Мпикс · 60 · 0.10
+        let quality = VideoTarget::new(1920, 1080, 60, VideoPreset::Quality);
+        assert_eq!(quality.bitrate_bps, 19_906_560);
+        // Окно 1108x610x30 «сбалансированным» — 2.0 Мбит/с по формуле, но пол
+        // 2.5 Мбит/с: на 1.5 Мбит/с текст браузера/Discord был мутным.
+        let window = VideoTarget::new(1108, 610, 30, VideoPreset::Balanced);
+        assert_eq!(window.bitrate_bps, VideoTarget::MIN_BITRATE);
+        let window_quality = VideoTarget::new(1108, 610, 30, VideoPreset::Quality);
+        assert_eq!(window_quality.bitrate_bps, 3_244_224);
+    }
+
+    #[test]
+    fn small_streams_get_longer_gop() {
+        // Малый поток: IDR раз в 2 с, иначе ключевые кадры съедают битрейт.
+        let window = VideoTarget::new(1108, 610, 30, VideoPreset::Balanced);
+        assert_eq!(window.keyframe_secs, 2);
+        let big = VideoTarget::new(1920, 1080, 60, VideoPreset::Quality);
+        assert_eq!(big.keyframe_secs, 1);
+    }
+
+    #[test]
+    fn odd_sizes_and_fps_are_normalized() {
+        let t = VideoTarget::new(1109, 611, 0, VideoPreset::Low);
+        assert_eq!((t.width, t.height), (1108, 610));
+        assert_eq!(t.fps, 1);
     }
 }
 
