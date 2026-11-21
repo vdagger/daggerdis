@@ -13,6 +13,58 @@ extern "system" {
 /// Системный код клавиши Windows (VK)
 pub type PttBind = i32;
 
+/// Что решил шаг перехвата. `ptt` — только при смене состояния (иначе поток
+/// каждый тик писал бы одно и то же), `mute_toggle` — фронт Ctrl+M.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotkeyEvents {
+    pub ptt: Option<bool>,
+    pub mute_toggle: bool,
+}
+
+/// Решения по горячим клавишам без ОС и потоков.
+///
+/// Вход — то, что умеет прочитать любой бэкенд: «передача включена тумблером»,
+/// «клавиша зажата», «зажата экранная зона», «нажат Ctrl», «нажат M». Win32
+/// читает это через `GetAsyncKeyState`, X11/Wayland-бэкенд сможет читать из
+/// `XGrabKey`/evdev и звать тот же `step` — поэтому логика про края и здесь,
+/// а не в цикле потока.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HotkeyState {
+    ptt: bool,
+    mute_combo: bool,
+}
+
+impl HotkeyState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Один тик: накапливает фронты.
+    pub fn step(
+        &mut self,
+        continuous: bool,
+        key_down: bool,
+        screen_ptt: bool,
+        ctrl: bool,
+        m: bool,
+    ) -> HotkeyEvents {
+        let active = continuous || key_down || screen_ptt;
+        let mut ptt = None;
+        if active != self.ptt {
+            self.ptt = active;
+            ptt = Some(active);
+        }
+        // Ctrl+M — по фронту: удержание не должно дёргать тумблер на каждом тике.
+        let combo = ctrl && m;
+        let mut mute_toggle = false;
+        if combo && !self.mute_combo {
+            mute_toggle = true;
+        }
+        self.mute_combo = combo;
+        HotkeyEvents { ptt, mute_toggle }
+    }
+}
+
 // По умолчанию Mouse 4 (боковая кнопка мыши 0x05)
 pub static CURRENT_VK: AtomicI32 = AtomicI32::new(0x05);
 static LISTENER_SPAWNED: AtomicBool = AtomicBool::new(false);
@@ -24,7 +76,6 @@ static SCREEN_PTT: AtomicBool = AtomicBool::new(false);
 /// GUI забирает событие через `take_mute_toggle` — сам он в этом потоке
 /// не живёт, поэтому флаг, а не прямой вызов микшера.
 static MUTE_EDGE: AtomicBool = AtomicBool::new(false);
-static MUTE_LAST: AtomicBool = AtomicBool::new(false);
 
 /// Забирает накопившееся нажатие Ctrl+M (true — ровно одно нажатие).
 pub fn take_mute_toggle() -> bool {
@@ -62,7 +113,7 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
     {
         std::thread::spawn(move || {
             println!("[ХОТКЕЙ] 🚀 Фоновый системный перехватчик PTT в играх запущен!");
-            let mut last_state = false;
+            let mut state = HotkeyState::new();
 
             loop {
                 std::thread::sleep(Duration::from_millis(10));
@@ -77,15 +128,21 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
                     } else {
                         false
                     };
+                    let ctrl_down = unsafe { (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0 };
+                    let m_down = unsafe { (GetAsyncKeyState(0x4D) as u16 & 0x8000) != 0 };
 
-                    // Передача активна: тумблер, физическая клавиша или зажатая экранная зона
-                    let should_transmit =
-                        is_active || key_down || SCREEN_PTT.load(Ordering::Relaxed);
-
-                    if should_transmit != last_state {
-                        last_state = should_transmit;
-                        ptt_flag.store(should_transmit, Ordering::Relaxed);
-                        if should_transmit {
+                    // Решения — в чистой `HotkeyState`: тот же шаг сможет звать
+                    // бэкенд X11/Wayland, когда появится.
+                    let events = state.step(
+                        is_active,
+                        key_down,
+                        SCREEN_PTT.load(Ordering::Relaxed),
+                        ctrl_down,
+                        m_down,
+                    );
+                    if let Some(on) = events.ptt {
+                        ptt_flag.store(on, Ordering::Relaxed);
+                        if on {
                             println!(
                                 "[ХОТКЕЙ] 🎙️ ЭФИР ВКЛЮЧЕН (VK: {:#X}, Hands-Free: {})",
                                 vk, is_active
@@ -94,15 +151,7 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
                             println!("[ХОТКЕЙ] 🔇 ЭФИР ВЫКЛЮЧЕН");
                         }
                     }
-
-                    // Ctrl+M — глобальный мьют микрофона, рядом с PTT и так же
-                    // из любого приложения. Реагируем на фронт, иначе удержание
-                    // дёргало бы тумблер каждые 10 мс.
-                    let ctrl_down = unsafe { (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0 };
-                    let m_down = unsafe { (GetAsyncKeyState(0x4D) as u16 & 0x8000) != 0 };
-                    let combo = ctrl_down && m_down;
-                    let was_combo = MUTE_LAST.swap(combo, Ordering::Relaxed);
-                    if combo && !was_combo {
+                    if events.mute_toggle {
                         MUTE_EDGE.store(true, Ordering::Relaxed);
                     }
                 }
@@ -214,5 +263,55 @@ pub fn check_ptt_status(
 
     if let Some(vk) = bind {
         CURRENT_VK.store(vk, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ptt_reacts_to_edges_only() {
+        let mut st = HotkeyState::new();
+        // Клавиша нажата — событие включения.
+        assert_eq!(
+            st.step(false, true, false, false, false).ptt,
+            Some(true),
+            "первое нажатие включает эфир"
+        );
+        // Держим — повторных событий нет.
+        assert_eq!(st.step(false, true, false, false, false).ptt, None);
+        // Отпустили — событие выключения.
+        assert_eq!(st.step(false, false, false, false, false).ptt, Some(false));
+        assert_eq!(st.step(false, false, false, false, false).ptt, None);
+    }
+
+    #[test]
+    fn ptt_sums_hands_free_key_and_screen_zone() {
+        let mut st = HotkeyState::new();
+        // Тумблер включён — эфир уже идёт.
+        assert_eq!(st.step(true, false, false, false, false).ptt, Some(true));
+        // Отпустили клавишу, но тумблер держит передачу: выключения нет.
+        assert_eq!(st.step(true, false, false, false, false).ptt, None);
+        // Экранная зона дожимает, когда тумблер выключили.
+        assert_eq!(st.step(false, false, true, false, false).ptt, None);
+        assert_eq!(st.step(false, false, false, false, false).ptt, Some(false));
+    }
+
+    #[test]
+    fn mute_toggles_once_per_ctrl_m_press() {
+        let mut st = HotkeyState::new();
+        assert!(st.step(false, false, false, true, true).mute_toggle, "первое нажатие");
+        assert!(!st.step(false, false, false, true, true).mute_toggle, "удержание молчит");
+        assert!(!st.step(false, false, false, true, false).mute_toggle);
+        assert!(st.step(false, false, false, true, true).mute_toggle, "второе нажатие");
+    }
+
+    #[test]
+    fn mute_needs_both_keys() {
+        let mut st = HotkeyState::new();
+        // Ctrl без M и M без Ctrl — не мьют.
+        assert!(!st.step(false, false, false, true, false).mute_toggle);
+        assert!(!st.step(false, false, false, false, true).mute_toggle);
     }
 }
