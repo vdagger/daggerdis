@@ -27,6 +27,7 @@ raw-window-handle = "0.6"
 # Захват экрана, аппаратный H.264 (Media Foundation) и DXGI — только Windows.
 # Остальные платформы получают заглушки в src/video и собираются без этих фич.
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -40,6 +41,14 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    # Windows Graphics Capture (трансляция окна поверх перекрытия)
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",

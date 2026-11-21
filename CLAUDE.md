@@ -143,7 +143,8 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/video/win_d3d.rs` | D3D11 device + `ID3D11VideoProcessor` BGRA↔NV12 conversion/scaling, staging readback |
 | `src/video/win_mf.rs` | Async hardware H.264 MFT encoder (NVENC/AMF/QSV), CBR/GOP via `ICodecAPI` |
 | `src/video/win_decode.rs` | H.264 decoder MFT — both async and sync paths; NV12 repack 1088→1080 |
-| `src/video/win_windows.rs` | Список окон для трансляции окна (`EnumWindows`, рамка без тени) + `clamp_rect`: пересечение с экраном и чётные размеры |
+| `src/video/win_wgc.rs` | Захват окна через Windows Graphics Capture: свой `IGraphicsCaptureItemInterop`, `CreateFreeThreaded`-пул, кадр → `ID3D11Texture2D` → тот же конвертер |
+| `src/video/win_windows.rs` | Список окон (`EnumWindows`, рамка без тени) + `clamp_rect`: пересечение с экраном и чётные размеры |
 | `src/video/publisher.rs` | `video-publisher` thread: capture at the chosen fps (30/60) → NV12 → encode → mpsc of `EncodedUnit`; `encode_fps` counter for diagnostics |
 | `src/network/video_directory.rs` | `VideoDirectory`: номер своей трансляции (`my_gen`) + анонсы соседей из IrohSync (`video_gen`), TTL 5 с; общая для миграции, сервиса приёма и видео |
 | `src/network/video_link.rs` | `discordrf-video/1`: контроль `kind=2/3/4/5` (подписка, ответ, feed издателя, релей-подписка) в первом bi-стриме, окно недавних кадров и relay под одним замком (180 / 64 МиБ, отдача с последнего ключевого), релей хоста без ре-энкода, маршрутизация зрителя, очередь зрителя со сдвигом показа на буфер |
@@ -514,7 +515,8 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   после 5 чистых секунд, пол — четверть пресета), энкодер принимает значение
   на ходу. Источник — весь экран или одно окно: прямоугольник окна вырезается
   из кадра стола через `VideoProcessorSetStreamSourceRect`, поэтому захват идёт
-  в размер окна; перекрытое окно попадёт в кадр с перекрытием (WGC ещё нет).
+  в размер окна. Через WGC (`win_wgc.rs`) окно снимается независимо от
+  перекрытия; если система WGC не даёт — работает вырезка из экрана.
 - **AMF encoder quirk:** the AMD MFT ignores `MF_MT_FRAME_RATE` and computes rate
   control against 30 fps — at 60 fps the stream came out twice the requested
   bitrate. `win_mf::mean_bitrate_for()` compensates with `30/fps` for MFTs whose
@@ -644,17 +646,12 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   comb filtering smears the voice. Candidates are now sorted by channel count
   (f32 before i16, then fewer channels), and the callback writes only the
   first two channels (`active_channels = channels.min(2)`), leaving the rest
-  silent: LFE/центр/тыл копией фронта не кормим.
-- **Razer's virtual "7.1 Surround Sound" endpoint mangles `f32`.** Известный
-  баг cpal ([RustAudio/cpal#892](https://github.com/RustAudio/cpal/issues/892)):
-  любой cpal-звук на нём искажён, а `i32` играет чисто. Поэтому `i32` тоже
-  кандидат, и на многоканальных выходах он пробуется раньше `f32`; порядок
-  печатается по попыткам (`формат … не подошёл`).
-- **Build stamp for stale copies:** `build.rs` exports `ALBUS_BUILD_STAMP` (the
-  newest mtime under `src/` or `build.rs`), and startup prints
-  `[СБОРКА] Albus <version> · сборка <stamp>`. Two peers must show the same
-  stamp — an exe copied to another machine stays whatever it was, and that is
-  the first thing to rule out when one side has "robot voice" or 30 fps video.
+  silent: LFE/центр/тыл копией фронта не кормим. У виртуального «7.1» Razer
+  ломается `f32` (cpal#892), поэтому `i32` тоже кандидат и пробуется раньше.
+- **Build stamp:** `build.rs` отдаёт `ALBUS_BUILD_STAMP` (самый свежий mtime в
+  `src/`), при старте печатается `[СБОРКА] Albus <version> · сборка <stamp>`.
+  У двух узлов штамп обязан совпадать — экземпляр, скопированный на другую
+  машину, остаётся старым, и это первое, что проверяют при «роботе» или 30 fps.
 - **Stream rate is a setting:** `video_fps=30|60` in `config.ini`, picked in the
   broadcast panel before starting (default 60); it threads through
   `VideoSession::start(fps)` → `ScreenPublisher::start(fps)` → capture, encoder and

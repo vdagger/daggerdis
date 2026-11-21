@@ -15,6 +15,62 @@ use super::{EncodedUnit, VideoPreset, VideoTarget};
 
 pub use super::StreamInfo;
 
+use super::win_wgc::WindowCapture;
+
+/// Откуда берём кадры: весь экран (или его область) либо одно окно через WGC.
+enum Capture {
+    Screen(ScreenCapture),
+    Wgc(WindowCapture),
+}
+
+impl Capture {
+    fn next_nv12(&mut self, timeout_ms: u32) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Capture::Screen(c) => c.next_nv12(timeout_ms),
+            Capture::Wgc(c) => c.next_nv12(timeout_ms),
+        }
+    }
+
+}
+
+/// Собирает источник кадров: окно через WGC, окно вырезкой из экрана или
+/// весь экран. Возвращает источник, размер и подпись для карточки.
+fn make_capture(
+    fps: u32,
+    window: Option<isize>,
+) -> Result<(Capture, u32, u32, String), String> {
+    if let Some(hwnd) = window {
+        if super::win_wgc::supported() {
+            match WindowCapture::new(hwnd, fps) {
+                Ok(c) => {
+                    let (w, h) = c.dimensions();
+                    return Ok((Capture::Wgc(c), w, h, format!("окно {w}x{h} (WGC)")));
+                }
+                Err(e) => println!("[ВИДЕО] WGC не поднялся ({e}) — вырезаю окно из кадра экрана"),
+            }
+        } else {
+            println!("[ВИДЕО] WGC недоступен — вырезаю окно из кадра экрана");
+        }
+        let mut cap = ScreenCapture::new(None, fps)?;
+        let desktop = cap.desktop_size();
+        let rect = super::win_windows::window_rect(hwnd)
+            .and_then(|r| super::win_windows::clamp_rect(r, desktop));
+        let Some((x, y, w, h)) = rect else {
+            return Err("окно не видно на экране (свёрнуто или уведено за край)".into());
+        };
+        cap.set_source_rect(Some((x, y, w, h)));
+        let label = format!("{} окно {w}x{h}", cap.adapter_name);
+        return Ok((Capture::Screen(cap), w, h, label));
+    }
+    let cap = ScreenCapture::new(None, fps)?;
+    let (w, h) = cap.dimensions();
+    let label = format!(
+        "{} {}x{}",
+        cap.adapter_name, cap.source_width, cap.source_height
+    );
+    Ok((Capture::Screen(cap), w, h, label))
+}
+
 pub struct ScreenPublisher {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -108,37 +164,14 @@ fn run(
     encode_kbps: &AtomicU32,
     bitrate: &AtomicU32,
 ) -> Result<(), String> {
-    // целимся в нативное разрешение экрана: апскейл тратит битрейт зря
-    let mut capture = match ScreenCapture::new(None, fps) {
-        Ok(c) => c,
+    // Окно — через WGC, если система умеет; иначе вырезка из кадра экрана.
+    // Целимся в размер источника: апскейл тратит битрейт зря.
+    let (mut capture, w, h, label) = match make_capture(fps, window) {
+        Ok(v) => v,
         Err(e) => {
             let _ = init.send(Err(e.clone()));
             return Err(e);
         }
-    };
-
-    // Трансляция окна: режем кадр рабочего стола его прямоугольником, тогда
-    // захват идёт в размер окна (без масштаба и без чужих пикселей).
-    let mut window_label = String::new();
-    let (w, h) = match window {
-        Some(hwnd) => {
-            let desktop = capture.desktop_size();
-            let rect = crate::video::win_windows::window_rect(hwnd)
-                .and_then(|r| crate::video::win_windows::clamp_rect(r, desktop));
-            match rect {
-                Some((x, y, rw, rh)) => {
-                    capture.set_source_rect(Some((x, y, rw, rh)));
-                    window_label = format!("окно {rw}x{rh}");
-                    (rw, rh)
-                }
-                None => {
-                    let e = "окно не видно на экране (свёрнуто или уведено за край)";
-                    let _ = init.send(Err(e.to_string()));
-                    return Err(e.to_string());
-                }
-            }
-        }
-        None => capture.dimensions(),
     };
     let target = VideoTarget::new(w, h, fps, VideoPreset::default_for(w, h));
     let mut encoder = match MfEncoder::new(&target) {
@@ -155,17 +188,7 @@ fn run(
         fps: target.fps,
         sequence_header: encoder.sequence_header.clone(),
     };
-    let source = if window_label.is_empty() {
-        format!(
-            "{} {}x{} → {}x{}",
-            capture.adapter_name, capture.source_width, capture.source_height, target.width, target.height
-        )
-    } else {
-        format!(
-            "{} {window_label} → {}x{}",
-            capture.adapter_name, target.width, target.height
-        )
-    };
+    let source = format!("{label} → {}x{}", target.width, target.height);
     let base_bitrate = target.bitrate_bps;
     let _ = init.send(Ok((info, source, base_bitrate)));
     // Какой битрейт сейчас стоит у энкодера: меняем только при отличии.

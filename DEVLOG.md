@@ -671,3 +671,37 @@ clippy 34 — прежние.
 окном попадёт в кадр вместе с перекрытием, а свёрнутое — не снимется вовсе.
 Полноценный WGC (захват окна независимо от перекрытия) — следующий шаг; камера
 — за ним.
+
+## 2026-11-21, вечер — захват окна через Windows Graphics Capture (E, часть 2)
+
+**Зачем.** Вырезка прямоугольника из кадра экрана работает, но окно снимается
+с экрана: перекрыл его другим — и в трансляции чужое окно, свернул — кадра нет.
+WGC отдаёт кадры самого окна, независимо от того, что лежит поверх.
+
+**Что оказалось главной помехой.** В биндингах `windows 0.62` нет
+`IGraphicsCaptureItemInterop` — того самого Win32-интерфейса, через который
+WGC получает item окна по HWND. Объявили его сами макросом
+`#[windows::core::interface("3628E81B-…")]`; для этого в `Cargo.toml`
+добавлены `windows-core` (макрос ссылается на `::windows_core`) и фичи
+`Foundation`, `Graphics`, `Graphics_Capture`, `Graphics_DirectX`,
+`Graphics_DirectX_Direct3D11`, `Win32_System_WinRT`, `Win32_System_WinRT_Direct3D11`.
+
+**Как работает (`src/video/win_wgc.rs`).** `factory::<GraphicsCaptureItem,
+IGraphicsCaptureItemInterop>()` → `CreateForWindow` → item;
+`CreateDirect3D11DeviceFromDXGIDevice` поверх нашего D3D11-устройства →
+`Direct3D11CaptureFramePool::CreateFreeThreaded` (BGRA, 2 буфера, размер окна,
+чётный) → `CreateCaptureSession` → `SetIsCursorCaptureEnabled(true)` →
+`StartCapture`. Кадр берётся опросом `TryGetNextFrame` (free-threaded пул),
+поверхность приводится к `ID3D11Texture2D` через `IDirect3DDxgiInterfaceAccess`
+и уходит в тот же `Converter` BGRA → NV12.
+
+**Интеграция.** `ScreenPublisher` выбирает источник: окно и WGC поддерживается →
+WGC; иначе — прежняя вырезка из кадра экрана. В карточке подпись показывает
+«окно 944x718 (WGC)». Публикация, энкодер, адаптивный битрейт, NACK и топология
+не менялись — кадр просто другого происхождения.
+
+**Проверено живьём:** Блокнот двигал, накрывал окном Albus целиком — окно
+показа продолжало показывать Блокнот (`Смотрит: … 944x718 (WGC) → 944x718`),
+на экране его уже не было. FPS в покое ~20 (WGC отдаёт кадр только при
+изменении содержимого — это норма), в движении доходит до 60.
+Тесты 150, clippy 34 — прежние.
