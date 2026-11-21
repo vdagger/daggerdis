@@ -593,12 +593,16 @@ impl VideoLink {
         let my_gen = self.directory.my_gen();
         let is_host = self.is_host.load(Ordering::Relaxed);
         let left = self.room.is_left();
-        // Живой ли анонс издателя: feed от узла, которого нет в каталоге,
-        // не принимаем — это может быть старый поток или чужой участник.
-        let feed_live = matches!(
-            cmd.as_ref(),
-            Some(Control::Feed { gen }) if self.directory.is_live(&from, *gen, Instant::now())
-        );
+        // Анонс издателя идёт раз в секунду, и первый feed может обогнать его
+        // на секунду: раньше хост отвечал отказом «в эфире 0» ни за что, а
+        // издатель ждал повтора. Поэтому пускаем и того, кто уже в комнате.
+        let in_room = self.room.get_all_addresses().iter().any(|a| a == &from);
+        let feed_live = match cmd.as_ref() {
+            Some(Control::Feed { gen }) => {
+                feed_request_ok(self.directory.is_live(&from, *gen, Instant::now()), in_room)
+            }
+            _ => false,
+        };
         let relay = self
             .window
             .lock()
@@ -1358,6 +1362,15 @@ enum Action {
 
 /// Чистое решение по запросу: без сети и без состояния, чтобы проверялось
 /// тестами.
+/// Принимать ли feed издателя.
+///
+/// Живой анонс — достаточное условие, но не необходимое: анонс приходит раз в
+/// секунду, а первый feed уходит сразу после старта трансляции. Участник
+/// комнаты — тот же доверенный узел, что и в анонсе.
+fn feed_request_ok(announced: bool, in_room: bool) -> bool {
+    announced || in_room
+}
+
 fn decide_control(
     cmd: &Control,
     my_gen: u32,
@@ -1707,6 +1720,16 @@ mod tests {
         // вышли из эфира
         let current = Some((publisher.as_str(), 4u32));
         assert_eq!(decide_control(&cmd, 0, true, true, false, current), Action::Reject);
+    }
+
+    #[test]
+    fn feed_request_accepts_room_member_without_announce() {
+        // Анонс запаздывает на секунду — участник комнаты всё равно проходит.
+        assert!(feed_request_ok(false, true));
+        assert!(feed_request_ok(true, false));
+        assert!(feed_request_ok(true, true));
+        // Посторонний узел без анонса — не проходит.
+        assert!(!feed_request_ok(false, false));
     }
 
     #[test]

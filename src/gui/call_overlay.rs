@@ -6,6 +6,19 @@ use eframe::egui;
 use egui::{Align, Layout, Order, Rounding, Stroke};
 
 impl RadioApp {
+    /// Имя для карточки звонка: из `friends.json` по NodeID, иначе ник из
+    /// пакета. Ник в приглашении — из `config.ini` отправителя, а у получателя
+    /// друг записан своим именем; в тестовых профилях это «Гость» против
+    /// «Узел 1», и карточка выглядела чужой.
+    pub(super) fn peer_display_name(&self, node: &str, fallback: &str) -> String {
+        self.friends
+            .friends()
+            .into_iter()
+            .find(|f| f.node_id == node)
+            .map(|f| f.name)
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
     /// Карточка звонка поверх окна: входящий, «звоним…» или идущий разговор
     pub(super) fn draw_call_overlay(&mut self, ctx: &egui::Context) {
         let view = self.calls.view();
@@ -52,13 +65,9 @@ impl RadioApp {
             // В комнате на N подписью служит число участников; имя показываем,
             // когда собеседник один — как в прежнем личном звонке.
             let label = match (members, peer) {
-                (2, Some(node)) => self
-                    .friends
-                    .friends()
-                    .into_iter()
-                    .find(|f| &f.node_id == node)
-                    .map(|f| f.name)
-                    .unwrap_or_else(|| crate::diagnostics::short_id(node)),
+                (2, Some(node)) => {
+                    self.peer_display_name(node, &crate::diagnostics::short_id(node))
+                }
                 _ => format!("{members} в комнате"),
             };
             // Идёт разговор: никакой карточки поверх окна — стрим и комната
@@ -140,7 +149,8 @@ impl RadioApp {
 
                         match &view {
                             crate::calls::CallView::Idle => {}
-                            crate::calls::CallView::Incoming { nick, .. } => {
+                            crate::calls::CallView::Incoming { nick, peer, .. } => {
+                let nick = &self.peer_display_name(peer, nick);
                                 ui.horizontal(|ui| {
                                     t::avatar(ui, nick, 34.0, true);
                                     ui.add_space(4.0);

@@ -428,7 +428,9 @@ impl eframe::App for RadioApp {
         // Входящий звонок: подсветить приложение в панели задач, если оно
         // свёрнуто или закрыто другим окном, — иначе звонок пропускают.
         let incoming = match self.calls.view() {
-            crate::calls::CallView::Incoming { nick, .. } => Some(nick),
+            crate::calls::CallView::Incoming { nick, peer, .. } => {
+                Some(self.peer_display_name(&peer, &nick))
+            }
             _ => None,
         };
         if let Some(nick) = incoming {

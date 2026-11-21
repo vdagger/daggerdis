@@ -82,8 +82,13 @@ enum CallPhase {
 #[derive(Clone, Debug)]
 pub enum CallView {
     Idle,
-    /// Нас пригласили
-    Incoming { nick: String, elapsed: Duration },
+    /// Нас пригласили. `peer` — NodeID пригласившего: имя для карточки берётся
+    /// из `friends.json`, а `nick` из пакета остаётся запасным.
+    Incoming {
+        nick: String,
+        peer: String,
+        elapsed: Duration,
+    },
     /// Ждём ответа от приглашённого: в комнате пока только мы
     Outgoing { nick: String, elapsed: Duration },
     /// Мы в комнате: `members` — сколько человек в ней, включая нас;
@@ -178,8 +183,11 @@ impl CallManager {
         let now = Instant::now();
         match &*phase {
             CallPhase::Idle => CallView::Idle,
-            CallPhase::Incoming { nick, started, .. } => CallView::Incoming {
+            CallPhase::Incoming {
+                from, nick, started, ..
+            } => CallView::Incoming {
                 nick: nick.clone(),
+                peer: from.clone(),
                 elapsed: now.duration_since(*started),
             },
             CallPhase::Active {
@@ -644,10 +652,12 @@ impl CallManager {
         // Вошедший — участник комнаты с этой секунды. Без записи его нет в
         // списке, mesh не дотягивается до него (ensure_connected идёт по
         // списку), и человек остаётся «приглашённым», но невидимым.
-        self.register_peer(peer);
+        let joined_now = self.register_peer(peer);
         // Новый участник соединён только с нами: отдаём ему список остальных.
         self.send_members(peer, room_id);
-        println!("[КОМНАТА] {} вошёл в комнату", short(peer));
+        if joined_now {
+            println!("[КОМНАТА] {} вошёл в комнату", short(peer));
+        }
     }
 
     pub fn on_decline(&self, peer: &str, room_id: u32, reason: u8) {
@@ -1015,10 +1025,19 @@ impl CallManager {
     /// Нужно в момент входа: IrohSync придёт только после того, как мы сами
     /// начнём рассылать свой, а рассылка и лечение соединений идут по списку
     /// участников. Без записи вошедший не видит никого, хотя «в комнате».
-    fn register_peer(&self, node_id: &str) {
+    /// Записывает собеседника в комнату. `true` — его там ещё не было.
+    ///
+    /// Нужно для журнала: `CallAccept` переотправляется, и без проверки одна
+    /// и та же строка «вошёл в комнату» печаталась по три раза.
+    fn register_peer(&self, node_id: &str) -> bool {
         let Some(id) = crate::identity::my_id_from_node_id(node_id) else {
-            return;
+            return false;
         };
+        let already = self
+            .room
+            .get_all_addresses()
+            .iter()
+            .any(|a| a == node_id);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1029,6 +1048,7 @@ impl CallManager {
             is_host: false,
             last_heartbeat: now,
         });
+        !already
     }
 
     pub fn announce_leave(&self) {
