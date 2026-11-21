@@ -44,6 +44,23 @@ The app requests **Administrator** (UAC manifest injected by `build.rs`/`winres`
 can register firewall rules and install a global PTT keyboard hook. Launching from a
 normal terminal triggers a UAC prompt.
 
+### Проверки и GUI-тесты из-под агента (`tools/agent/`)
+
+`albus.exe` — консольная программа: обычный `Start-Process` без редиректа оставляет
+унаследованный stdout у дочернего процесса, и вызывающий терминал ждёт EOF на пайпе
+(выглядит как «запуск завис», хотя окно открыто). Поэтому для агентских запусков:
+
+```powershell
+pwsh -NoProfile -File tools\agent\build.ps1 -Mode check|test|clippy|release
+pwsh -NoProfile -File tools\agent\albus.ps1 -Action start|stop|shot|click|keys|info
+```
+
+`albus.ps1` запускает exe с `-RedirectStandardOutput/-Error` (журналы и скриншоты в
+`%TEMP%\albus-agent`), ставит окно на (40,40) 1120×700, снимает экран (`-Action shot`)
+и шлёт клики/клавиши в абсолютных координатах экрана (`-Action click -X … -Y …`,
+`-Action keys -Combo ctrl+m`). Скриншот смотреть через `read_image` — так проверяются
+UI-правки без ручного запуска.
+
 ## Architecture (startup flow, `src/main.rs`)
 
 1. `firewall::setup_firewall_rules()` — auto-add Windows inbound UDP rule (covers iroh QUIC).
@@ -128,6 +145,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/network/video_link.rs` | `discordrf-video/1`: контроль `kind=2/3/4/5` (подписка, ответ, feed издателя, релей-подписка) в первом bi-стриме, окно недавних кадров и relay под одним замком (180 / 64 МиБ, отдача с последнего ключевого), релей хоста без ре-энкода, маршрутизация зрителя, очередь зрителя со сдвигом показа на буфер |
 | `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
 | `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
+| `tools/agent/` | Скрипты для агента: `albus.ps1` (запуск GUI с редиректом stdio, скриншоты, клики, клавиши, позиционирование окна), `build.ps1` (check/test/clippy/release с журналом) |
 | `src/widgets/room_panel.rs` | Секции рейла: вход по NodeID, «Мой NodeID» + копирование, участники плоскими строками, громкость собеседника |
 | `assets/icon.png`, `assets/logo.png` | Embedded via `include_bytes!` (monolithic binary) |
 | `.github/workflows/macos.yml` | macOS Universal 2 build |

@@ -35,9 +35,13 @@ cmd /c "cd /d C:\Claude-Exchange\DISCORDRF && cargo build --release > C:\Claude-
 
 - `git` требует `-c safe.directory=C:/Claude-Exchange/DISCORDRF` (владелец каталога другой).
 - Сеть теперь доступна, но обычная сборка идёт из локального кэша `cargo-home`.
-- GUI здесь не проверить: exe просит UAC, а в VM/Hyper-V нет OpenGL 2.0.
-  Скриншоты интерфейса смотрит пользователь; для проверок без GUI есть
-  `tools/video_probe` (`--capture`, `--gpu`, `--loopback`, `bin/cycles`).
+- GUI **можно запускать и снимать скриншоты из-под агента** (налажено 21.11.2026):
+  `tools\agent\albus.ps1` — `start/stop/shot/click/keys/info`, окно ставится
+  на (40,40) 1120×700, скриншоты и журналы в `%TEMP%\albus-agent`.
+  Причина прежних «зависаний»: exe — консольная программа и без редиректа stdio
+  держала пайп терминала; скрипт запускает с `-RedirectStandardOutput/-Error`.
+  Проверки без GUI всё ещё есть: `tools/video_probe` (`--capture`, `--gpu`,
+  `--loopback`, `bin/cycles`).
 - Штамп сборки печатается при старте: у двух собеседников он должен совпадать.
 
 ## Проверено в этой точке (2026-11-21)
@@ -46,8 +50,9 @@ cmd /c "cd /d C:\Claude-Exchange\DISCORDRF && cargo build --release > C:\Claude-
       теперь используются).
 - [x] `cargo test` — 95 тестов, все зелёные, 4.6 с.
 - [x] `cargo build --release` из HEAD — собран 21.11.2026 (после пачки быстрых побед).
-- [ ] Живой запуск GUI на этой машине не выполнялся: `Start-Process` из-под агента
-      зависает, UAC/OpenGL проверяются только руками.
+- [x] Живой запуск GUI — 21.11.2026: окно открывается, мьют кнопкой и `Ctrl+M`
+      проверены по скриншотам, меню друга с «Войти в комнату» видно.
+      Управление — `tools/agent/albus.ps1`, см. «Как проверять».
 
 ## Где остановились (21.11.2026)
 
