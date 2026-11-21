@@ -271,6 +271,52 @@ pub fn next_voice_bitrate_below(bps: u32) -> Option<u32> {
         .max()
 }
 
+/// Что сделать с передачей голоса по состоянию сети.
+///
+/// Отдельная структура, а не пара чисел: правило одно на все вызовы, и его
+/// можно проверить тестами, не поднимая ни микшер, ни транспорт.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoicePlan {
+    /// Ожидаемые потери для Opus (in-band FEC и плотность защиты).
+    pub fec_perc: u32,
+    /// Потолок битрейта: `u32::MAX` — сеть тянет настройку.
+    pub cap: u32,
+}
+
+/// Решает, как подстроить голос под сеть.
+///
+/// `loss_pct` — доля потерянных пакетов на путях (сумма по соединениям),
+/// `current_fec` — что Opus думает сейчас, `min_bw` — худшая оценка полосы из
+/// путей (None — неизвестна), `opus_bps` — выбранный пользователем битрейт,
+/// `peers` — сколько собеседников делят канал.
+pub fn plan_voice_tuning(
+    loss_pct: u32,
+    current_fec: u32,
+    min_bw: Option<u64>,
+    opus_bps: u32,
+    peers: usize,
+) -> VoicePlan {
+    // Сглаживание: один процент туда-обратно — шум измерения, а не сигнал.
+    // Верхняя граница 30 % — выше защита съедает речь.
+    let loss = loss_pct.min(30);
+    let fec_perc = if loss.abs_diff(current_fec) >= 4 {
+        loss
+    } else {
+        current_fec
+    };
+
+    // Полоса нужна на всех собеседников сразу: считаем по худшему пути, с
+    // запасом 30 %.
+    let needed = opus_bps as u64 * peers.max(1) as u64;
+    let cap = match min_bw {
+        Some(bw) if bw < needed * 13 / 10 => {
+            next_voice_bitrate_below(opus_bps).unwrap_or(opus_bps)
+        }
+        _ => u32::MAX,
+    };
+    VoicePlan { fec_perc, cap }
+}
+
 impl AudioMixer {
     /// Создает новый аудио-микшер с дефолтными значениями
     pub fn new() -> Self {
@@ -852,5 +898,56 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod voice_plan_tests {
+    use super::*;
 
+    #[test]
+    fn fec_follows_loss_with_deadband() {
+        // Рост на 5 % — это сигнал: защита поднимается.
+        assert_eq!(plan_voice_tuning(13, 8, None, 64_000, 1).fec_perc, 13);
+        // ±3 % — шум измерения, оставляем как было.
+        assert_eq!(plan_voice_tuning(10, 8, None, 64_000, 1).fec_perc, 8);
+        assert_eq!(plan_voice_tuning(6, 8, None, 64_000, 1).fec_perc, 8);
+        // Канал очистился: защита возвращается вниз.
+        assert_eq!(plan_voice_tuning(0, 12, None, 64_000, 1).fec_perc, 0);
+    }
 
+    #[test]
+    fn fec_is_clamped_at_thirty() {
+        // Выше 30 % защита съедает речь — потолок.
+        assert_eq!(plan_voice_tuning(80, 0, None, 64_000, 1).fec_perc, 30);
+    }
+
+    #[test]
+    fn bitrate_cap_drops_a_step_when_bandwidth_is_short() {
+        // 64 кбит/с на двоих — нужно 128, полоса 100 кбит/с: спускаемся на 64.
+        assert_eq!(
+            plan_voice_tuning(0, 8, Some(100_000), 96_000, 2).cap,
+            64_000
+        );
+        // Полосы хватает — потолка нет.
+        assert_eq!(
+            plan_voice_tuning(0, 8, Some(1_000_000), 96_000, 2).cap,
+            u32::MAX
+        );
+        // Ниже 64 кбит/с некуда: остаётся как есть.
+        assert_eq!(plan_voice_tuning(0, 8, Some(10_000), 64_000, 3).cap, 64_000);
+        // Полоса неизвестна — не трогаем.
+        assert_eq!(plan_voice_tuning(0, 8, None, 128_000, 4).cap, u32::MAX);
+    }
+
+    #[test]
+    fn one_peer_needs_less_than_four() {
+        // 128 кбит/с одному: полоса 150 кбит/с уже тесна (нужно 166).
+        assert_eq!(
+            plan_voice_tuning(0, 8, Some(150_000), 128_000, 1).cap,
+            96_000
+        );
+        // А на четверых и 600 кбит/с мало.
+        assert_eq!(
+            plan_voice_tuning(0, 8, Some(600_000), 128_000, 4).cap,
+            96_000
+        );
+    }
+}

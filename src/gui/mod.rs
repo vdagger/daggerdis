@@ -329,34 +329,32 @@ impl RadioApp {
             }
         }
 
-        let pct = crate::diagnostics::loss_percent(sent, lost).min(30) as i64;
-        let current = self.mixer.packet_loss_perc() as i64;
-        // Сглаживание: один процент туда-обратно — шум измерения, а не сигнал.
-        if (pct - current).abs() >= 4 {
-            self.mixer.set_packet_loss_perc(pct as u32);
+        // Решение — в чистой `mixer::plan_voice_tuning`: там же сглаживание
+        // потерь и правило «полоса нужна на всех собеседников».
+        let loss = crate::diagnostics::loss_percent(sent, lost);
+        let plan = crate::mixer::plan_voice_tuning(
+            loss,
+            self.mixer.packet_loss_perc(),
+            if min_bw == u64::MAX { None } else { Some(min_bw) },
+            self.mixer.opus_bitrate(),
+            links.len(),
+        );
+        if plan.fec_perc != self.mixer.packet_loss_perc() {
+            self.mixer.set_packet_loss_perc(plan.fec_perc);
             eprintln!(
                 "[АУДИО] Потери на путях {}% → защита Opus {}%",
-                pct,
-                self.mixer.packet_loss_perc()
+                loss, plan.fec_perc
             );
         }
-
-        let needed = self.mixer.opus_bitrate() as u64 * links.len().max(1) as u64;
-        let cap = if min_bw != u64::MAX && min_bw < needed * 13 / 10 {
-            crate::mixer::next_voice_bitrate_below(self.mixer.opus_bitrate())
-                .unwrap_or(self.mixer.opus_bitrate())
-        } else {
-            u32::MAX
-        };
-        if cap != self.mixer.voice_bitrate_cap() {
-            self.mixer.set_voice_bitrate_cap(cap);
-            if cap == u32::MAX {
+        if plan.cap != self.mixer.voice_bitrate_cap() {
+            self.mixer.set_voice_bitrate_cap(plan.cap);
+            if plan.cap == u32::MAX {
                 println!("[АУДИО] Полосы хватает — битрейт передачи вернулся к настройке");
             } else {
                 println!(
                     "[АУДИО] Полосы мало на {} путей → битрейт передачи {} кбит/с",
                     links.len(),
-                    cap / 1000
+                    plan.cap / 1000
                 );
             }
         }
