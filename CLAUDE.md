@@ -178,8 +178,6 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 17 | `RoomMembers` | `sender_id` u64 LE, `room_id` u32 LE, `count` u16 LE, затем `count` × (`len` u16 LE + NodeID) — список комнаты новому участнику, чтобы mesh собрался целиком |
 | 18 | `RoomChat` | `sender_id` u64 LE, `room_id` u32 LE, `nick` str, `text` str — общее сообщение комнаты (0 — эфир без созвона) |
 
-Tags 1–2 удалены вместе с raw-UDP mesh.
-
 ### Video wire format (`src/network/video_link.rs`)
 
 Video uses a **separate iroh connection** with ALPN `discordrf-video/1`: QUIC
@@ -508,8 +506,12 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   converts/scales to NV12 on the GPU → hardware H.264 MFT → iroh → decoder MFT →
   NV12 → Video Processor → BGRA → egui texture. Bitrate is `pixels × fps ×
   bits_per_pixel` (Low 0.04 / Balanced 0.07 / Quality 0.10, capped 1.5–40 Mbps),
-  so 1080p60 ≈ 8.7 Mbps and 1440p60 ≈ 18–22 Mbps. Capture runs at the monitor's
-  native resolution — upscaling to a preset wastes bitrate.
+  so 1080p60 ≈ 8.7 Mbps and 1440p60 ≈ 18–22 Mbps. Захват — в нативном
+  разрешении (апскейл тратит битрейт). Битрейт **адаптивный**: издатель раз в
+  секунду смотрит потери своего feed-канала и опускает/поднимает его
+  (`watch_feed_bitrate`; вниз 15 % при потерях > 0.5 %, вверх 10 % потолка
+  после 5 чистых секунд, пол — четверть пресета), энкодер принимает значение
+  на ходу.
 - **AMF encoder quirk:** the AMD MFT ignores `MF_MT_FRAME_RATE` and computes rate
   control against 30 fps — at 60 fps the stream came out twice the requested
   bitrate. `win_mf::mean_bitrate_for()` compensates with `30/fps` for MFTs whose
@@ -648,7 +650,6 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   любой cpal-звук на нём искажён, а `i32` играет чисто. Поэтому `i32` тоже
   кандидат, и на многоканальных выходах он пробуется раньше `f32`; порядок
   печатается по попыткам (`формат … не подошёл`).
-- **A silent "nothing plays" must be visible:** `[ОШИБКА] Динамики/Микрофон не открылись: …`.
 - **Build stamp for stale copies:** `build.rs` exports `ALBUS_BUILD_STAMP` (the
   newest mtime under `src/` or `build.rs`), and startup prints
   `[СБОРКА] Albus <version> · сборка <stamp>`. Two peers must show the same
@@ -689,10 +690,8 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   growth both during a stream and across broadcast start/stop cycles (the
   driver frees it late). `win_d3d.rs` now `ManuallyDrop::take`s it on every
   `Blt` outcome. Headless check: `tools/video_probe/src/bin/cycles.rs`.
-- **Probe crate:** `tools/video_probe` — отдельный пакет: манифест
-  requireAdministrator из `build.rs` ломает запуск example-процессов.
-  Собирать с `--manifest-path tools/video_probe/Cargo.toml --target-dir target`
-  и `ALBUS_NO_ADMIN_MANIFEST=1`; его `Cargo.lock` — копия корневого, в gitignore.
+- **Probe crate:** `tools/video_probe` — отдельный пакет (манифест админа ломает
+  example-процессы): `ALBUS_NO_ADMIN_MANIFEST=1`, свой `Cargo.lock` в gitignore.
 - **Video window:** своё превью и чужие потоки — в отдельном окне «Albus —
   трансляция» (растягивается, есть полноэкранный режим; чужой поток открывает
   его сам). Своё превью на том же мониторе подкармливает захват — это норма.
