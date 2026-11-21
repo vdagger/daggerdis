@@ -115,7 +115,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, per-peer mix bus. Вход пишет сэмплы своего устройства в слоты `txbus`, вывод кладёт в `echo_ref` опору AEC; Opus-энкодера и DSP в колбэке больше нет |
 | `src/txbus.rs` | `InputBus` (кольца на два входа, эпохи, watchdog) + поток `albus-tx`: сборка кадра 20 мс (960 сэмплов), эффекты входов по тумблерам (эхо-подавление AEC3, шумодав RNNoise, затвор и AGC независимо), лимитер передачи, монитор, Opus 64/96/128 кбит/с |
 | `src/mixer.rs` | `AudioMixer` (per-peer dB gain, master gain, mute, VU, monitor своего тракта, кольцо опоры `echo_ref`, тумблеры `input1_denoise`/`input1_gate`/`input1_agc`/`input1_aec`/`input2_denoise`/`input2_gate`/`input2_agc`/`input2_aec`/`tx_limiter_enabled`/`rx_limiter_enabled` — все по умолчанию выкл., битрейт `opus_bitrate`), `SlotProfile` (пресет тумблеров), `TransmitAgc`, `Limiter` (−1 dBFS, на микс) |
-| `src/devices.rs` | `DeviceSelector`: enumerate input/output devices, find by name |
+| `src/devices.rs` | `DeviceSelector` (enumerate/find by name), `DeviceWatcher` (фоновый обход раз в 2 с), `DeviceSnapshot`/`DeviceChange`/`reselect`/`plan_device_update` — правила горячего подключения (выбор по имени, откат на умолчание) |
 | `src/config.rs` | `AppConfig`: `%APPDATA%\Albus\config.ini` (devices включая `input2_device`, PTT, mixer, эффекты `input1_denoise`/`input1_gate`/`input1_agc`/`input1_aec`/`input2_denoise`/`input2_gate`/`input2_agc`/`input2_aec`/`tx_limiter`, nick, per-peer volume, `video_fps`, `video_buffer_ms`, `rx_limiter`; старые `mic_processing` и `input*_profile` читаются для совместимости) |
 | `src/keybind.rs` | `PttBind`: global Win32 `GetAsyncKeyState` hook thread |
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule for the current exe — идемпотентно (лишние одноимённые записи чистятся) |
@@ -608,6 +608,22 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   unplugged between sessions left the app with no input at all: `stream_control.rs`
   now logs «Выбранное устройство не найдено … — берём … по умолчанию» and opens the
   system default instead of failing.
+- **Hot-plug: device lists are refreshed in the background and the selection lives
+  by name.** `devices::DeviceWatcher` re-enumerates every 2 s on its own thread
+  (`albus-devices`) and hands a `DeviceSnapshot` to the GUI; `refresh_devices()`
+  feeds it through the pure `devices::plan_device_update`, which remaps each
+  selection **by name**, falls back to the *current* default device when the
+  chosen one is gone, and returns the added/removed lists for the log and the
+  toast. Because indices shift whenever a card is plugged or unplugged,
+  `reconcile_inputs` and the output switch compare `prev_*_name`, not indices —
+  otherwise a reordered list restarted the stream on the very same device. An
+  empty snapshot (cpal sees nothing while the driver reloads) is ignored, and the
+  second input drops to «То же устройство» instead of falling back to the default
+  mic (that would silently feed a microphone into the instrument slot).
+  Windows `pnputil /disable-device <instance>` is a usable stand-in for unplugging
+  a *driver* device; disabling an already-active endpoint with
+  `Disable-PnpDevice` does **not** change its WASAPI state (it stays `ACTIVE` in
+  `MMDevices`), so it cannot be used to fake a removal.
 - **A multichannel endpoint gets the signal in two channels only.** On a
   virtual 7.1 output (`Динамики (7.1 Surround Sound)`, 8 channels) writing the
   same mono sample into all eight made the peer's speech a mush: the
