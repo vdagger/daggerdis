@@ -146,7 +146,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/network/video_link.rs` | `discordrf-video/1`: контроль `kind=2/3/4/5` (подписка, ответ, feed издателя, релей-подписка) в первом bi-стриме, окно недавних кадров и relay под одним замком (180 / 64 МиБ, отдача с последнего ключевого), релей хоста без ре-энкода, маршрутизация зрителя, очередь зрителя со сдвигом показа на буфер |
 | `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
 | `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
-| `tools/agent/` | Скрипты для агента: `albus.ps1` (запуск GUI с редиректом stdio, скриншоты, клики, клавиши, позиционирование окна), `build.ps1` (check/test/clippy/release с журналом) |
+| `tools/agent/` | Скрипты для агента: `albus.ps1` (запуск GUI с редиректом stdio, скриншоты, клики, клавиши, позиционирование окна), `build.ps1` (check/test/clippy/release с журналом), `group.ps1` (N экземпляров с взаимной дружбой: свой `%APPDATA%`, NodeID из журнала, friends.json до запуска — для проверки группы) |
 | `src/widgets/room_panel.rs` | Секции рейла: вход по NodeID, «Мой NodeID» + копирование, участники плоскими строками, громкость собеседника |
 | `assets/icon.png`, `assets/logo.png` | Embedded via `include_bytes!` (monolithic binary) |
 | `.github/workflows/macos.yml` | macOS Universal 2 build |
@@ -303,15 +303,13 @@ that sender's queued frames and waits for a keyframe.
   кольце рисуется `radial_ring` от 0 (уходит под диск) — иначе у края диска
   видна резкая кромка и диск читается «мишенью».
 - **Правило брандмауэра ставится идемпотентно.** `netsh advfirewall firewall add
-  rule name=DiscordRF` не считает повтором уже существующее правило с тем же
-  именем: старый код добавлял новую запись при каждом запуске, и в брандмауэре
-  копились десятки одинаковых. Теперь `setup_firewall_rules` сначала ищет в
+  rule name=DiscordRF` не считает дублем правило с тем же именем — старый код
+  добавлял новую запись при каждом запуске. Теперь `setup_firewall_rules` ищет в
   `show rule name=DiscordRF verbose` полный путь текущего exe и при совпадении
-  ничего не делает; если правила для этого exe нет — удаляет все одноимённые
-  (в том числе от старых копий с другим путём) и добавляет одно. Код возврата
-  netsh как признак «правила нет» использовать нельзя: он равен 0 и когда
-  правил не найдено, поэтому сравнение идёт по тексту вывода (путь ASCII
-  переживает OEM-кодировку).
+  ничего не делает; если правила для этого exe нет — удаляет все одноимённые и
+  добавляет одно. Код возврата netsh не годится как признак «правила нет»: он 0 и
+  когда правил не найдено, поэтому сравнение идёт по тексту (путь ASCII переживает
+  OEM-кодировку).
 - **Git ownership (critical):** the checkout is owned by `vPC\mcdag`, but Claude runs
   over SSH as `vPC\Claude-Worker`, so plain `git` fails with "dubious ownership". Always
   prefix: `git -c safe.directory=C:/Claude-Exchange/DISCORDRF <cmd>`.
@@ -442,6 +440,18 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   друга, `room.leave()` не даёт `IrohSync` вернуть нас, соединения рвутся.
   Два одновременных приглашения разрешаются переходом в комнату пригласившего
   (свои приглашения отменяются — у них другой `room_id`).
+- **Хост — наименьший id среди соседей и себя** (`room.host_id_with_me`, раз в
+  секунду). Флаг `is_host` в пакетах не используется: он выставлен у всех, и
+  раньше каждый считал хостом себя — для видео это значило, что трансляцию не
+  смотрел никто (хост не подписывается на чужой поток).
+- **Уход и mesh.** `leave_voice` зовёт `announce_leave` (`CallEnd` всем в
+  комнате) до разбора фазы: в ветке `Idle` (комната собрана одним mesh) уход
+  иначе не объявлялся, и человека держали «молчит» до таймаута. Получатель по
+  `CallEnd` сразу убирает его из `RoomManager`; `start_outgoing` не блокируется
+  записью без heartbeat ≥ 6 с. Пока мы в эфире, `migration.rs` раз в секунду
+  дотягивается до участников (`p2p.ensure_connected`) и только потом рассылает
+  `IrohSync`; `on_accept`/`accept_incoming` регистрируют собеседника
+  (`register_peer`) — иначе после обрыва узел «в комнате» без людей.
 - **Новый участник узнаёт остальных из `RoomMembers` (тег 17).** Он соединён
   только с пригласившим, а остальные о нём не знают — без списка комнаты mesh не
   собирается, и человек слышит одного из трёх. Пригласивший в ответ на
@@ -456,13 +466,10 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   продолжение тона и спектра), и только если декодер ещё ничего не слышал —
   затухающий повтор. Восстановленные FEC кадры видны в диагностике отдельным
   счётчиком (`RxStats::fec`).
-- **«Выйти из эфира» (`RoomManager::leave`):** красная кнопка в секции «Комната»
-  (видна, когда в комнате есть собеседники) завершает/отменяет/отклоняет звонок,
-  очищает участников, ставит флаг `left` и рвёт все QUIC-соединения
-  (`disconnect_all`). Пока флаг стоит, `iroh_service` отбрасывает `IrohSync`,
-  `Heartbeat` и `AudioFrame` — иначе автосинхронизация mesh возвращает всех в
-  комнату за секунду. Снимается «Войти» или начатым/принятым звонком (`room.join`).
-  До этого из активного звонка можно было выйти только закрытием приложения.
+- **«Выйти из эфира» (`RoomManager::leave`):** кнопка «Завершить/Выйти» завершает
+  звонок, очищает участников, ставит флаг `left` и рвёт соединения; пока флаг
+  стоит, `iroh_service` отбрасывает `IrohSync`/`Heartbeat`/`AudioFrame`. Снимается
+  «Войти» или принятым звонком (`room.join`).
 - **«Не запускается» = две разные причины.** exe несёт манифест
   `requireAdministrator`, поэтому из обычного терминала/без подтверждения UAC
   процесс получает «requires elevation» и молча не стартует. Если же UAC
@@ -472,10 +479,9 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   ошибка печатается и показывается `MessageBoxW` (то же окно упоминает
   `ALBUS_RENDERER=wgpu`). Feature `wgpu` включён в eframe, рендерер выбирается
   переменной окружения (по умолчанию glow). `pollster` подключён локальной
-  заменой `vendor/pollster` через `[patch.crates-io]`: его `.crate` не скачивался,
-  потому что реестр cargo на сборочной машине принадлежит другому пользователю.
-  Если в такой VM и DX12-адаптера нет (`Failed to create wgpu adapter`), GUI там
-  не поднять вовсе — приложение проверяется на обычной машине.
+  заменой `vendor/pollster` через `[patch.crates-io]` (его `.crate` не скачивался:
+  реестр cargo принадлежит другому пользователю). Без DX12-адаптера GUI в такой
+  VM не поднять — проверять на обычной машине.
 - **Онлайн-статус друзей — по пингу, а не по комнате.** `PresenceTracker`
   (`src/presence.rs`) держит `HashMap<NodeID, Instant>` с TTL 12 с: `spawn_ping_loop`
   раз в 4 с шлёт `PresencePing` друзьям без свежей отметки (отдельной задачей и с
@@ -698,14 +704,11 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   `cargo build --release --manifest-path tools/video_probe/Cargo.toml
   --target-dir target` and `ALBUS_NO_ADMIN_MANIFEST=1` (build.rs skips the
   manifest when that variable is set). Its `Cargo.lock` is a copy of the root
-  one (the crates.io cache is read-only for `Claude-Worker`) and is gitignored.
-  `src/bin/cycles.rs` is the start/stop leak finder: it creates and drops exactly
-  what lives between «Начать трансляцию» and «Остановить» (encoder, decoder, D3D
-  device, NV12 texture, converter) for N rounds and prints commit/working-set
-  after each, with no GUI involved. `--enc`, `--dec`, `--gpu` keep one stage
-  only; `--dev`, `--tex`, `--conv` cut inside the GPU path; `--upload`, `--blt`,
-  `--copy` cut inside the per-frame work. Vary the frame count to tell a
-  per-frame leak from a per-session one.
+  one and is gitignored.
+  `src/bin/cycles.rs` — поиск утечек старт/стоп: создаёт и роняет ровно то, что
+  живёт между «Начать трансляцию» и «Остановить», и печатает память после
+  каждого круга. Флаги `--enc/--dec/--gpu/--dev/--tex/--conv` оставляют одну
+  стадию, `--upload/--blt/--copy` режут внутри кадра.
 - **Self-preview feedback:** showing your own stream on the same monitor feeds
   the capture loop continuously — expected behaviour, not a decoder bug.
 - **Video window:** own preview and remote streams are shown in a separate
@@ -715,6 +718,13 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
 - `Cargo.lock` is committed and must stay committed (binary app — do **not** gitignore it).
+
+
+
+
+
+
+
 
 
 
