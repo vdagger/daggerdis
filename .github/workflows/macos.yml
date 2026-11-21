@@ -37,8 +37,23 @@ jobs:
 
           chmod +x dist/${BIN_NAME}-macos-universal
 
+      # Голый бинарник на macOS ведёт себя не как приложение: нет фокуса по
+      # клику из Finder, иконки в Dock, нельзя закрепить. Собираем .app.
+      - name: Сборка .app-бандла
+        run: |
+          chmod +x tools/macos-bundle.sh
+          tools/macos-bundle.sh dist/${BIN_NAME}-macos-universal dist
+        env:
+          ALBUS_VERSION: ${{ github.ref_name }}
+
+      - name: Упаковка .app в zip (артефакты не сохраняют права и симлинки)
+        run: |
+          cd dist && zip -qry Albus-macOS-Universal.zip Albus.app && ls -la
+
       - name: Загрузка готового файла в артефакты GitHub
         uses: actions/upload-artifact@v4
         with:
           name: Albus-macOS-Universal
-          path: dist/*
+          path: |
+            dist/Albus-macOS-Universal.zip
+            dist/*-macos-universal

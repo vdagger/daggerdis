@@ -63,6 +63,13 @@ fn remove_all_rules() {
 /// Добавляет правило в Брандмауэр Windows для разрешения входящих UDP-пакетов.
 /// Повторный запуск ничего не добавляет, если правило для этого exe уже есть.
 pub fn setup_firewall_rules() {
+    // На Linux/macOS правило входящего UDP не нужно: iroh поднимает исходящий
+    // QUIC, а проход через NAT делает релей (или hole punching с уже открытого
+    // сокета). Если понадобится — это `ufw allow` / `pfctl`, но по умолчанию
+    // приложение работает без прав администратора.
+    #[cfg(not(windows))]
+    println!("[ФАЕРВОЛ] Не Windows: правило входящего UDP не требуется (iroh + NAT/релей).");
+
     #[cfg(windows)]
     {
         let Ok(exe_path) = std::env::current_exe() else {

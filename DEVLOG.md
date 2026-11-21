@@ -761,3 +761,32 @@ iroh: подлинность `sender_id`, глубина релея, «реле�
 превью идёт), `WM_CLOSE` прячет окно в трей (`IsWindowVisible=false`, процесс
 жив), `WM_COMMAND 1` («Открыть») возвращает окно, `WM_COMMAND 2` («Выйти»)
 завершает процесс. Тесты 155, clippy 34 — прежние.
+
+## 2026-11-21, вечер — кроссплатформенность: закрыть Windows-специфику (D, часть 1)
+
+**Что мешало собирать не-Windows.** Два модуля видео (`win_wgc`, `win_windows`)
+были подключены без `#[cfg(windows)]`: на Linux `crate windows` вообще нет в
+зависимостях, и сборка падала бы на них. Остальные платформенные файлы
+(`win_dxgi`, `win_d3d`, `win_mf`, `win_decode`, `publisher`, `video_session`,
+`tray`) уже были закрыты.
+
+**Что сделано.**
+
+- `video::{win_wgc, win_windows}` — под `#[cfg(windows)]`.
+- `keybind`: вне Windows больше не запускается фоновый поток, который каждые
+  10 мс проверял несуществующий Win32-хоткей. Вместо него одна строка в
+  журнал: «Глобальный хоткей недоступен на этой платформе — PTT работает
+  экранной кнопкой». `vk_to_name` тоже под Windows (виртуальные коды — её
+  понятие).
+- `firewall`: на не-Windows печатается, что правило входящего UDP не нужно —
+  iroh ходит исходящим QUIC, а NAT обходится релеем/долбёжкой.
+- macOS: `tools/macos-bundle.sh` собирает `Albus.app` — `Contents/MacOS`,
+  `Info.plist` с `CFBundleIdentifier`, `NSMicrophoneUsageDescription`,
+  `NSLocalNetworkUsageDescription` (без них macOS молча не даёт микрофон и
+  сеть) и ad-hoc подписью через `codesign -s -`. Workflow macOS теперь делает
+  бандл и пакует его в zip (артефакты GitHub не сохраняют права и симлинки).
+
+**Честное ограничение.** Linux/macOS-тулчейнов в этой среде нет, поэтому
+проверено только: Windows-сборка (`cargo check`/`test` — 155 тестов, clippy 34)
+и синтаксис скрипта (`bash -n`), плюс валидность YAML workflow. Реальная
+сборка под Linux и macOS — за проверяющим с этими машинами (или CI).

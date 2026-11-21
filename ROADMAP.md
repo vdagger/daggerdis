@@ -193,15 +193,16 @@ oom_id вместо пары «звонящий/принявший», pending �
 ## Кроссплатформенность
 
 ### Linux
-- [ ] `firewall.rs` целиком на `netsh` — обернуть в `#[cfg(windows)]` и добавить заглушку
-- [ ] `keybind.rs` использует Win32 `GetAsyncKeyState` — нужен глобальный хоткей через X11/Wayland
+- [x] `firewall.rs`: правило ставится только на Windows (`#[cfg(windows)]`), на остальных платформах печатается, что входящее UDP-правило не нужно (iroh ходит исходящим QUIC через NAT/релей)
+- [x] `keybind.rs` больше не крутит пустой поток вне Windows: глобального перехвата там нет, в журнал пишется, что PTT работает экранной кнопкой
+- [ ] `keybind.rs` — сама реализация глобального хоткея для X11/Wayland (`XGrabKey`/evdev) ещё не написана
 - [ ] `audio.rs`/cpal на ALSA или PulseAudio — проверить выбор устройств и частоты
 - [ ] iroh STUN/hole punching и релеи — проверить, что работают без прав администратора
 
 ### macOS
-- [ ] Собирать `.app`-бандл, а не голый бинарник: без него окно не ведёт себя как приложение
-- [ ] Универсальная сборка `x86_64-apple-darwin` + `aarch64-apple-darwin` (GitHub-раннеры уже arm64)
-- [ ] Ad-hoc подпись и снятие карантина при распространении, иначе Gatekeeper убивает процесс
+- [x] Собирать `.app`-бандл: `tools/macos-bundle.sh` раскладывает `Contents/MacOS`, `Info.plist` (включая `NSMicrophoneUsageDescription`/`NSLocalNetworkUsageDescription`) и иконку; workflow собирает и упаковывает в zip
+- [x] Универсальная сборка `x86_64-apple-darwin` + `aarch64-apple-darwin` (GitHub-раннеры уже arm64)
+- [x] Ad-hoc подпись в скрипте (`codesign --sign -`), чтобы Gatekeeper не убивал процесс; настоящая подпись Developer ID — отдельно
 - [ ] `keybind.rs` — глобальный перехват через `CGEventTap` вместо Win32
 - [ ] cpal на macOS работает через CoreAudio, отдельной работы не требует
 

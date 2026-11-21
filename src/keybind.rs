@@ -38,6 +38,24 @@ pub fn set_screen_ptt(active: bool) {
 
 /// Запускает независимый фоновый системный поток перехвата PTT в Windows
 fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
+    // Вне Windows глобального перехвата нет: X11/Wayland требуют своей
+    // реализации (XGrabKey/evdev), macOS — CGEventTap. Крутить пустой цикл
+    // каждые 10 мс бессмысленно, поэтому честно говорим об этом один раз.
+    #[cfg(not(windows))]
+    {
+        let _ = ptt_flag;
+        if LISTENER_SPAWNED
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            println!(
+                "[ХОТКЕЙ] Глобальный хоткей недоступен на этой платформе — \
+                 PTT работает экранной кнопкой"
+            );
+        }
+        return;
+    }
+
     if LISTENER_SPAWNED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
@@ -94,6 +112,7 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
 }
 
 /// Возвращает понятное человеческое имя для кода клавиши Windows
+#[cfg(windows)]
 fn vk_to_name(vk: i32) -> String {
     match vk {
         0x01 => "Мышь: ЛКМ".to_string(),
