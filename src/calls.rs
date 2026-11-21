@@ -532,7 +532,7 @@ impl CallManager {
                         // Мы уже в этой комнате: отвечаем согласием, чтобы
                         // пригласивший перестал звонить
                         Act::Accept(room_id)
-                    } else if pending.contains_key(peer) {
+                    } else if pending.contains_key(peer) && self.room.get_all_peers().is_empty() {
                         let cancelled: Vec<String> =
                             pending.keys().filter(|p| *p != peer).cloned().collect();
                         pending.clear();
@@ -1324,6 +1324,25 @@ mod tests {
     }
 
     #[test]
+    fn mutual_invite_with_people_in_room_is_busy() {
+        let (a, b) = (node(0xAA), node(0xBB));
+        let m = manager();
+        m.start_outgoing(&a, "Аня", "Я");
+        let id = room_id_of(&m);
+        m.on_accept(&a, id);
+        add_to_room(&m, &a);
+
+        // Мы уже разговариваем с Аней: второе приглашение с другим room_id не
+        // должно смешать две комнаты — отвечаем «занято» и остаёмся в своей.
+        m.on_invite(&b, "Боря", 999);
+        assert_eq!(room_id_of(&m), id);
+        match m.view() {
+            CallView::Active { members, .. } => assert_eq!(members, 2),
+            other => panic!("ожидали Active, получили {other:?}"),
+        }
+    }
+
+    #[test]
     fn room_id_is_shared_for_members_list() {
         let a = node(0xAA);
         let m = manager();
@@ -1341,6 +1360,8 @@ mod tests {
         assert_ne!(new_room_id(1), new_room_id(2));
     }
 }
+
+
 
 
 
