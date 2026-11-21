@@ -174,6 +174,7 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 15 | `PresencePing` | `sender_id` u64 LE — «ты в сети?»; пинг живёт вне комнаты |
 | 16 | `PresencePong` | `sender_id` u64 LE — ответ на пинг |
 | 17 | `RoomMembers` | `sender_id` u64 LE, `room_id` u32 LE, `count` u16 LE, затем `count` × (`len` u16 LE + NodeID) — список комнаты новому участнику, чтобы mesh собрался целиком |
+| 18 | `RoomChat` | `sender_id` u64 LE, `room_id` u32 LE, `nick` str, `text` str — общее сообщение комнаты (0 — эфир без созвона) |
 
 Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP mesh.
 
@@ -480,8 +481,7 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   `ALBUS_RENDERER=wgpu`). Feature `wgpu` включён в eframe, рендерер выбирается
   переменной окружения (по умолчанию glow). `pollster` подключён локальной
   заменой `vendor/pollster` через `[patch.crates-io]` (его `.crate` не скачивался:
-  реестр cargo принадлежит другому пользователю). Без DX12-адаптера GUI в такой
-  VM не поднять — проверять на обычной машине.
+  реестр cargo принадлежит другому пользователю).
 - **Онлайн-статус друзей — по пингу, а не по комнате.** `PresenceTracker`
   (`src/presence.rs`) держит `HashMap<NodeID, Instant>` с TTL 12 с: `spawn_ping_loop`
   раз в 4 с шлёт `PresencePing` друзьям без свежей отметки (отдельной задачей и с
@@ -493,19 +493,17 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   этого не годятся — они существуют только внутри комнаты. В панели друзей точка
   зелёная/серая; «Позвонить» офлайн-другу не гудит 35 с в пустоту, а сразу
   показывает тост «… не в сети».
-- **Chat (DM):** session-only and in-memory (`src/chat.rs`, never persisted) — by
-  design, so chat history cannot leak to disk. Friends-only: messages from non-friends
-  are dropped. Transport is iroh **datagrams** with a reliable uni-stream fallback in
-  `IrohP2pManager::send_bytes` (reconnect + retry when the map entry is dead or the
-  datagram fails), so a lost datagram no longer loses the message. Text is
+- **Chat (DM и комната):** session-only, in memory (`src/chat.rs`), never
+  persisted — history cannot leak to disk. DM is friends-only (strangers dropped);
+  room chat (`RoomChat`, tag 18) goes to every room address and is accepted only
+  from a room member while we are in the air, `room_id` 0 = общий эфир; history is
+  per-room and cleared when the room changes. Transport is iroh **datagrams** with
+  a reliable uni-stream fallback in `send_bytes` (reconnect + retry), text is
   capped to 1024 bytes on send (QUIC datagram MTU).
-- **Unread chat:** `ChatLog` counts unread per NodeID. The badge lives on the
-  «Чат» chip in the **«Эфир» header row**, not in the console footer — at the default
-  window size the footer is clipped below the edge, so the badge was invisible.
-  An open chat overlay calls `mark_read` every frame (before, the counter only grew,
-  so the badge never cleared), and a rise in a friend's unread count while their
-  chat is closed also shows a toast «Новое сообщение · <ник>» — the badge alone is
-  easy to miss.
+- **Unread chat:** `ChatLog` counts unread per NodeID, `RoomChat` — одно число на
+  комнату; бейдж на чипе «Чат» в шапке «Эфира» (в подвале он обрезался за краем).
+  Открытый оверлей зовёт `mark_read` каждый кадр, а рост непрочитанного в
+  закрытой переписке даёт тост «Новое сообщение · <ник>» — бейдж легко пропустить.
 - **Video pipeline (Windows):** DXGI capture (BGRA, GPU) → `ID3D11VideoProcessor`
   converts/scales to NV12 on the GPU → hardware H.264 MFT → iroh → decoder MFT →
   NV12 → Video Processor → BGRA → egui texture. Bitrate is `pixels × fps ×
@@ -649,15 +647,12 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
 - **Razer's virtual "7.1 Surround Sound" endpoint mangles `f32`.** This is a
   known cpal problem ([RustAudio/cpal#892](https://github.com/RustAudio/cpal/issues/892)):
   every cpal app (rodio, kira, Bevy) plays heavily distorted sound on that
-  device while other outputs are clean, and Razer's own surround toggle makes no
-  difference — the same stream in `i32` plays fine. So `i32` is a candidate
+  device while other outputs are clean, and the same stream in `i32` plays fine. So `i32` is a candidate
   format too, and on endpoints with more than two channels it is tried before
   `f32`; stereo endpoints keep `f32` first. The order is printed per attempt
   (`формат … не подошёл`), so the log shows which format the device did accept.
-- **A silent "nothing plays" must be visible in the console.** `main.rs` used to
-  swallow `create_playback_stream`/`create_input_stream` errors with `if let Ok`,
-  so a failed stream looked like a working app that transmits but stays quiet.
-  Both now print `[ОШИБКА] Динамики не открылись: …` / `Микрофон не открылся: …`.
+- **A silent "nothing plays" must be visible in the console.** a failed stream is
+  printed (`[ОШИБКА] Динамики/Микрофон не открылись: …`), not swallowed by `if let Ok`.
 - **Build stamp for stale copies:** `build.rs` exports `ALBUS_BUILD_STAMP` (the
   newest mtime under `src/` or `build.rs`), and startup prints
   `[СБОРКА] Albus <version> · сборка <stamp>`. Two peers must show the same
@@ -714,7 +709,6 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
 - **Video window:** own preview and remote streams are shown in a separate
   resizable egui viewport ("Albus — трансляция") with an in-window fullscreen
   toggle; remote streams open it automatically.
-- **Assets are compiled in** via `include_bytes!` (icon/logo) — no runtime asset loading.
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
 - `Cargo.lock` is committed and must stay committed (binary app — do **not** gitignore it).
