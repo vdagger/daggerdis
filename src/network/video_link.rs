@@ -33,6 +33,7 @@
 //! u32 fps
 //! i64 pts_100ns
 //! u32 len
+//! u32 frame_seq   (номер кадра: по нему зритель просит досыл)
 //! [SPS/PPS][H.264 Annex-B]
 //! ```
 
@@ -62,6 +63,16 @@ const KIND_ACK: u8 = 3;
 const KIND_FEED: u8 = 4;
 /// Зритель → хост: «отдай мне поток этого издателя».
 const KIND_RELAY: u8 = 5;
+/// Запрос досыла: `[kind][count u8][seq u32 LE × count]`.
+const KIND_NACK: u8 = 6;
+
+/// Сколько кадров просим за один раз: больше — это уже «начни с ключевого».
+const NACK_LIMIT: usize = 16;
+
+/// Заголовок кадра до номера.
+const FRAME_HEADER: usize = 28;
+/// Полный заголовок: плюс номер кадра.
+const FRAME_HEADER_SEQ: usize = FRAME_HEADER + 4;
 
 /// Управляющий пакет — вид, поколение и 64-символьный NodeID.
 const CONTROL_LIMIT: usize = 256;
@@ -95,6 +106,8 @@ pub struct RemoteFrame {
     pub height: u32,
     pub fps: u32,
     pub sequence_header: Vec<u8>,
+    /// Номер кадра в потоке отправителя: по нему видно дырку и находится досыл.
+    pub seq: u32,
     pub unit: EncodedUnit,
     /// Когда кадр пришёл: от неё считается дедлайн показа.
     pub arrived: Instant,
@@ -147,7 +160,14 @@ impl RemoteQueue {
             self.resync = false;
         }
         self.bytes += cost;
-        self.frames.push_back(frame);
+        // Порядок очереди — порядок показа. Кадр, досланный по NACK, приходит
+        // позже своих потомков, поэтому вставляем его по номеру, а не в хвост.
+        let pos = self
+            .frames
+            .iter()
+            .position(|f| (frame.seq.wrapping_sub(f.seq) as i32) < 0)
+            .unwrap_or(self.frames.len());
+        self.frames.insert(pos, frame);
         true
     }
 
@@ -206,6 +226,12 @@ impl Recent {
         if self.next_seq == 0 {
             self.next_seq = 1;
         }
+        // Номер кадра уходит на провод: без него зритель не видит дырок, а
+        // значит и не может попросить досыл.
+        let mut data = data;
+        if data.len() >= FRAME_HEADER_SEQ && data[0] == KIND_FRAME {
+            data[FRAME_HEADER..FRAME_HEADER_SEQ].copy_from_slice(&self.next_seq.to_le_bytes());
+        }
         let published = Arc::new(Published {
             seq: self.next_seq,
             keyframe,
@@ -246,6 +272,11 @@ impl Recent {
         }
         let last = tail.last().map(|f| f.seq).unwrap_or(self.next_seq);
         (tail, last)
+    }
+
+    /// Кадр по номеру — для досыла по NACK.
+    fn by_seq(&self, seq: u32) -> Option<Arc<Published>> {
+        self.frames.iter().find(|f| f.seq == seq).cloned()
     }
 
     fn clear(&mut self) {
@@ -601,6 +632,11 @@ impl VideoLink {
             Some(Control::Feed { gen }) => {
                 feed_request_ok(self.directory.is_live(&from, *gen, Instant::now()), in_room)
             }
+            // Для релей-подписки важно, живёт ли поток издателя в каталоге:
+            // хост может ещё не получить feed, но зритель уже вправе ждать.
+            Some(Control::Relay { gen, publisher }) => {
+                self.directory.is_live(publisher, *gen, Instant::now())
+            }
             _ => false,
         };
         let relay = self
@@ -694,6 +730,15 @@ impl VideoLink {
                 alive: alive.clone(),
             });
         }
+        // Запросы досыла — отдельной задачей на том же соединении.
+        {
+            let nack_me = self.clone();
+            let nack_conn = conn.clone();
+            let nack_stop = stop_rx.clone();
+            self.rt.spawn(async move {
+                nack_me.serve_nacks(nack_conn, nack_stop).await;
+            });
+        }
         let me = self.clone();
         self.rt.spawn(async move {
             me.send_frames(conn, stop_rx, None).await;
@@ -784,6 +829,56 @@ impl VideoLink {
                 (rx, tail, last)
             }
             Err(_) => (self.outgoing.subscribe(), Vec::new(), 0),
+        }
+    }
+
+    /// Читает запросы досыла от собеседника и отдаёт кадры из окна.
+    ///
+    /// Отдельная задача: отдача кадров идёт своим циклом и не должна ждать,
+    /// пока зритель что-то попросит. У хоста в окне те же кадры, что он
+    /// раздаёт, поэтому досыл работает и для релея.
+    async fn serve_nacks(
+        self: Arc<Self>,
+        conn: Connection,
+        mut stop: watch::Receiver<bool>,
+    ) {
+        loop {
+            let mut stream = tokio::select! {
+                changed = stop.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                _ = conn.closed() => return,
+                next = conn.accept_uni() => match next {
+                    Ok(stream) => stream,
+                    Err(_) => return,
+                },
+            };
+            let data = tokio::select! {
+                changed = stop.changed() => {
+                    let _ = changed;
+                    return;
+                }
+                read = stream.read_to_end(64) => match read {
+                    Ok(data) => data,
+                    Err(_) => continue,
+                },
+            };
+            let Some(seqs) = parse_nack(&data) else {
+                continue;
+            };
+            let frames: Vec<Arc<Published>> = match self.window.lock() {
+                Ok(window) => seqs
+                    .iter()
+                    .filter_map(|s| window.recent.by_seq(*s))
+                    .collect(),
+                Err(_) => continue,
+            };
+            for frame in frames {
+                if send_published(&conn, &frame).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 
@@ -1201,6 +1296,8 @@ impl VideoLink {
         // Кадры прошлой подписки к новому потоку не относятся.
         self.reset_remote_from(node);
 
+        // Номер следующего ожидаемого кадра: разрыв — повод попросить досыл.
+        let mut expected: Option<u32> = None;
         loop {
             let mut stream = tokio::select! {
                 changed = stop.changed() => {
@@ -1223,7 +1320,35 @@ impl VideoLink {
                 },
             };
             match parse_frame(&data, node) {
-                Some(frame) => self.push_remote(frame),
+                Some(frame) => {
+                    let seq = frame.seq;
+                    let mut skip = false;
+                    match expected {
+                        Some(exp) => {
+                            let diff = seq.wrapping_sub(exp) as i32;
+                            if diff >= 0 {
+                                let missing = diff as u32;
+                                if missing > 0 {
+                                    if missing <= NACK_LIMIT as u32 {
+                                        request_missing(&conn, exp, missing).await;
+                                    } else {
+                                        // Дырка больше окна досыла: дешевле
+                                        // дождаться ключевого кадра.
+                                        self.reset_remote_from(node);
+                                    }
+                                }
+                                expected = Some(seq.wrapping_add(1));
+                            } else {
+                                // Дубль или кадр старше уже показанного.
+                                skip = true;
+                            }
+                        }
+                        None => expected = Some(seq.wrapping_add(1)),
+                    }
+                    if !skip {
+                        self.push_remote(frame);
+                    }
+                }
                 None => eprintln!("[ВИДЕО] Битый кадр от {}", node),
             }
         }
@@ -1396,8 +1521,11 @@ fn decide_control(
         }
         Control::Relay { gen, publisher } => {
             // Поколение — секунды, у двух издателей они совпадают: отдаём
-            // поток только тому издателю, который сейчас в релее.
-            if !left && relay == Some((publisher.as_str(), *gen)) {
+            // поток только тому издателю, который сейчас в релее. Но зритель
+            // вправе подписаться и раньше, чем feed дошёл до хоста: живой
+            // анонс издателя — достаточное подтверждение, кадры пойдут, как
+            // только хост примет поток (до этого окно пустое).
+            if !left && (relay == Some((publisher.as_str(), *gen)) || feed_live) {
                 Action::Serve
             } else {
                 Action::Reject
@@ -1471,6 +1599,49 @@ fn parse_control(data: &[u8]) -> Option<Control> {
     }
 }
 
+/// Запрос досыла: `[6][count][seq u32 LE × count]`.
+fn encode_nack(seqs: &[u32]) -> Vec<u8> {
+    let count = seqs.len().min(NACK_LIMIT);
+    let mut out = Vec::with_capacity(2 + count * 4);
+    out.push(KIND_NACK);
+    out.push(count as u8);
+    for seq in &seqs[..count] {
+        out.extend_from_slice(&seq.to_le_bytes());
+    }
+    out
+}
+
+fn parse_nack(data: &[u8]) -> Option<Vec<u32>> {
+    if data.len() < 2 || data[0] != KIND_NACK {
+        return None;
+    }
+    let count = data[1] as usize;
+    if count == 0 || count > NACK_LIMIT || data.len() < 2 + count * 4 {
+        return None;
+    }
+    let mut seqs = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = 2 + i * 4;
+        seqs.push(u32::from_le_bytes(data[at..at + 4].try_into().ok()?));
+    }
+    Some(seqs)
+}
+
+/// Просит досыл кадров `from..from+count` тем же соединением, что и кадры.
+///
+/// Отдельный uni-стрим: видео идёт односторонними потоками, а запрос — это
+/// встречный поток в том же соединении, ничего не блокирует.
+async fn request_missing(conn: &Connection, from: u32, count: u32) {
+    let seqs: Vec<u32> = (0..count.min(NACK_LIMIT as u32))
+        .map(|i| from.wrapping_add(i))
+        .collect();
+    let Ok(mut send) = conn.open_uni().await else {
+        return;
+    };
+    let _ = send.write_all(&encode_nack(&seqs)).await;
+    let _ = send.finish();
+}
+
 fn encode_ack(status: u8, gen: u32) -> [u8; 6] {
     let mut out = [0u8; 6];
     out[0] = KIND_ACK;
@@ -1490,6 +1661,8 @@ fn parse_ack(data: &[u8]) -> Option<(u8, u32)> {
 struct FrameHeader {
     keyframe: bool,
     seq_len: usize,
+    /// Номер кадра в потоке отправителя.
+    frame_seq: u32,
     width: u32,
     height: u32,
     fps: u32,
@@ -1498,7 +1671,7 @@ struct FrameHeader {
 }
 
 fn frame_header(data: &[u8]) -> Option<FrameHeader> {
-    if data.len() < 28 || data[0] != KIND_FRAME {
+    if data.len() < FRAME_HEADER_SEQ || data[0] != KIND_FRAME {
         return None;
     }
     let flags = data[1];
@@ -1508,12 +1681,14 @@ fn frame_header(data: &[u8]) -> Option<FrameHeader> {
     let fps = u32::from_le_bytes(data[12..16].try_into().ok()?);
     let pts = i64::from_le_bytes(data[16..24].try_into().ok()?);
     let len = u32::from_le_bytes(data[24..28].try_into().ok()?) as usize;
-    if data.len() < 28 + seq_len + len {
+    let frame_seq = u32::from_le_bytes(data[28..32].try_into().ok()?);
+    if data.len() < FRAME_HEADER_SEQ + seq_len + len {
         return None;
     }
     Some(FrameHeader {
         keyframe: flags & 1 != 0,
         seq_len,
+        frame_seq,
         width,
         height,
         fps,
@@ -1546,6 +1721,9 @@ fn encode_frame(unit: &EncodedUnit, info: &StreamInfo) -> Vec<u8> {
     v.extend_from_slice(&info.fps.to_le_bytes());
     v.extend_from_slice(&unit.pts_100ns.to_le_bytes());
     v.extend_from_slice(&(unit.data.len() as u32).to_le_bytes());
+    // Номер кадра проставляет кольцо недавних кадров: у каждого отправителя
+    // (издатель и хост-релей) своя нумерация.
+    v.extend_from_slice(&0u32.to_le_bytes());
     v.extend_from_slice(seq);
     v.extend_from_slice(&unit.data);
     v
@@ -1553,9 +1731,10 @@ fn encode_frame(unit: &EncodedUnit, info: &StreamInfo) -> Vec<u8> {
 
 fn parse_frame(data: &[u8], from: &str) -> Option<RemoteFrame> {
     let h = frame_header(data)?;
-    let rest = &data[28..];
+    let rest = &data[FRAME_HEADER_SEQ..];
     Some(RemoteFrame {
         from: from.to_string(),
+        seq: h.frame_seq,
         width: h.width,
         height: h.height,
         fps: h.fps,
@@ -1593,6 +1772,8 @@ mod tests {
     fn frame(from: &str, keyframe: bool, pts: i64, arrived: Instant) -> RemoteFrame {
         RemoteFrame {
             from: from.to_string(),
+            // Номер кадра в тестах очереди не важен: порядок задаёт arrived.
+            seq: 1,
             width: 1920,
             height: 1080,
             fps: 60,
@@ -1755,6 +1936,84 @@ mod tests {
     }
 
     #[test]
+    fn relay_subscribe_allowed_when_publisher_announced() {
+        let publisher = node_id('a');
+        let cmd = Control::Relay {
+            gen: 4,
+            publisher: publisher.clone(),
+        };
+        // Релея ещё нет, но анонс жив: подписку принимаем — кадры пойдут,
+        // как только хост получит feed.
+        assert_eq!(
+            decide_control(&cmd, 0, true, false, true, None),
+            Action::Serve
+        );
+        // Ни релея, ни анонса — отказ.
+        assert_eq!(
+            decide_control(&cmd, 0, true, false, false, None),
+            Action::Reject
+        );
+        // Из эфира вышли — отказ даже при живом анонсе.
+        assert_eq!(
+            decide_control(&cmd, 0, true, true, true, None),
+            Action::Reject
+        );
+    }
+
+    #[test]
+    fn nack_roundtrip_and_limits() {
+        let seqs = vec![7u32, 8, 100];
+        let parsed = parse_nack(&encode_nack(&seqs)).unwrap();
+        assert_eq!(parsed, seqs);
+        // Пустой запрос и мусор — не запрос.
+        assert!(parse_nack(&encode_nack(&[])).is_none());
+        assert!(parse_nack(&[KIND_NACK]).is_none());
+        assert!(parse_nack(&[KIND_FRAME, 1, 0, 0, 0, 0]).is_none());
+        // Больше лимита не просим: длинный список обрезается.
+        let many: Vec<u32> = (1..=(NACK_LIMIT as u32 + 10)).collect();
+        let parsed = parse_nack(&encode_nack(&many)).unwrap();
+        assert_eq!(parsed.len(), NACK_LIMIT);
+        assert_eq!(parsed[0], 1);
+        // Обрезанный пакет — мусор.
+        let full = encode_nack(&seqs);
+        assert!(parse_nack(&full[..full.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn published_frames_carry_seq_on_the_wire() {
+        let info = info();
+        let unit = unit(true, 10, 4);
+        let bytes = encode_frame(&unit, &info);
+        // До публикации номер нулевой — его проставляет кольцо.
+        assert_eq!(frame_header(&bytes).unwrap().frame_seq, 0);
+        let mut recent = Recent::new();
+        let published = recent.push(true, bytes);
+        assert_eq!(frame_header(&published.data).unwrap().frame_seq, published.seq);
+        assert_eq!(recent.by_seq(published.seq).unwrap().seq, published.seq);
+        assert!(recent.by_seq(published.seq + 100).is_none());
+    }
+
+    #[test]
+    fn queue_orders_retransmitted_frames_by_seq() {
+        let mut queue = RemoteQueue::new();
+        let now = Instant::now();
+        // Пришли 5, 7, а 6 дослали позже: показ должен идти 5, 6, 7.
+        let mut f5 = frame("n", true, 5, now);
+        f5.seq = 5;
+        let mut f7 = frame("n", false, 7, now);
+        f7.seq = 7;
+        let mut f6 = frame("n", false, 6, now);
+        f6.seq = 6;
+        assert!(queue.push(f5, Duration::ZERO));
+        assert!(queue.push(f7, Duration::ZERO));
+        assert!(queue.push(f6, Duration::ZERO));
+        let order: Vec<u32> = std::iter::from_fn(|| queue.pop_due(Duration::ZERO, now))
+            .map(|f| f.seq)
+            .collect();
+        assert_eq!(order, vec![5, 6, 7]);
+    }
+
+    #[test]
     fn frame_roundtrip_keeps_wire_format() {
         let unit = unit(true, 42, 9);
         let info = info();
@@ -1762,7 +2021,7 @@ mod tests {
         assert_eq!(bytes[0], 1);
         assert_eq!(bytes[1], 3); // keyframe + SPS/PPS
         assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), 2);
-        assert_eq!(&bytes[28..30], &[0x67, 0x42]);
+        assert_eq!(&bytes[32..34], &[0x67, 0x42]);
 
         let parsed = parse_frame(&bytes, "node-a").unwrap();
         assert_eq!(parsed.from, "node-a");
@@ -1775,12 +2034,12 @@ mod tests {
 
     #[test]
     fn short_or_foreign_frames_rejected() {
-        assert!(parse_frame(&[0; 27], "n").is_none());
+        assert!(parse_frame(&[0; 31], "n").is_none());
         let mut bytes = encode_frame(&unit(false, 0, 1), &info());
         bytes[0] = KIND_SUBSCRIBE;
         assert!(parse_frame(&bytes, "n").is_none());
         let bytes = encode_frame(&unit(false, 0, 4), &info());
-        assert!(parse_frame(&bytes[..30], "n").is_none());
+        assert!(parse_frame(&bytes[..34], "n").is_none());
     }
 
     fn relay(id: u64, publisher: &str, gen: u32) -> FeedRelay {

@@ -178,14 +178,14 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 17 | `RoomMembers` | `sender_id` u64 LE, `room_id` u32 LE, `count` u16 LE, затем `count` × (`len` u16 LE + NodeID) — список комнаты новому участнику, чтобы mesh собрался целиком |
 | 18 | `RoomChat` | `sender_id` u64 LE, `room_id` u32 LE, `nick` str, `text` str — общее сообщение комнаты (0 — эфир без созвона) |
 
-Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP mesh.
+Tags 1–2 удалены вместе с raw-UDP mesh.
 
 ### Video wire format (`src/network/video_link.rs`)
 
 Video uses a **separate iroh connection** with ALPN `discordrf-video/1`: QUIC
 congestion control is per-connection, so video cannot starve voice datagrams.
 Each frame is its own **unidirectional stream** — a lost packet delays one frame,
-not the whole GOP. Little-endian 28-byte header, then optional SPS/PPS and the
+not the whole GOP. Little-endian 32-byte header, then optional SPS/PPS and the
 Annex-B H.264 payload:
 
 | Offset | Type | Field |
@@ -198,7 +198,8 @@ Annex-B H.264 payload:
 | 12 | u32 | fps |
 | 16 | i64 | pts (100 ns) |
 | 24 | u32 | payload length |
-| 28 | bytes | SPS/PPS (if flag 2), then H.264 |
+| 28 | u32 | `frame_seq` — номер кадра у отправителя: по нему виден разрыв и находится досыл |
+| 32 | bytes | SPS/PPS (if flag 2), then H.264 |
 
 **Control protocol.** The client opens the connection — a viewer, or a publisher
 sending its feed to the host. The first bidirectional stream is the control
@@ -428,9 +429,6 @@ that sender's queued frames and waits for a keyframe.
   is stored as `peer_<id>_volume` keyed by the stable `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60), viewer delay
 is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
   written on change with a 400 ms throttle, never on exit.
-- **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
-  spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
-  commands are not currently reachable.
 - **Голосовая комната (`src/calls.rs`) — это и есть «звонок», на N человек.**
   `Active { room_id, pending }` вместо пары «звонящий/принявший»: приглашение
   зовёт в текущую комнату, поэтому второй и третий друг не получают «вы уже в
@@ -650,8 +648,7 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   любой cpal-звук на нём искажён, а `i32` играет чисто. Поэтому `i32` тоже
   кандидат, и на многоканальных выходах он пробуется раньше `f32`; порядок
   печатается по попыткам (`формат … не подошёл`).
-- **A silent "nothing plays" must be visible in the console.** a failed stream is
-  printed (`[ОШИБКА] Динамики/Микрофон не открылись: …`), not swallowed by `if let Ok`.
+- **A silent "nothing plays" must be visible:** `[ОШИБКА] Динамики/Микрофон не открылись: …`.
 - **Build stamp for stale copies:** `build.rs` exports `ALBUS_BUILD_STAMP` (the
   newest mtime under `src/` or `build.rs`), and startup prints
   `[СБОРКА] Albus <version> · сборка <stamp>`. Two peers must show the same
@@ -668,9 +665,9 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   frame by the GUI and passed to `VideoLink::set_buffer_ms`; `try_recv_due()` then
   releases a frame only after it has sat in the queue that long. Changing it on the
   fly applies to frames already queued (the deadline is evaluated at release). The
-  viewer toolbar shows it as «буфер N.N с». It is not a NACK/retransmission
-  mechanism — a frame lost in the network is skipped, the stream waits for the
-  next keyframe only when the queue overflows.
+  viewer toolbar shows it as «буфер N.N с». Потерянный кадр зритель просит
+  досылом (kind 6, из кольца того, кто отдаёт), очередь вставляет его по номеру;
+  если кадра нет совсем — пропуск, ключевой ждём при переполнении.
 - **Decoder output is 1088 rows** (height aligned to 16) and its UV plane starts
   below; `repack_nv12()` strips the padding to exactly w×h before upload.
 - **The Microsoft H.264 decoder MFT is synchronous** (no
@@ -696,15 +693,9 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   requireAdministrator из `build.rs` ломает запуск example-процессов.
   Собирать с `--manifest-path tools/video_probe/Cargo.toml --target-dir target`
   и `ALBUS_NO_ADMIN_MANIFEST=1`; его `Cargo.lock` — копия корневого, в gitignore.
-  `src/bin/cycles.rs` — поиск утечек старт/стоп: создаёт и роняет ровно то, что
-  живёт между «Начать трансляцию» и «Остановить», и печатает память после
-  каждого круга. Флаги `--enc/--dec/--gpu/--dev/--tex/--conv` оставляют одну
-  стадию, `--upload/--blt/--copy` режут внутри кадра.
-- **Self-preview feedback:** showing your own stream on the same monitor feeds
-  the capture loop continuously — expected behaviour, not a decoder bug.
-- **Video window:** own preview and remote streams are shown in a separate
-  resizable egui viewport ("Albus — трансляция") with an in-window fullscreen
-  toggle; remote streams open it automatically.
+- **Video window:** своё превью и чужие потоки — в отдельном окне «Albus —
+  трансляция» (растягивается, есть полноэкранный режим; чужой поток открывает
+  его сам). Своё превью на том же мониторе подкармливает захват — это норма.
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
 - `Cargo.lock` is committed and must stay committed (binary app — do **not** gitignore it).
