@@ -71,61 +71,64 @@ pub fn spawn_iroh_receiver(
                             hops,
                             video_gen,
                         } => {
-                            if hops > 0 {
-                                // Релей: хост пересылает IrohSync тем, с кем этот
-                                // узел ещё не соединился напрямую. Подлинность
-                                // соединения тут не проверить, поэтому пускаем
-                                // только один релей и только от нашего хоста.
-                                let id_ok = crate::identity::my_id_from_node_id(&node_id)
-                                    == Some(sender_id);
-                                if hops > 1 || !id_ok || node_id == p2p_recv.my_node_id {
+                            // Решение — в чистой `admission::admit_sync`:
+                            // подлинность, глубина релея, «свой хост», блокировка
+                            // приглашения и наш флаг «вне эфира». Здесь только
+                            // печать причины и действие.
+                            let relayed_by_host = hops > 0
+                                && room_iroh
+                                    .get_all_peers()
+                                    .iter()
+                                    .any(|p| p.address == pkt.sender_id && p.is_host);
+                            let verdict = crate::network::admission::admit_sync(
+                                &crate::network::admission::SyncCheck {
+                                    from: &pkt.sender_id,
+                                    node_id: &node_id,
+                                    sender_id,
+                                    hops,
+                                    my_node_id: &p2p_recv.my_node_id,
+                                    relayed_by_host,
+                                    blocked: calls_iroh.is_blocked(&pkt.sender_id),
+                                    left: room_iroh.is_left(),
+                                },
+                            );
+                            use crate::network::admission::SyncVerdict;
+                            match verdict {
+                                SyncVerdict::Accept => {}
+                                SyncVerdict::RelayTooDeep
+                                | SyncVerdict::RelayForeign
+                                | SyncVerdict::RelaySelf => {
                                     eprintln!(
                                         "[БЕЗОПАСНОСТЬ] Релейный IrohSync от {} отброшен",
                                         pkt.sender_id
                                     );
                                     continue;
                                 }
-                                let relayed_by_host = room_iroh
-                                    .get_all_peers()
-                                    .iter()
-                                    .any(|p| p.address == pkt.sender_id && p.is_host);
-                                if !relayed_by_host {
+                                SyncVerdict::RelayNotHost => {
                                     eprintln!(
                                         "[БЕЗОПАСНОСТЬ] IrohSync по релею не от хоста ({}) отброшен",
                                         pkt.sender_id
                                     );
                                     continue;
                                 }
-                            } else if !sender_id_verified(&pkt.sender_id, sender_id)
-                                || node_id != pkt.sender_id
-                            {
-                                // Узел обязан назвать в пакете тот же NodeID, что у
-                                // соединения, а sender_id должен быть хешем этого NodeID.
-                                eprintln!(
-                                    "[БЕЗОПАСНОСТЬ] IrohSync с чужим sender_id/NodeID от {} отброшен",
-                                    pkt.sender_id
-                                );
-                                continue;
-                            }
-
-                            // Звонящий, которого ещё не приняли, в комнату не попадает:
-                            // IrohSync рассылается раз в секунду и иначе добавлял бы
-                            // его в участники в обход согласия на звонок.
-                            // Пользователь вышел из эфира сам — не возвращаем его
-                            // туда авто-синхронизацией.
-                            if calls_iroh.is_blocked(&pkt.sender_id) {
-                                continue;
-                            }
-                            if room_iroh.is_left() {
-                                // Пока стоит «вышли из эфира», комната не
-                                // принимает синхронизацию — иначе узел вернулся
-                                // бы в неё сам. Если это видно в журнале после
-                                // «Войти по приглашению», значит флаг не снят.
-                                eprintln!(
-                                    "[КОМНАТА] IrohSync от {} отброшен: мы вне эфира",
-                                    pkt.sender_id
-                                );
-                                continue;
+                                SyncVerdict::Foreign => {
+                                    eprintln!(
+                                        "[БЕЗОПАСНОСТЬ] IrohSync с чужим sender_id/NodeID от {} отброшен",
+                                        pkt.sender_id
+                                    );
+                                    continue;
+                                }
+                                SyncVerdict::Blocked => continue,
+                                SyncVerdict::Left => {
+                                    // Пока стоит «вышли из эфира», комната не
+                                    // принимает синхронизацию — иначе узел
+                                    // вернулся бы в неё сам.
+                                    eprintln!(
+                                        "[КОМНАТА] IrohSync от {} отброшен: мы вне эфира",
+                                        pkt.sender_id
+                                    );
+                                    continue;
+                                }
                             }
 
                             // Анонс трансляции — только после проверок подлинности:
@@ -332,41 +335,43 @@ pub fn spawn_iroh_receiver(
                             nick,
                             text,
                         } => {
-                            if !sender_id_verified(&pkt.sender_id, sender_id) {
-                                continue;
-                            }
-                            // Вне эфира комната нас не касается: сообщение
-                            // прилетело бы из разговора, которого мы не слышим.
-                            if room_iroh.is_left() {
-                                eprintln!(
-                                    "[ЧАТ] Сообщение в комнату от {} отброшено: мы вне эфира",
-                                    pkt.sender_id
-                                );
-                                continue;
-                            }
-                            // Писать в эфир может только его участник: чужой не
-                            // должен вклиниваться в комнату без приглашения.
-                            if !room_iroh
+                            // Правило приёма — в чистой `admission::admit_room_chat`:
+                            // подлинность, «в эфире ли мы», участие в комнате,
+                            // номер комнаты и непустой текст.
+                            let my_room = calls_iroh.room_id().unwrap_or(0);
+                            let member = room_iroh
                                 .get_all_addresses()
                                 .iter()
-                                .any(|a| a == &pkt.sender_id)
-                            {
-                                eprintln!(
-                                    "[ЧАТ] Сообщение в комнату от {} отброшено: его нет в комнате",
-                                    pkt.sender_id
-                                );
-                                continue;
-                            }
-                            // 0 — общий эфир без созвона; иначе номера комнат
-                            // должны совпадать.
-                            let my_room = calls_iroh.room_id().unwrap_or(0);
-                            if room_id != 0 && my_room != 0 && room_id != my_room {
-                                continue;
+                                .any(|a| a == &pkt.sender_id);
+                            use crate::network::admission::ChatVerdict;
+                            let verdict = crate::network::admission::admit_room_chat(
+                                sender_id_verified(&pkt.sender_id, sender_id),
+                                room_iroh.is_left(),
+                                member,
+                                room_id,
+                                my_room,
+                                &text,
+                            );
+                            match verdict {
+                                ChatVerdict::Accept => {}
+                                ChatVerdict::Foreign | ChatVerdict::EmptyText => continue,
+                                ChatVerdict::NotInAir => {
+                                    eprintln!(
+                                        "[ЧАТ] Сообщение в комнату от {} отброшено: мы вне эфира",
+                                        pkt.sender_id
+                                    );
+                                    continue;
+                                }
+                                ChatVerdict::NotMember => {
+                                    eprintln!(
+                                        "[ЧАТ] Сообщение в комнату от {} отброшено: его нет в комнате",
+                                        pkt.sender_id
+                                    );
+                                    continue;
+                                }
+                                ChatVerdict::WrongRoom => continue,
                             }
                             let text = text.trim().to_string();
-                            if text.is_empty() {
-                                continue;
-                            }
                             println!(
                                 "[ЧАТ] {} → в комнату: {} симв.",
                                 nick,
@@ -458,7 +463,11 @@ pub fn spawn_iroh_receiver(
                             }
                             // Номер комнаты известен только приглашённым: список
                             // от чужого (или от другой комнаты) не применяем.
-                            if calls_iroh.room_id() != Some(room_id) {
+                            if !crate::network::admission::admit_members(
+                                sender_id_verified(&pkt.sender_id, sender_id),
+                                calls_iroh.room_id(),
+                                room_id,
+                            ) {
                                 eprintln!(
                                     "[КОМНАТА] Список комнаты от {} не для нашей комнаты — отброшен",
                                     pkt.sender_id
