@@ -54,17 +54,29 @@ impl MigrationManager {
             }
             self.room.set_host(host_id);
             let my_is_host = i_am_host;
-            // Рассылаем IrohSync через Iroh P2P для Full-Mesh связности и анонса хоста
+            // Рассылаем IrohSync через Iroh P2P для Full-Mesh связности и анонса хоста.
+            // После «Выйти из эфира» не рассылаем: иначе один и тот же узел
+            // возвращается в комнату у всех за секунду, а вместе с ним и
+            // устаревшие «нет связи» в списке участников (`room.leave()`).
             if let Some(ref p2p) = self.iroh {
-                let sync_msg = NetworkMessage::IrohSync {
-                    sender_id: self.my_id,
-                    node_id: p2p.my_node_id.clone(),
-                    is_host: my_is_host,
-                    hops: 0,
-                    video_gen: self.video.my_gen(),
-                };
-                let serialized = crate::network::message::serialize_msg(&sync_msg);
-                p2p.broadcast_bytes(&serialized).await;
+                if !self.room.is_left() {
+                    // Держим mesh живым: соединение с соседом может пропасть
+                    // после «Выйти из эфира» или обрыва, и тогда его IrohSync
+                    // больше не доходит — узел выпадает из комнаты, хотя оба
+                    // живы. Живые соединения пропускаются внутри.
+                    for address in self.room.get_all_addresses() {
+                        let _ = p2p.ensure_connected(&address).await;
+                    }
+                    let sync_msg = NetworkMessage::IrohSync {
+                        sender_id: self.my_id,
+                        node_id: p2p.my_node_id.clone(),
+                        is_host: my_is_host,
+                        hops: 0,
+                        video_gen: self.video.my_gen(),
+                    };
+                    let serialized = crate::network::message::serialize_msg(&sync_msg);
+                    p2p.broadcast_bytes(&serialized).await;
+                }
             }
 
             // Автоматическая очистка оффлайн-участников
@@ -180,5 +192,9 @@ impl MigrationManager {
         }
     }
 }
+
+
+
+
 
 

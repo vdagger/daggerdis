@@ -111,7 +111,18 @@ pub fn spawn_iroh_receiver(
                             // его в участники в обход согласия на звонок.
                             // Пользователь вышел из эфира сам — не возвращаем его
                             // туда авто-синхронизацией.
-                            if calls_iroh.is_blocked(&pkt.sender_id) || room_iroh.is_left() {
+                            if calls_iroh.is_blocked(&pkt.sender_id) {
+                                continue;
+                            }
+                            if room_iroh.is_left() {
+                                // Пока стоит «вышли из эфира», комната не
+                                // принимает синхронизацию — иначе узел вернулся
+                                // бы в неё сам. Если это видно в журнале после
+                                // «Войти по приглашению», значит флаг не снят.
+                                eprintln!(
+                                    "[КОМНАТА] IrohSync от {} отброшен: мы вне эфира",
+                                    pkt.sender_id
+                                );
                                 continue;
                             }
 
@@ -372,6 +383,11 @@ pub fn spawn_iroh_receiver(
                                 continue;
                             }
                             calls_iroh.on_end(&pkt.sender_id, room_id);
+                            // «Выйти из эфира» — это же и уход из mesh: если
+                            // оставить запись в списке, остальные видят человека
+                            // «в комнате», а пригласить его уже нельзя —
+                            // start_outgoing отвечает «он уже в комнате».
+                            room.remove_peer(sender_id);
                         }
                         NetworkMessage::RoomMembers {
                             sender_id,
@@ -437,4 +453,7 @@ pub fn spawn_iroh_receiver(
         });
     }
 }
+
+
+
 

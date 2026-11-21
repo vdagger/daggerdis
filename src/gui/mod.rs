@@ -1684,6 +1684,11 @@ impl RadioApp {
     /// «Выйти из эфира»: закрыть звонок, отпустить всех собеседников и не
     /// пускать их обратно, пока не нажмут «Войти» или не позвонят снова.
     fn leave_voice(&mut self) {
+        // Объявляем уход до того, как разберём фазу звонка. Комната может быть
+        // собрана одним mesh (без CallPhase::Active), и тогда «Выйти из эфира»
+        // ничего не отправляло: собеседники держали нас в списке «молчит» до
+        // таймаута и не могли пригласить обратно.
+        self.calls.announce_leave();
         match self.calls.view() {
             crate::calls::CallView::Active { .. } => self.calls.end_active(),
             crate::calls::CallView::Outgoing { .. } => self.calls.cancel_outgoing(),
@@ -3025,6 +3030,8 @@ fn mixer_row(ui: &mut egui::Ui, label: &str, value: &mut u32, level: f32) {
         *value = (f * 100.0).round() as u32;
     }
 }
+
+
 
 
 

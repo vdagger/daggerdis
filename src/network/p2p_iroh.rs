@@ -98,6 +98,24 @@ impl IrohP2pManager {
     }
 
     /// Подключается к другому узлу по его строковому NodeID
+    /// Гарантирует соединение с соседом: живое — оставляет как есть.
+    ///
+    /// Нужно для лечения mesh: после «Выйти из эфира» или обрыва соединение с
+    /// собеседником пропадает, его IrohSync больше не доходит, и узел выпадает
+    /// из комнаты, хотя оба живы. `connect_to_peer` каждый раз открывал бы
+    /// новое соединение, поэтому сначала проверяем существующее.
+    pub async fn ensure_connected(&self, target_id_str: &str) -> bool {
+        {
+            let conns = self.connections.lock().await;
+            if let Some(conn) = conns.get(target_id_str) {
+                if conn.close_reason().is_none() {
+                    return true;
+                }
+            }
+        }
+        self.connect_to_peer(target_id_str).await.is_ok()
+    }
+
     pub async fn connect_to_peer(
         &self,
         target_id_str: &str,
@@ -342,4 +360,5 @@ impl IrohP2pManager {
         &self.endpoint
     }
 }
+
 

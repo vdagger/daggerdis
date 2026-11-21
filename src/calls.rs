@@ -235,9 +235,23 @@ impl CallManager {
     /// в текущую; повторный вызов для уже приглашённого безопасен — повтор
     /// отправит `tick`.
     pub fn start_outgoing(&self, peer: &str, peer_nick: &str, my_nick: &str) -> bool {
-        if self.room.get_all_peers().iter().any(|p| p.address == peer) {
-            self.set_notice("Он уже в комнате".to_string());
-            return false;
+        if let Some(known) = self.room.get_all_peers().into_iter().find(|p| p.address == peer) {
+            // Запись могла остаться после «Выйти из эфира» собеседника: он
+            // больше не шлёт heartbeat, но список обновляется по таймауту не
+            // мгновенно. Если он давно молчит — принимаем приглашение заново,
+            // иначе честно говорим, что он уже здесь.
+            // last_heartbeat — миллисекунды с эпохи, как и в migration.rs.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let silent = now.saturating_sub(known.last_heartbeat) >= 6000;
+            if silent {
+                self.room.remove_peer(known.id);
+            } else {
+                self.set_notice("Он уже в комнате".to_string());
+                return false;
+            }
         }
 
         enum Act {
@@ -339,6 +353,9 @@ impl CallManager {
         // переиграют это внутри комнаты).
         println!("[КОМНАТА] Входим по приглашению {} (комната {})", short(&from), room_id);
         self.room.join();
+        // Пригласивший сразу становится соседом: иначе мы «в комнате», но без
+        // участников, и mesh не может до него дотянуться по списку.
+        self.register_peer(&from);
         self.is_host.store(false, Ordering::SeqCst);
         self.unblock(&from);
         self.send_accept_repeat(&from, room_id);
@@ -624,6 +641,10 @@ impl CallManager {
         }
         self.room.join();
         self.unblock(peer);
+        // Вошедший — участник комнаты с этой секунды. Без записи его нет в
+        // списке, mesh не дотягивается до него (ensure_connected идёт по
+        // списку), и человек остаётся «приглашённым», но невидимым.
+        self.register_peer(peer);
         // Новый участник соединён только с нами: отдаём ему список остальных.
         self.send_members(peer, room_id);
         println!("[КОМНАТА] {} вошёл в комнату", short(peer));
@@ -985,6 +1006,48 @@ impl CallManager {
     }
 
     /// Явный вход в комнату по NodeID снимает все ограничения с этого узла.
+    /// «Выйти из эфира», когда звонка нет: комната собрана mesh-синхронизацией,
+    /// и о нас знают без всякого `CallPhase::Active`. Явно объявляем уход, иначе
+    /// остальные держат нас «нет связи» до таймаута (12 с), не могут пригласить
+    /// обратно и видят устаревший список участников.
+    /// Добавляет соседа в комнату по NodeID (heartbeat — сейчас).
+    ///
+    /// Нужно в момент входа: IrohSync придёт только после того, как мы сами
+    /// начнём рассылать свой, а рассылка и лечение соединений идут по списку
+    /// участников. Без записи вошедший не видит никого, хотя «в комнате».
+    fn register_peer(&self, node_id: &str) {
+        let Some(id) = crate::identity::my_id_from_node_id(node_id) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.room.update_peer(crate::types::Peer {
+            id,
+            address: node_id.to_string(),
+            is_host: false,
+            last_heartbeat: now,
+        });
+    }
+
+    pub fn announce_leave(&self) {
+        let members = self.room.get_all_addresses();
+        if members.is_empty() {
+            return;
+        }
+        let room_id = self.room_id().unwrap_or(0);
+        for member in members {
+            self.send_to(
+                &member,
+                crate::network::message::NetworkMessage::CallEnd {
+                    sender_id: self.my_id,
+                    room_id,
+                },
+            );
+        }
+    }
+
     pub fn unblock_peer(&self, peer: &str) {
         self.unblock(peer);
     }
@@ -1035,13 +1098,25 @@ mod tests {
     }
 
     /// Кладём участника в комнату так, как это делает IrohSync.
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Сосед в комнате, от которого только что был heartbeat.
     fn add_to_room(m: &CallManager, node_id: &str) {
+        add_to_room_at(m, node_id, now_ms());
+    }
+
+    fn add_to_room_at(m: &CallManager, node_id: &str, heartbeat: u64) {
         let id = crate::identity::my_id_from_node_id(node_id).expect("валидный NodeID");
         m.room.update_peer(Peer {
             id,
             address: node_id.to_string(),
             is_host: false,
-            last_heartbeat: 0,
+            last_heartbeat: heartbeat,
         });
     }
 
@@ -1121,6 +1196,17 @@ mod tests {
         add_to_room(&m, &a);
         assert!(!m.start_outgoing(&a, "Аня", "Я"));
         assert_eq!(m.take_notice().as_deref(), Some("Он уже в комнате"));
+    }
+
+    #[test]
+    fn stale_room_entry_does_not_block_invite() {
+        // Собеседник нажал «Выйти из эфира», а запись о нём ещё висит в списке:
+        // приглашение должно уйти, а не «он уже в комнате».
+        let a = node(0xAA);
+        let m = manager();
+        add_to_room_at(&m, &a, now_ms().saturating_sub(30_000));
+        assert!(m.start_outgoing(&a, "Аня", "Я"), "приглашение уходит");
+        assert_eq!(m.room.get_all_peers().len(), 0, "мёртвая запись убрана");
     }
 
     #[test]
@@ -1361,6 +1447,11 @@ mod tests {
         assert_ne!(new_room_id(1), new_room_id(2));
     }
 }
+
+
+
+
+
 
 
 
