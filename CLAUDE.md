@@ -110,7 +110,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/presence.rs` | `PresenceTracker`: кто из друзей недавно подавал признаки жизни (TTL 12 с) + фоновый ping-цикл раз в 4 с |
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
 | `src/diagnostics.rs` | `RxStats` (счётчики приёма голоса в атомиках), `LinkLine`/`OwnVideo`/`RemoteVideo`, `ReportInput` + `render()` — текст отчёта для панели «Диагностика» и «Скопировать отчёт» |
-| `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), переходы под одним замком, проверка `call_id` в Accept/Decline/Cancel/End, приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
+| `src/calls.rs` | `CallManager`: голосовая комната на N (Idle/Active с `room_id`, Incoming). Приглашение зовёт в текущую комнату, повторное приглашение второго/третьего не блокируется; `pending` — кому отправлено и кто ещё не ответил, переотправка и таймауты; отказ блокирует адресно; `RoomMembers` отдаёт новому участнику список остальных; тон звонит только пока в комнате никого нет |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
 | `src/audio.rs` | `UniversalAudioCapture`: CPAL capture/playback, линейный ресэмплер, per-peer mix bus. Вход пишет сэмплы своего устройства в слоты `txbus`, вывод кладёт в `echo_ref` опору AEC; Opus-энкодера и DSP в колбэке больше нет |
@@ -166,13 +166,14 @@ Integers are **little-endian**; text fields are `len u16 LE` + UTF-8 bytes.
 | 7 | `FriendAccept` | `sender_id` u64 LE, `node_id` str, `nick` str |
 | 8 | `FriendRemove` | `sender_id` u64 LE, `node_id` str |
 | 9 | `ChatMessage` | `sender_id` u64 LE, `text` str |
-| 10 | `CallInvite` | `sender_id` u64 LE, `call_id` u32 LE, `nick` str |
-| 11 | `CallAccept` | `sender_id` u64 LE, `call_id` u32 LE |
-| 12 | `CallDecline` | `sender_id` u64 LE, `call_id` u32 LE, `reason` u8 (0 отклонён / 1 занято / 2 таймаут) |
-| 13 | `CallCancel` | `sender_id` u64 LE, `call_id` u32 LE |
-| 14 | `CallEnd` | `sender_id` u64 LE, `call_id` u32 LE |
+| 10 | `CallInvite` | `sender_id` u64 LE, `room_id` u32 LE, `nick` str — приглашение в комнату |
+| 11 | `CallAccept` | `sender_id` u64 LE, `room_id` u32 LE — вошёл в комнату |
+| 12 | `CallDecline` | `sender_id` u64 LE, `room_id` u32 LE, `reason` u8 (0 отклонён / 1 занято / 2 таймаут) |
+| 13 | `CallCancel` | `sender_id` u64 LE, `room_id` u32 LE — приглашение отменено |
+| 14 | `CallEnd` | `sender_id` u64 LE, `room_id` u32 LE — участник вышел из комнаты |
 | 15 | `PresencePing` | `sender_id` u64 LE — «ты в сети?»; пинг живёт вне комнаты |
 | 16 | `PresencePong` | `sender_id` u64 LE — ответ на пинг |
+| 17 | `RoomMembers` | `sender_id` u64 LE, `room_id` u32 LE, `count` u16 LE, затем `count` × (`len` u16 LE + NodeID) — список комнаты новому участнику, чтобы mesh собрался целиком |
 
 Tags 1 (`JoinRequest`) and 2 (`PeerListUpdate`) were removed with the raw-UDP mesh.
 
@@ -429,40 +430,32 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
 - **`menu.rs` is dormant:** `handle_command` is defined and exported, but `main.rs`
   spawns no stdin-reader loop, so the `/mute`, `/vol`, `/mic`, `/devices` console
   commands are not currently reachable.
-- **Звонки (`src/calls.rs`):** «Позвонить» только шлёт `CallInvite`; в комнату
-  собеседник попадает после `CallAccept`. Миграции комнаты шлют `IrohSync` каждую
-  секунду и вычищают молчащих >12 с, поэтому согласие держится не состоянием, а
-  гейтом: `CallManager::is_blocked` отбрасывает `IrohSync`/`Heartbeat`/`AudioFrame`
-  от собеседника в состоянии Outgoing/Incoming (35/45 с), а отказ/таймаут/отмена/
-  завершение держат его вне комнаты `BLOCK_AFTER` = 1 час и дополнительно закрывают
-  QUIC-соединение (`disconnect_peer`) — 45 с хватало ровно до следующего `IrohSync`,
-  и завершённый звонок «возобновлялся» сам. Блок снимается явно: новым звонком
-  (`start_outgoing`/`accept_incoming`/`on_accept`), кнопкой «Войти» или «Выйти из
-  эфира». Свой отказ запоминается отдельно (`declined`, 45 с) и переживает блок:
-  другу после отказа можно позвонить снова, а повторы Invite ещё 45 с получают
-  `CallDecline`. Приглашение переотправляется раз в 1.5 с, `CallAccept` — трижды;
-  одновременный вызов с двух сторон разрешается автоответом на встречное
-  приглашение. Отклонение/«занято»/«не ответил» видны тостом; шапка звонка —
-  оверлей `draw_call_overlay` с крупной красной кнопкой «Завершить звонок»
-  («Отменить звонок» у исходящего), `Esc` делает то же самое. В активном
-  разговоре карточки-оверлея нет — только компактная пилюля в правом верхнем
-  углу (точка LIVE, ник, таймер, «Завершить»), она не закрывает трансляцию.
-  Карточка «Принять/Отклонить» раньше не исчезала после ответа: методы звонков
-  снимали фазу (`take_phase`) и клали её назад (`put_phase`), поэтому
-  устаревшая `Incoming` затирала только что установленную `Active`. Теперь все
-  переходы идут под одним замком, а `on_accept`/`on_decline`/`on_cancel`/`on_end`
-  дополнительно сверяют `call_id` — иначе запоздавший `Accept` прошлого звонка
-  поднимал новый. На входящем звонке
-  окно один раз запрашивает внимание панели задач
-  (`ViewportCommand::RequestUserAttention`), иначе свёрнутое приложение звонок
-  «просто не слышно». Тон звонка синтезируется в колбэке воспроизведения
-  (`mixer.ring_mode`: 1 — входящий, 2 — исходящий) после master gain и до
-  миксового лимитера, поэтому не зависит от громкости собеседников. Отдельная
-  причина «звонит у звонящего, у принимающего тишина» — `send_bytes`
-  раньше молча возвращал Ok при отсутствующем или мёртвом соединении: теперь он
-  выбрасывает закрытую запись (`Connection::close_reason`), переподключается и
-  повторяет, а если датаграм не прошёл — шлёт сообщение надёжным uni-стримом
-  (его читает `spawn_stream_receiver` рядом с приёмником датаграмм).
+- **Голосовая комната (`src/calls.rs`) — это и есть «звонок», на N человек.**
+  `Active { room_id, pending }` вместо пары «звонящий/принявший»: приглашение
+  зовёт в текущую комнату, поэтому второй и третий друг не получают «вы уже в
+  звонке», а приглашаются в ту же комнату; `pending` хранит, кому отправлено и
+  кто ещё не ответил (переотправка раз в 1.5 с, таймаут 35 с). `Incoming` —
+  мы приглашены и ещё не ответили; Enter входит, Esc отклоняет. Отказ блокирует
+  только этого узла (`blocked`/`declined`, адресно), а не комнату: один отказался
+  — остальные продолжают разговор, и комната закрывается только когда в ней
+  никого не осталось. «Завершить» = выйти из комнаты: остальные остаются друг у
+  друга, `room.leave()` не даёт `IrohSync` вернуть нас, соединения рвутся.
+  Два одновременных приглашения разрешаются переходом в комнату пригласившего
+  (свои приглашения отменяются — у них другой `room_id`).
+- **Новый участник узнаёт остальных из `RoomMembers` (тег 17).** Он соединён
+  только с пригласившим, а остальные о нём не знают — без списка комнаты mesh не
+  собирается, и человек слышит одного из трёх. Пригласивший в ответ на
+  `CallAccept` отправляет список NodeID, получатель дотягивается до каждого;
+  список принимается только если `room_id` совпадает с нашей комнатой (его знают
+  лишь приглашённые). Дальше mesh достраивается обычным `IrohSync`.
+- **Потерянный кадр голоса восстанавливается FEC/PLC, а не повтором.** Повтор
+  последнего кадра — это и есть «робот»: одна и та же волна дважды. `txbus`
+  включает `use_inband_fec` и `packet_loss_perc = 8` (Opus кладёт копию
+  предыдущего кадра в следующий пакет, SILK/hybrid). На приёме дырка в `seq`
+  закрывается `decode_fec(следующий_пакет)`, затем PLC (`decode(&[])` —
+  продолжение тона и спектра), и только если декодер ещё ничего не слышал —
+  затухающий повтор. Восстановленные FEC кадры видны в диагностике отдельным
+  счётчиком (`RxStats::fec`).
 - **«Выйти из эфира» (`RoomManager::leave`):** красная кнопка в секции «Комната»
   (видна, когда в комнате есть собеседники) завершает/отменяет/отклоняет звонок,
   очищает участников, ставит флаг `left` и рвёт все QUIC-соединения
@@ -573,10 +566,9 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   `create_playback_stream` used to feed all senders through one `OpusDecoder`;
   Opus is stateful (SILK/CELT), so interleaving two people's packets corrupted
   that state and the speech turned "robotic" as soon as a second voice joined.
-  The receive state is now a per-sender `Peer` struct in `audio.rs`. Gaps are
-  concealed by repeating the sender's last frame with a fade (up to 3 frames =
-  60 ms), the prebuffer is 60 ms, and an overflowing jitter buffer is trimmed to
-  80 ms out of 200 ms. A sender that restarts (seq back to 0) is re-armed on its
+  The receive state is now a per-sender `Peer` struct in `audio.rs`. Gaps up to
+  3 frames (60 ms) are restored by FEC/PLC (see below), the prebuffer is 60 ms, and
+  an overflowing jitter buffer is trimmed to 80 ms out of 200 ms. A sender that restarts (seq back to 0) is re-armed on its
   own after ~25 consecutive "stale" packets, so it stays audible while others
   talk. Every 10 s the callback prints reception counters (buffer underruns,
   concealed frames, stream restarts, burst drops) — that log is what tells which
@@ -723,3 +715,6 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
 - `Cargo.lock` is committed and must stay committed (binary app — do **not** gitignore it).
+
+
+
