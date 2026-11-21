@@ -50,6 +50,9 @@ pub struct AppConfig {
     pub rx_limiter: Option<bool>,
     /// Битрейт Opus на передачу (64 000 / 96 000 / 128 000), по умолчанию 64k.
     pub opus_bitrate: Option<u32>,
+    /// Закрытие окна сворачивает приложение в трей, а не завершает его.
+    /// Ключа нет в старых файлах — считается включённым.
+    pub close_to_tray: Option<bool>,
     pub peer_volumes: HashMap<u64, u32>,
 }
 
@@ -148,6 +151,7 @@ impl AppConfig {
                 "rx_limiter" => cfg.rx_limiter = value.parse().ok(),
                 // Битрейт — только из допустимого набора: промежуточное значение
                 // просто округлится при загрузке в микшер, но хранить мусор незачем.
+                "close_to_tray" => cfg.close_to_tray = value.parse().ok(),
                 "opus_bitrate" => cfg.opus_bitrate = value.parse().ok().filter(|v| {
                     crate::mixer::OPUS_BITRATES.contains(v)
                 }),
@@ -223,6 +227,9 @@ impl AppConfig {
         }
         if let Some(value) = self.tx_limiter {
             out.push_str(&format!("tx_limiter={}\n", value));
+        }
+        if let Some(value) = self.close_to_tray {
+            out.push_str(&format!("close_to_tray={}\n", value));
         }
         if let Some(value) = self.rx_limiter {
             out.push_str(&format!("rx_limiter={}\n", value));

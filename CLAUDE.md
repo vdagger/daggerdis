@@ -108,6 +108,8 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/identity.rs` | Pinned iroh `SecretKey` (`secret.key`), `my_id` = FNV-1a hash of NodeID, reset |
 | `src/friends.rs` | `FriendsManager`: `friends.json` (node_id/name/date), incoming/outgoing requests |
 | `src/presence.rs` | `PresenceTracker`: кто из друзей недавно подавал признаки жизни (TTL 12 с) + фоновый ping-цикл раз в 4 с |
+| `src/tray.rs` | Иконка в трее (свой поток, скрытое окно, меню «Открыть»/«Выйти») и всплывающие уведомления Windows; связи с GUI — атомики + HWND главного окна |
+| `src/autostart.rs` | Автозапуск при входе в Windows: ключ `Run` в HKCU через `reg.exe`, сверка пути, чтобы старая запись не считалась своей |
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
 | `src/diagnostics.rs` | `RxStats` (счётчики приёма голоса в атомиках), `LinkLine`/`OwnVideo`/`RemoteVideo`, `ReportInput` + `render()` — текст отчёта для панели «Диагностика» и «Скопировать отчёт» |
 | `src/calls.rs` | `CallManager`: голосовая комната на N (Idle/Active с `room_id`, Incoming). Приглашение зовёт в текущую комнату, повторное приглашение второго/третьего не блокируется; `pending` — кому отправлено и кто ещё не ответил, переотправка и таймауты; отказ блокирует адресно; `RoomMembers` отдаёт новому участнику список остальных; тон звонит только пока в комнате никого нет |
@@ -514,12 +516,12 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   control against 30 fps — at 60 fps the stream came out twice the requested
   bitrate. `win_mf::mean_bitrate_for()` compensates with `30/fps` for MFTs whose
   friendly name contains "amd"; re-check when the NVIDIA MFT is selected instead.
-- **NVIDIA MFT outside a user session:** `ActivateObject` fails with
-  `E_UNEXPECTED` (0x8000FFFF) in a non-interactive SSH session; AMF activates
-  fine. Encoder checks must run interactively.
-- **DXGI capture needs an interactive desktop.** Over SSH `ScreenCapture::new`
-  returns "не найден экран"; use `tools/video_probe --capture` in the user's
-  session (it reports the adapter and effective fps).
+- **NVIDIA MFT outside a user session:** `ActivateObject` отдаёт
+  `E_UNEXPECTED` в неинтерактивной сессии (AMF активируется) — энкодеры
+  проверять только интерактивно.
+- **DXGI capture needs an interactive desktop.** По SSH `ScreenCapture::new`
+  отвечает «не найден экран»; проверять `tools/video_probe --capture` в сессии
+  пользователя.
 - **A fresh output sample per `ProcessOutput` call:** `win_decode.rs` and
   `win_mf.rs` allocate a new `IMFSample` for every call. Reusing one persistent
   sample makes the Microsoft H.264 decoder fail every frame with
@@ -642,15 +644,12 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   comb filtering smears the voice. Candidates are now sorted by channel count
   (f32 before i16, then fewer channels), and the callback writes only the
   first two channels (`active_channels = channels.min(2)`), leaving the rest
-  silent. Feeding LFE/center/surround with a copy of the front pair is never
-  what a plain stereo signal should do.
-- **Razer's virtual "7.1 Surround Sound" endpoint mangles `f32`.** This is a
-  known cpal problem ([RustAudio/cpal#892](https://github.com/RustAudio/cpal/issues/892)):
-  every cpal app (rodio, kira, Bevy) plays heavily distorted sound on that
-  device while other outputs are clean, and the same stream in `i32` plays fine. So `i32` is a candidate
-  format too, and on endpoints with more than two channels it is tried before
-  `f32`; stereo endpoints keep `f32` first. The order is printed per attempt
-  (`формат … не подошёл`), so the log shows which format the device did accept.
+  silent: LFE/центр/тыл копией фронта не кормим.
+- **Razer's virtual "7.1 Surround Sound" endpoint mangles `f32`.** Известный
+  баг cpal ([RustAudio/cpal#892](https://github.com/RustAudio/cpal/issues/892)):
+  любой cpal-звук на нём искажён, а `i32` играет чисто. Поэтому `i32` тоже
+  кандидат, и на многоканальных выходах он пробуется раньше `f32`; порядок
+  печатается по попыткам (`формат … не подошёл`).
 - **A silent "nothing plays" must be visible in the console.** a failed stream is
   printed (`[ОШИБКА] Динамики/Микрофон не открылись: …`), not swallowed by `if let Ok`.
 - **Build stamp for stale copies:** `build.rs` exports `ALBUS_BUILD_STAMP` (the
@@ -693,13 +692,10 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   growth both during a stream and across broadcast start/stop cycles (the
   driver frees it late). `win_d3d.rs` now `ManuallyDrop::take`s it on every
   `Blt` outcome. Headless check: `tools/video_probe/src/bin/cycles.rs`.
-- **Probe crate:** `tools/video_probe` is a separate package because `build.rs`
-  link args (the requireAdministrator manifest) leak into examples and such a
-  process cannot start in an SSH session. Build with
-  `cargo build --release --manifest-path tools/video_probe/Cargo.toml
-  --target-dir target` and `ALBUS_NO_ADMIN_MANIFEST=1` (build.rs skips the
-  manifest when that variable is set). Its `Cargo.lock` is a copy of the root
-  one and is gitignored.
+- **Probe crate:** `tools/video_probe` — отдельный пакет: манифест
+  requireAdministrator из `build.rs` ломает запуск example-процессов.
+  Собирать с `--manifest-path tools/video_probe/Cargo.toml --target-dir target`
+  и `ALBUS_NO_ADMIN_MANIFEST=1`; его `Cargo.lock` — копия корневого, в gitignore.
   `src/bin/cycles.rs` — поиск утечек старт/стоп: создаёт и роняет ровно то, что
   живёт между «Начать трансляцию» и «Остановить», и печатает память после
   каждого круга. Флаги `--enc/--dec/--gpu/--dev/--tex/--conv` оставляют одну

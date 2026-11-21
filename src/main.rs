@@ -344,6 +344,9 @@ fn main() {
 
     let _guard = rt.enter();
     let _runtime_guard = rt;
+    // Иконка в трее: окно можно закрыть, а рация продолжает работать.
+    albus::tray::init();
+
     let result = eframe::run_native(
         "Albus Audio",
         native_options,

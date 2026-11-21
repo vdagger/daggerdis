@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod autostart;
 pub mod calls;
 pub mod chat;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod mixer;
 pub mod network;
 pub mod presence;
 pub mod room;
+pub mod tray;
 pub mod txbus;
 pub mod types;
 pub mod video;

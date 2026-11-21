@@ -150,7 +150,10 @@ public static class AlbusWin {
 function Get-AlbusWindows {
     foreach ($pr in @(Get-Process albus -ErrorAction SilentlyContinue)) {
         foreach ($h in [AlbusWin]::WindowsOf([uint32]$pr.Id)) {
-            [pscustomobject]@{ Hwnd = $h; Pid = $pr.Id; Title = [AlbusWin]::TitleOf($h) }
+            $title = [AlbusWin]::TitleOf($h)
+            # Служебное окно трея не должно попадать в цели кликов и съёмки.
+            if ($title -eq 'Albus') { continue }
+            [pscustomobject]@{ Hwnd = $h; Pid = $pr.Id; Title = $title }
         }
     }
 }

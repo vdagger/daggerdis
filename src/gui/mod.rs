@@ -93,6 +93,12 @@ pub struct RadioApp {
     seen_unread: std::collections::HashMap<String, usize>,
     /// Окно уже мигнуло в панели задач за текущий входящий звонок.
     call_attention: bool,
+    /// Выход через меню трея: закрытие окна больше не перехватываем.
+    tray_quit: bool,
+    /// Окно спрятано в трей — нужно, чтобы опрашивать команды иконки.
+    hidden_to_tray: bool,
+    /// Автозапуск при входе в Windows (кэш: reg.exe не дёргаем каждый кадр).
+    autostart_on: bool,
     my_node_id: String,
     network_error: Option<String>,
     nick: String,
@@ -224,6 +230,9 @@ impl RadioApp {
             chat_error: Arc::new(std::sync::Mutex::new(None)),
             seen_unread: std::collections::HashMap::new(),
             call_attention: false,
+            tray_quit: false,
+            hidden_to_tray: false,
+            autostart_on: crate::autostart::is_enabled(),
             my_node_id,
             network_error,
             nick,
@@ -523,6 +532,8 @@ impl RadioApp {
             )
         };
         self.title_dark = res.is_ok();
+        // Трею нужен HWND, чтобы показывать окно, пока сам GUI спит.
+        crate::tray::set_main_window(w.hwnd.get() as isize);
     }
 
     fn show_toast(&mut self, text: &str) {
@@ -820,15 +831,58 @@ impl eframe::App for RadioApp {
 
         // Входящий звонок: подсветить приложение в панели задач, если оно
         // свёрнуто или закрыто другим окном, — иначе звонок пропускают.
-        if matches!(self.calls.view(), crate::calls::CallView::Incoming { .. }) {
+        let incoming = match self.calls.view() {
+            crate::calls::CallView::Incoming { nick, .. } => Some(nick),
+            _ => None,
+        };
+        if let Some(nick) = incoming {
             if !self.call_attention {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                     egui::UserAttentionType::Critical,
                 ));
                 self.call_attention = true;
+                // Окно может быть свёрнуто в трей: без уведомления звонок
+                // просто не заметят — подсветка панели задач его не заменит.
+                #[cfg(windows)]
+                crate::tray::notify("Входящий звонок", &format!("{nick} зовёт в эфир"));
             }
         } else {
             self.call_attention = false;
+        }
+
+        // Трей: «крестик» прячет окно, а не закрывает приложение — рация должна
+        // принимать звонки, пока окна нет. Выйти можно из меню иконки.
+        #[cfg(windows)]
+        {
+            if crate::tray::take_quit() {
+                self.tray_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if crate::tray::take_show() {
+                self.hidden_to_tray = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            let root = ctx.viewport_id() == egui::ViewportId::ROOT;
+            let wants_close =
+                root && !self.tray_quit && ctx.input(|i| i.viewport().close_requested());
+            if wants_close && self.config.close_to_tray.unwrap_or(true) {
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    self.hidden_to_tray = true;
+                    crate::tray::notify(
+                        "Albus свёрнут в трей",
+                        "Приложение работает: эфир и звонки продолжаются",
+                    );
+                }
+            }
+            if self.hidden_to_tray {
+                // Скрытое окно просыпается только по запросу: без этого опроса
+                // команда из меню иконки ждала бы следующего события.
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
         }
 
         #[cfg(windows)]
@@ -2003,6 +2057,58 @@ impl RadioApp {
                                 ui.label(
                                     egui::RichText::new(
                                         "Буфер зрителя: сеть успевает отдать отставший кадр. 0 — показывать сразу.",
+                                    )
+                                    .size(8.5)
+                                    .color(t::TEXT_MUTED),
+                                );
+
+                                ui.add_space(14.0);
+                                t::divider(ui);
+                                ui.add_space(8.0);
+
+                                t::section_label(ui, "СИСТЕМА");
+                                ui.add_space(4.0);
+                                let mut close_to_tray =
+                                    self.config.close_to_tray.unwrap_or(true);
+                                if ui
+                                    .checkbox(
+                                        &mut close_to_tray,
+                                        egui::RichText::new(
+                                            "Закрывать в трей, не выходя из эфира",
+                                        )
+                                        .size(10.5)
+                                        .color(t::TEXT_MUTED),
+                                    )
+                                    .changed()
+                                {
+                                    self.config.close_to_tray = Some(close_to_tray);
+                                    self.pending_save = true;
+                                }
+                                ui.add_space(4.0);
+                                let mut autostart = self.autostart_on;
+                                if ui
+                                    .checkbox(
+                                        &mut autostart,
+                                        egui::RichText::new("Запускать при входе в Windows")
+                                            .size(10.5)
+                                            .color(t::TEXT_MUTED),
+                                    )
+                                    .changed()
+                                {
+                                    if crate::autostart::set_enabled(autostart) {
+                                        self.autostart_on = autostart;
+                                        self.show_toast(if autostart {
+                                            "Автозапуск включён"
+                                        } else {
+                                            "Автозапуск выключен"
+                                        });
+                                    } else {
+                                        self.show_toast("Не удалось изменить автозапуск");
+                                    }
+                                }
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Трей: двойной клик по иконке открывает окно, меню — выход.",
                                     )
                                     .size(8.5)
                                     .color(t::TEXT_MUTED),
