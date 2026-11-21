@@ -137,6 +137,17 @@ impl ScreenCapture {
         }
     }
 
+    /// Ограничивает область кадра (трансляция окна): вырезаем его
+    /// прямоугольник из кадра рабочего стола до масштабирования.
+    pub fn set_source_rect(&mut self, rect: Option<(i32, i32, u32, u32)>) {
+        self.converter.set_source_rect(rect);
+    }
+
+    /// Размер кадра рабочего стола до обрезки.
+    pub fn desktop_size(&self) -> (u32, u32) {
+        (self.source_width, self.source_height)
+    }
+
     pub fn dimensions(&self) -> (u32, u32) {
         (self.out_width, self.out_height)
     }

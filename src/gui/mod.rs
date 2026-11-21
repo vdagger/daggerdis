@@ -124,6 +124,12 @@ pub struct RadioApp {
     video_fullscreen: bool,
     #[cfg(windows)]
     video_window: bool,
+    /// Что транслируем: `None` — весь экран, иначе окно (hwnd) и его имя.
+    #[cfg(windows)]
+    pub(crate) capture_window: Option<(isize, String)>,
+    /// Список окон для выбора источника, читается при открытии списка.
+    #[cfg(windows)]
+    pub(crate) capture_windows: Vec<crate::video::win_windows::WindowInfo>,
     #[cfg(windows)]
     remote: Option<video_session::RemoteView>,
     /// Счётчик сбросов очереди зрителя на прошлом кадре: сменился — прошлую
@@ -258,6 +264,10 @@ impl RadioApp {
             video_fullscreen: false,
             #[cfg(windows)]
             video_window: false,
+            #[cfg(windows)]
+            capture_window: None,
+            #[cfg(windows)]
+            capture_windows: Vec::new(),
             #[cfg(windows)]
             remote: None,
             #[cfg(windows)]

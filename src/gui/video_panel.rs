@@ -379,6 +379,58 @@ impl RadioApp {
                                 .color(t::TEXT_MUTED),
                         );
 
+                        ui.add_space(4.0);
+
+                        // Источник: весь экран или одно окно. Окно
+                        // транслируется как область кадра — без чужих
+                        // пикселей и без лишнего битрейта.
+                        if !running {
+                            let current = self
+                                .capture_window
+                                .as_ref()
+                                .map(|(_, title)| short_title(title))
+                                .unwrap_or_else(|| "Весь экран".to_string());
+                            egui::ComboBox::new("capture_source", "")
+                                .width(170.0)
+                                .selected_text(egui::RichText::new(current).size(9.0))
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(self.capture_window.is_none(), "Весь экран")
+                                        .clicked()
+                                    {
+                                        self.capture_window = None;
+                                    }
+                                    if self.capture_windows.is_empty() {
+                                        self.capture_windows =
+                                            crate::video::win_windows::list_windows();
+                                    }
+                                    for w in &self.capture_windows {
+                                        let selected = self
+                                            .capture_window
+                                            .as_ref()
+                                            .map(|(hwnd, _)| *hwnd == w.hwnd)
+                                            .unwrap_or(false);
+                                        if ui
+                                            .selectable_label(
+                                                selected,
+                                                egui::RichText::new(short_title(&w.title)).size(9.0),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.capture_window =
+                                                Some((w.hwnd, w.title.clone()));
+                                        }
+                                    }
+                                });
+                            if ui
+                                .small_button("↻")
+                                .on_hover_text("Обновить список окон")
+                                .clicked()
+                            {
+                                self.capture_windows = crate::video::win_windows::list_windows();
+                            }
+                        }
+
                         ui.add_space(6.0);
 
                         ui.horizontal(|ui| {
@@ -395,7 +447,10 @@ impl RadioApp {
                                         Some(30) => 30,
                                         _ => 60,
                                     };
-                                    match video_session::VideoSession::start(fps) {
+                                    match video_session::VideoSession::start(
+                                        fps,
+                                        self.capture_window.as_ref().map(|(hwnd, _)| *hwnd),
+                                    ) {
                                         Ok(v) => {
                                             // Адаптация битрейта: потери канала
                                             // feed будут опускать целевой
@@ -485,5 +540,17 @@ impl RadioApp {
                 self.mixer.set_ch2_volume(guitar);
                 self.mixer.set_output_volume(peers);
             });
+    }
+}
+
+/// Заголовок окна в одну строку: списку виджетов длинные заголовки мешают.
+fn short_title(title: &str) -> String {
+    let clean = title.replace(['\n', '\r', '\t'], " ");
+    let clean = clean.trim();
+    if clean.chars().count() > 26 {
+        let head: String = clean.chars().take(25).collect();
+        format!("{head}…")
+    } else {
+        clean.to_string()
     }
 }

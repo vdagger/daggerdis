@@ -260,8 +260,9 @@ impl VideoSession {
         self.publisher.bitrate_base
     }
 
-    pub fn start(fps: u32) -> Result<Self, String> {
-        let publisher = ScreenPublisher::start(fps)?;
+    /// `window` — транслировать окно вместо всего экрана.
+    pub fn start(fps: u32, window: Option<isize>) -> Result<Self, String> {
+        let publisher = ScreenPublisher::start(fps, window)?;
         // превью — в половинном разрешении: на экране оно всё равно мелкое,
         // а полный 1080p readback не даёт держать 60 кадров в секунду
         let renderer = Renderer::new(&publisher.info, 2)?;

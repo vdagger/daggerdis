@@ -143,6 +143,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/video/win_d3d.rs` | D3D11 device + `ID3D11VideoProcessor` BGRA↔NV12 conversion/scaling, staging readback |
 | `src/video/win_mf.rs` | Async hardware H.264 MFT encoder (NVENC/AMF/QSV), CBR/GOP via `ICodecAPI` |
 | `src/video/win_decode.rs` | H.264 decoder MFT — both async and sync paths; NV12 repack 1088→1080 |
+| `src/video/win_windows.rs` | Список окон для трансляции окна (`EnumWindows`, рамка без тени) + `clamp_rect`: пересечение с экраном и чётные размеры |
 | `src/video/publisher.rs` | `video-publisher` thread: capture at the chosen fps (30/60) → NV12 → encode → mpsc of `EncodedUnit`; `encode_fps` counter for diagnostics |
 | `src/network/video_directory.rs` | `VideoDirectory`: номер своей трансляции (`my_gen`) + анонсы соседей из IrohSync (`video_gen`), TTL 5 с; общая для миграции, сервиса приёма и видео |
 | `src/network/video_link.rs` | `discordrf-video/1`: контроль `kind=2/3/4/5` (подписка, ответ, feed издателя, релей-подписка) в первом bi-стриме, окно недавних кадров и relay под одним замком (180 / 64 МиБ, отдача с последнего ключевого), релей хоста без ре-энкода, маршрутизация зрителя, очередь зрителя со сдвигом показа на буфер |
@@ -511,14 +512,13 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   секунду смотрит потери своего feed-канала и опускает/поднимает его
   (`watch_feed_bitrate`; вниз 15 % при потерях > 0.5 %, вверх 10 % потолка
   после 5 чистых секунд, пол — четверть пресета), энкодер принимает значение
-  на ходу.
+  на ходу. Источник — весь экран или одно окно: прямоугольник окна вырезается
+  из кадра стола через `VideoProcessorSetStreamSourceRect`, поэтому захват идёт
+  в размер окна; перекрытое окно попадёт в кадр с перекрытием (WGC ещё нет).
 - **AMF encoder quirk:** the AMD MFT ignores `MF_MT_FRAME_RATE` and computes rate
   control against 30 fps — at 60 fps the stream came out twice the requested
   bitrate. `win_mf::mean_bitrate_for()` compensates with `30/fps` for MFTs whose
   friendly name contains "amd"; re-check when the NVIDIA MFT is selected instead.
-- **NVIDIA MFT outside a user session:** `ActivateObject` отдаёт
-  `E_UNEXPECTED` в неинтерактивной сессии (AMF активируется) — энкодеры
-  проверять только интерактивно.
 - **DXGI capture needs an interactive desktop.** По SSH `ScreenCapture::new`
   отвечает «не найден экран»; проверять `tools/video_probe --capture` в сессии
   пользователя.
@@ -689,12 +689,9 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   kept a frame-sized allocation per call (~3 MB at 1080p), which showed up as
   growth both during a stream and across broadcast start/stop cycles (the
   driver frees it late). `win_d3d.rs` now `ManuallyDrop::take`s it on every
-  `Blt` outcome. Headless check: `tools/video_probe/src/bin/cycles.rs`.
-- **Probe crate:** `tools/video_probe` — отдельный пакет (манифест админа ломает
-  example-процессы): `ALBUS_NO_ADMIN_MANIFEST=1`, свой `Cargo.lock` в gitignore.
-- **Video window:** своё превью и чужие потоки — в отдельном окне «Albus —
-  трансляция» (растягивается, есть полноэкранный режим; чужой поток открывает
-  его сам). Своё превью на том же мониторе подкармливает захват — это норма.
+  `Blt` outcome. Проверка утечек: `tools/video_probe` (`ALBUS_NO_ADMIN_MANIFEST=1`).
+- **Video window:** превью и чужие потоки — в окне «Albus — трансляция».
+  Превью на своём мониторе подкармливает захват — норма.
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
 - `Cargo.lock` is committed and must stay committed (binary app — do **not** gitignore it).

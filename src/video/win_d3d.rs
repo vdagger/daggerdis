@@ -5,7 +5,7 @@
 //! забирает готовый кадр из staging-текстуры.
 
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -87,6 +87,9 @@ pub struct Converter {
     width: u32,
     height: u32,
     layout: Layout,
+    /// Откуда брать кадр: прямоугольник в исходной текстуре (захват окна).
+    /// `None` — вся текстура.
+    source_rect: Option<(i32, i32, u32, u32)>,
 }
 
 impl Converter {
@@ -184,12 +187,19 @@ impl Converter {
                 width: dst_w,
                 height: dst_h,
                 layout: Layout::of(dst_format)?,
+                source_rect: None,
             })
         }
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+
+    /// Ограничивает область источника (захват окна, а не всего экрана).
+    /// Координаты — в пикселях исходной текстуры; `None` — вся текстура.
+    pub fn set_source_rect(&mut self, rect: Option<(i32, i32, u32, u32)>) {
+        self.source_rect = rect;
     }
 
     /// Кадр GPU → целевая текстура (без чтения в память).
@@ -222,6 +232,24 @@ impl Converter {
                 Enable: windows::core::BOOL(1),
                 ..Default::default()
             };
+            match self.source_rect {
+                Some((x, y, w, h)) => {
+                    let rect = RECT {
+                        left: x,
+                        top: y,
+                        right: x + w as i32,
+                        bottom: y + h as i32,
+                    };
+                    self.video_context
+                        .VideoProcessorSetStreamSourceRect(&self.processor, 0, true, Some(&rect));
+                }
+                None => self.video_context.VideoProcessorSetStreamSourceRect(
+                    &self.processor,
+                    0,
+                    false,
+                    None,
+                ),
+            }
             stream.pInputSurface = std::mem::ManuallyDrop::new(Some(in_view));
             let result = self.video_context.VideoProcessorBlt(
                 &self.processor,

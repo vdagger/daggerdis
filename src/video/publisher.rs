@@ -34,7 +34,9 @@ pub struct ScreenPublisher {
 }
 
 impl ScreenPublisher {
-    pub fn start(fps: u32) -> Result<Self, String> {
+    /// `window` — окно, которое транслируем вместо всего экрана: его
+    /// прямоугольник вырезается из кадра рабочего стола.
+    pub fn start(fps: u32, window: Option<isize>) -> Result<Self, String> {
         let (init_tx, init_rx) = channel::<Result<(StreamInfo, String, u32), String>>();
         let (frame_tx, frame_rx) = channel::<EncodedUnit>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -52,6 +54,7 @@ impl ScreenPublisher {
                 if let Err(e) = run(
                     &stop_thread,
                     fps,
+                    window,
                     &frame_tx,
                     &init_tx,
                     &encode_fps_thread,
@@ -94,9 +97,11 @@ impl Drop for ScreenPublisher {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     stop: &AtomicBool,
     fps: u32,
+    window: Option<isize>,
     tx: &Sender<EncodedUnit>,
     init: &Sender<Result<(StreamInfo, String, u32), String>>,
     encode_fps: &AtomicU32,
@@ -112,7 +117,29 @@ fn run(
         }
     };
 
-    let (w, h) = capture.dimensions();
+    // Трансляция окна: режем кадр рабочего стола его прямоугольником, тогда
+    // захват идёт в размер окна (без масштаба и без чужих пикселей).
+    let mut window_label = String::new();
+    let (w, h) = match window {
+        Some(hwnd) => {
+            let desktop = capture.desktop_size();
+            let rect = crate::video::win_windows::window_rect(hwnd)
+                .and_then(|r| crate::video::win_windows::clamp_rect(r, desktop));
+            match rect {
+                Some((x, y, rw, rh)) => {
+                    capture.set_source_rect(Some((x, y, rw, rh)));
+                    window_label = format!("окно {rw}x{rh}");
+                    (rw, rh)
+                }
+                None => {
+                    let e = "окно не видно на экране (свёрнуто или уведено за край)";
+                    let _ = init.send(Err(e.to_string()));
+                    return Err(e.to_string());
+                }
+            }
+        }
+        None => capture.dimensions(),
+    };
     let target = VideoTarget::new(w, h, fps, VideoPreset::default_for(w, h));
     let mut encoder = match MfEncoder::new(&target) {
         Ok(e) => e,
@@ -128,10 +155,17 @@ fn run(
         fps: target.fps,
         sequence_header: encoder.sequence_header.clone(),
     };
-    let source = format!(
-        "{} {}x{} → {}x{}",
-        capture.adapter_name, capture.source_width, capture.source_height, target.width, target.height
-    );
+    let source = if window_label.is_empty() {
+        format!(
+            "{} {}x{} → {}x{}",
+            capture.adapter_name, capture.source_width, capture.source_height, target.width, target.height
+        )
+    } else {
+        format!(
+            "{} {window_label} → {}x{}",
+            capture.adapter_name, target.width, target.height
+        )
+    };
     let base_bitrate = target.bitrate_bps;
     let _ = init.send(Ok((info, source, base_bitrate)));
     // Какой битрейт сейчас стоит у энкодера: меняем только при отличии.

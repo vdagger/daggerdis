@@ -22,6 +22,7 @@ pub mod win_decode;
 pub mod win_dxgi;
 #[cfg(windows)]
 pub mod win_mf;
+pub mod win_windows;
 
 /// Пресет качества.
 ///
