@@ -57,6 +57,8 @@ pub struct RadioApp {
     theme_configured: bool,
     settings_open: bool,
     chat_open: bool,
+    /// В чате открыта вкладка «Комната», а не переписка с другом.
+    chat_room: bool,
     /// Панель «Диагностика»: числа и «Скопировать отчёт».
     diag_open: bool,
     /// Общая точка диагностики: счётчики приёма голоса пишет аудиоколбэк.
@@ -73,6 +75,8 @@ pub struct RadioApp {
     config: crate::config::AppConfig,
     friends: Arc<crate::friends::FriendsManager>,
     chat_log: Arc<crate::chat::ChatLog>,
+    /// Общий чат комнаты: сообщение видят все в эфире, а не один друг.
+    room_chat: Arc<crate::chat::RoomChat>,
     calls: Arc<crate::calls::CallManager>,
     /// Кто из друзей недавно подавал признаки жизни (ping/pong).
     presence: Arc<crate::presence::PresenceTracker>,
@@ -143,6 +147,7 @@ impl RadioApp {
         config: crate::config::AppConfig,
         friends: Arc<crate::friends::FriendsManager>,
         chat_log: Arc<crate::chat::ChatLog>,
+        room_chat: Arc<crate::chat::RoomChat>,
         my_node_id: String,
         network_error: Option<String>,
         calls: Arc<crate::calls::CallManager>,
@@ -198,6 +203,7 @@ impl RadioApp {
             theme_configured: false,
             settings_open: false,
             chat_open: false,
+            chat_room: false,
             diag_open: false,
             diagnostics: diagnostics.clone(),
             diag_prev: (diagnostics.rx.snapshot(), Instant::now()),
@@ -209,6 +215,7 @@ impl RadioApp {
             config,
             friends,
             chat_log,
+            room_chat,
             calls,
             presence,
             active_chat: None,
@@ -715,18 +722,25 @@ impl RadioApp {
     }
 
     fn unread_total(&self) -> usize {
-        self.friends
+        let dm: usize = self
+            .friends
             .friends()
             .iter()
             .map(|f| self.chat_log.unread(&f.node_id))
-            .sum()
+            .sum();
+        dm + self.room_chat.unread()
     }
 
     fn open_chat(&mut self) {
         if self.active_chat.is_none() {
             self.active_chat = self.friends.friends().first().map(|f| f.node_id.clone());
         }
-        self.chat_open = self.active_chat.is_some();
+        // Друзей может не быть вовсе, а эфир — быть: тогда чат открывается
+        // сразу на комнате, иначе кнопка «Чат» выглядела бы сломанной.
+        if self.active_chat.is_none() && !self.room.get_all_peers().is_empty() {
+            self.chat_room = true;
+        }
+        self.chat_open = self.active_chat.is_some() || self.chat_room;
         self.settings_open = false;
     }
 }
@@ -2076,10 +2090,29 @@ impl RadioApp {
     }
 
     fn draw_chat_overlay(&mut self, ctx: &egui::Context) {
-        let Some(node_id) = self.active_chat.clone() else {
-            self.chat_open = false;
+        if !self.chat_open {
             return;
+        }
+        let room_alive = !self.room.get_all_peers().is_empty() && !self.room.is_left();
+        // Вкладка «Комната» при пустом эфире бессмысленна: назад в личку.
+        if self.chat_room && !room_alive && self.active_chat.is_some() {
+            self.chat_room = false;
+        }
+        let node_id = if self.chat_room {
+            String::new()
+        } else {
+            match self.active_chat.clone() {
+                Some(id) => id,
+                None => {
+                    self.chat_open = false;
+                    return;
+                }
+            }
         };
+        let show_room = self.chat_room;
+        let room_unread = self.room_chat.unread();
+        let room_id = self.calls.room_id().unwrap_or(0);
+        let mut want_room: Option<bool> = None;
         let screen = ctx.screen_rect();
         let mut close = false;
 
@@ -2120,25 +2153,82 @@ impl RadioApp {
                     .show(ui, |ui| {
                         ui.set_width(width - 28.0);
                         ui.set_height(height - 24.0);
-                        crate::widgets::chat_panel::draw_chat_panel(
-                            ui,
-                            &self.chat_log,
-                            &self.friends,
-                            &node_id,
-                            &mut self.chat_input,
-                            self.iroh.clone(),
-                            self.my_id,
-                            &mut close,
-                            &self.chat_error,
-                            &self.presence,
-                        );
+                        // Вкладки: личка другу и общий чат комнаты. Без них
+                        // «Чат» открывал только переписку, и написать в эфир
+                        // было нечем.
+                        ui.horizontal(|ui| {
+                            if t::chip_button(ui, "Личка", !show_room).clicked() {
+                                want_room = Some(false);
+                            }
+                            let label = if room_unread > 0 {
+                                format!("Комната · {room_unread}")
+                            } else {
+                                "Комната".to_string()
+                            };
+                            let resp = t::chip_button(ui, &label, show_room);
+                            if resp.clicked() && room_alive {
+                                want_room = Some(true);
+                            }
+                            if !room_alive {
+                                resp.on_hover_text("В эфире никого нет");
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if t::icon_button(ui, t::Icon::Close, 24.0, false)
+                                    .on_hover_text("Закрыть")
+                                    .clicked()
+                                {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                        t::divider(ui);
+                        ui.add_space(3.0);
+                        if show_room {
+                            crate::widgets::chat_panel::draw_room_chat_panel(
+                                ui,
+                                &self.room_chat,
+                                &self.nick,
+                                self.my_id,
+                                &self.room,
+                                room_id,
+                                self.iroh.clone(),
+                                &mut self.chat_input,
+                                &mut close,
+                                &self.chat_error,
+                            );
+                        } else {
+                            crate::widgets::chat_panel::draw_chat_panel(
+                                ui,
+                                &self.chat_log,
+                                &self.friends,
+                                &node_id,
+                                &mut self.chat_input,
+                                self.iroh.clone(),
+                                self.my_id,
+                                &mut close,
+                                &self.chat_error,
+                                &self.presence,
+                            );
+                        }
                     });
             });
 
+        if let Some(room) = want_room {
+            if self.chat_room != room {
+                self.chat_input.clear();
+            }
+            self.chat_room = room;
+        }
+
         // Открытый чат считается прочитанным: раньше счётчик копился вечно,
         // и бейдж горел даже при уже просмотренной переписке.
-        self.chat_log.mark_read(&node_id);
-        self.seen_unread.insert(node_id.clone(), 0);
+        if self.chat_room {
+            self.room_chat.mark_read();
+        } else {
+            self.chat_log.mark_read(&node_id);
+            self.seen_unread.insert(node_id.clone(), 0);
+        }
 
         if close {
             self.chat_open = false;

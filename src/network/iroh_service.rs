@@ -28,6 +28,7 @@ pub fn spawn_iroh_receiver(
     is_host: Arc<AtomicBool>,
     friends: Arc<FriendsManager>,
     chat_log: Arc<ChatLog>,
+    room_chat: Arc<crate::chat::RoomChat>,
     calls: Arc<CallManager>,
     presence: Arc<crate::presence::PresenceTracker>,
     video: Arc<crate::network::video_directory::VideoDirectory>,
@@ -39,6 +40,7 @@ pub fn spawn_iroh_receiver(
         let is_host_iroh = is_host.clone();
         let friends_iroh = friends.clone();
         let chat_log_iroh = chat_log.clone();
+        let room_chat_iroh = room_chat.clone();
         let calls_iroh = calls.clone();
         let presence_iroh = presence.clone();
         let video_iroh = video.clone();
@@ -323,6 +325,63 @@ pub fn spawn_iroh_receiver(
                                 text,
                                 at: now,
                             });
+                        }
+                        NetworkMessage::RoomChat {
+                            sender_id,
+                            room_id,
+                            nick,
+                            text,
+                        } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            // Вне эфира комната нас не касается: сообщение
+                            // прилетело бы из разговора, которого мы не слышим.
+                            if room_iroh.is_left() {
+                                eprintln!(
+                                    "[ЧАТ] Сообщение в комнату от {} отброшено: мы вне эфира",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+                            // Писать в эфир может только его участник: чужой не
+                            // должен вклиниваться в комнату без приглашения.
+                            if !room_iroh
+                                .get_all_addresses()
+                                .iter()
+                                .any(|a| a == &pkt.sender_id)
+                            {
+                                eprintln!(
+                                    "[ЧАТ] Сообщение в комнату от {} отброшено: его нет в комнате",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+                            // 0 — общий эфир без созвона; иначе номера комнат
+                            // должны совпадать.
+                            let my_room = calls_iroh.room_id().unwrap_or(0);
+                            if room_id != 0 && my_room != 0 && room_id != my_room {
+                                continue;
+                            }
+                            let text = text.trim().to_string();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            println!(
+                                "[ЧАТ] {} → в комнату: {} симв.",
+                                nick,
+                                text.chars().count()
+                            );
+                            room_chat_iroh.push(
+                                room_id,
+                                crate::chat::RoomMessage {
+                                    from_me: false,
+                                    sender_id,
+                                    nick,
+                                    text,
+                                    at: now,
+                                },
+                            );
                         }
                         NetworkMessage::CallInvite {
                             sender_id,

@@ -88,6 +88,17 @@ pub enum NetworkMessage {
         /// NodeID участников, не считая получателя.
         members: Vec<String>,
     },
+    /// Общий чат комнаты: сообщение видят все участники эфира, а не один друг.
+    ///
+    /// `room_id = 0` — общий эфир без созвона (комната собрана одним mesh).
+    /// Ник едет в самом пакете: у получателя нет `config.ini` отправителя, а
+    /// показывать вместо имени хеш NodeID не хочется.
+    RoomChat {
+        sender_id: u64,
+        room_id: u32,
+        nick: String,
+        text: String,
+    },
 }
 
 /// Пишет строку как `длина u16 LE` + байты UTF-8 (единый формат для текстовых полей).
@@ -242,6 +253,18 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
                 push_str(&mut data, member);
             }
         }
+        NetworkMessage::RoomChat {
+            sender_id,
+            room_id,
+            nick,
+            text,
+        } => {
+            data.push(18);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&room_id.to_le_bytes());
+            push_str(&mut data, nick);
+            push_str(&mut data, text);
+        }
     }
     data
 }
@@ -395,6 +418,20 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
                 members,
             })
         }
+        // 1 байт тега + 8 sender + 4 room + две строки (минимум по 2 байта).
+        18 if bytes.len() >= 17 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let room_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            let mut off = 13;
+            let nick = read_str(bytes, &mut off)?;
+            let text = read_str(bytes, &mut off)?;
+            Some(NetworkMessage::RoomChat {
+                sender_id,
+                room_id,
+                nick,
+                text,
+            })
+        }
         _ => None,
     }
 }
@@ -480,6 +517,46 @@ mod tests {
             room_id: 0x0BAD_F00D,
             members: vec!["ab".repeat(32), "cd".repeat(32)],
         });
+        roundtrip(NetworkMessage::RoomChat {
+            sender_id: 13,
+            room_id: 0,
+            nick: "Узел 2".into(),
+            text: "привет, эфир".into(),
+        });
+    }
+
+    #[test]
+    fn room_chat_layout_and_empty_text() {
+        let bytes = serialize_msg(&NetworkMessage::RoomChat {
+            sender_id: 4,
+            room_id: 0x0102_0304,
+            nick: "Я".into(),
+            text: "ок".into(),
+        });
+        assert_eq!(bytes[0], 18);
+        assert_eq!(u32::from_le_bytes(bytes[9..13].try_into().unwrap()), 0x0102_0304);
+        match deserialize_msg(&bytes) {
+            Some(NetworkMessage::RoomChat { sender_id, room_id, nick, text }) => {
+                assert_eq!(sender_id, 4);
+                assert_eq!(room_id, 0x0102_0304);
+                assert_eq!(nick, "Я");
+                assert_eq!(text, "ок");
+            }
+            other => panic!("RoomChat разобран неверно: {other:?}"),
+        }
+        // обрезанный пакет (нет второй строки) — мусор, а не сообщение
+        assert!(deserialize_msg(&bytes[..bytes.len() - 1]).is_none());
+        // пустой текст кодируется честно: длина 0
+        let empty = serialize_msg(&NetworkMessage::RoomChat {
+            sender_id: 4,
+            room_id: 0,
+            nick: "Я".into(),
+            text: String::new(),
+        });
+        assert!(matches!(
+            deserialize_msg(&empty),
+            Some(NetworkMessage::RoomChat { text, .. }) if text.is_empty()
+        ));
     }
 
     #[test]

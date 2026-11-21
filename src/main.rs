@@ -48,6 +48,8 @@ fn main() {
     let config = albus::config::AppConfig::load();
     let friends = Arc::new(albus::friends::FriendsManager::load());
     let chat_log = Arc::new(albus::chat::ChatLog::new());
+    // Общий чат комнаты: история тоже только в памяти
+    let room_chat = Arc::new(albus::chat::RoomChat::new());
     let input_devices = DeviceSelector::get_input_devices();
     let input_channel_counts = DeviceSelector::get_input_channel_counts();
     let output_devices = DeviceSelector::get_output_devices();
@@ -273,6 +275,7 @@ fn main() {
         is_host.clone(),
         friends.clone(),
         chat_log.clone(),
+        room_chat.clone(),
         calls.clone(),
         presence.clone(),
         video_directory.clone(),
@@ -366,6 +369,7 @@ fn main() {
                 config,
                 friends,
                 chat_log,
+                room_chat,
                 my_node_id,
                 network_error,
                 calls,

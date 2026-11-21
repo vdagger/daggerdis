@@ -1,9 +1,10 @@
 //! DM-чат: выдвижная панель с сессионной перепиской
 
-use crate::chat::{ChatLog, ChatMessage};
+use crate::chat::{ChatLog, ChatMessage, RoomChat};
 use crate::friends::FriendsManager;
 use crate::gui::theme as t;
 use crate::network::p2p_iroh::IrohP2pManager;
+use crate::room::RoomManager;
 use eframe::egui;
 use egui::{Align, Color32, Layout, RichText, Rounding, Stroke};
 use std::sync::Arc;
@@ -88,15 +89,30 @@ fn bubble(ui: &mut egui::Ui, m: &ChatMessage, time: &str) {
                 .inner_margin(egui::Margin::symmetric(10.0, 6.0))
                 .show(ui, |ui| {
                     ui.set_max_width(max_w);
-                    ui.label(RichText::new(m.text.as_str()).size(11.5).color(text_color));
-                    ui.add_space(1.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(time)
-                                .size(8.5)
-                                .color(t::with_alpha(text_color, 0.55)),
-                        );
-                    });
+                    // Текст и время — один LabelJob. Вложенная раскладка
+                    // (`with_layout(right_to_left)` внутри рамки) растягивала
+                    // пузырь на всю панель: рамка считала своей ширину
+                    // доступного места, а не текста.
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(
+                        &m.text,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(11.5),
+                            color: text_color,
+                            ..Default::default()
+                        },
+                    );
+                    job.append(
+                        &format!("  {time}"),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(8.5),
+                            color: t::with_alpha(text_color, 0.55),
+                            ..Default::default()
+                        },
+                    );
+                    ui.label(job);
                 });
         },
     );
@@ -317,4 +333,257 @@ pub fn draw_chat_panel(
             );
         });
     });
+}
+
+/// Отправка в общий чат: одно сообщение всем участникам комнаты.
+///
+/// Датаграммы уходят параллельно одному и тому же набору адресов, что и голос,
+/// поэтому «написать в эфир» не требует отдельного соединения. Ошибка видна
+/// тостом: сообщение уже нарисовано в ленте, и человек уверен, что оно ушло.
+fn send_room_chat(
+    p2p: &Arc<IrohP2pManager>,
+    targets: Vec<String>,
+    room_id: u32,
+    my_id: u64,
+    nick: String,
+    text: String,
+    error_slot: Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let text = truncate_to_bytes(text, 1024);
+    let bytes =
+        crate::network::message::serialize_msg(&crate::network::NetworkMessage::RoomChat {
+            sender_id: my_id,
+            room_id,
+            nick,
+            text,
+        });
+    if targets.is_empty() {
+        return;
+    }
+    let p2p = p2p.clone();
+    tokio::task::spawn(async move {
+        let mut failed = 0usize;
+        for target in targets {
+            if p2p.send_bytes(&target, &bytes).await.is_err() {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            if let Ok(mut slot) = error_slot.lock() {
+                *slot = Some(format!(
+                    "Сообщение в комнату не доставлено: {failed} участн."
+                ));
+            }
+        }
+    });
+}
+
+/// Общий чат комнаты: видно всем, кто в эфире, в отличие от лички другу.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_room_chat_panel(
+    ui: &mut egui::Ui,
+    room_chat: &Arc<RoomChat>,
+    my_nick: &str,
+    my_id: u64,
+    room: &Arc<RoomManager>,
+    room_id: u32,
+    iroh: Option<Arc<IrohP2pManager>>,
+    input: &mut String,
+    close: &mut bool,
+    error_slot: &Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let members = room.get_all_peers().len() + 1;
+
+    ui.horizontal(|ui| {
+        t::avatar(ui, "Э", 30.0, true);
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Комната").size(13.0).strong().color(t::TEXT));
+            ui.label(
+                RichText::new(format!("{members} участн. · видно всем в эфире"))
+                    .size(9.0)
+                    .color(t::TEXT_MUTED),
+            );
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if t::icon_button(ui, t::Icon::Close, 26.0, false)
+                .on_hover_text("Закрыть")
+                .clicked()
+            {
+                *close = true;
+            }
+        });
+    });
+
+    ui.add_space(6.0);
+    t::divider(ui);
+    ui.add_space(2.0);
+
+    let msgs = room_chat.messages();
+    let composer_h = 46.0;
+    let scroll_h = (ui.available_height() - composer_h - 30.0).max(80.0);
+
+    egui::ScrollArea::vertical()
+        .max_height(scroll_h)
+        .stick_to_bottom(true)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if msgs.is_empty() {
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new("В комнате ещё никто не писал. Сообщение увидят все в эфире.")
+                        .size(10.5)
+                        .color(t::TEXT_MUTED),
+                );
+            } else {
+                for m in &msgs {
+                    room_bubble(ui, m, &clock(m.at));
+                }
+            }
+        });
+
+    ui.add_space(4.0);
+
+    let mut send = false;
+    ui.horizontal(|ui| {
+        let btn = 30.0;
+        let width = (ui.available_width() - btn - 8.0).max(80.0);
+        egui::Frame::none()
+            .fill(t::INSET)
+            .rounding(Rounding::same(9.0))
+            .stroke(Stroke::new(1.0_f32, t::STROKE_SOFT))
+            .inner_margin(egui::Margin::symmetric(9.0, 6.0))
+            .show(ui, |ui| {
+                ui.set_width(width - 18.0);
+                let edit = ui.add(
+                    egui::TextEdit::singleline(input)
+                        .hint_text("Сообщение в комнату…")
+                        .char_limit(500)
+                        .desired_width(width - 18.0)
+                        .frame(false),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    send = true;
+                }
+            });
+
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(btn, 30.0), egui::Sense::click());
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().circle_filled(
+            rect.center(),
+            15.0,
+            if response.hovered() { t::BRAND } else { t::BRAND_2 },
+        );
+        t::draw_icon(
+            &ui.painter_at(rect),
+            egui::Rect::from_center_size(rect.center(), egui::vec2(13.0, 13.0)),
+            t::Icon::Send,
+            Color32::WHITE,
+        );
+        if response.clicked() {
+            send = true;
+        }
+    });
+
+    if send {
+        let text = input.trim().to_string();
+        if !text.is_empty() {
+            if let Some(ref p2p) = iroh {
+                room_chat.push(
+                    room_id,
+                    crate::chat::RoomMessage {
+                        from_me: true,
+                        sender_id: my_id,
+                        nick: my_nick.to_string(),
+                        text: text.clone(),
+                        at: now_ms(),
+                    },
+                );
+                send_room_chat(
+                    p2p,
+                    room.get_all_addresses(),
+                    room_id,
+                    my_id,
+                    my_nick.to_string(),
+                    text,
+                    error_slot.clone(),
+                );
+            }
+            input.clear();
+        }
+    }
+
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Только участники эфира · история до закрытия")
+            .size(8.0)
+            .color(t::with_alpha(t::TEXT_MUTED, 0.8)),
+    );
+}
+
+/// Пузырь общего чата: у входящего сверху ник, потому что в комнате говорят
+/// несколько человек и подпись важнее, чем в личке.
+fn room_bubble(ui: &mut egui::Ui, m: &crate::chat::RoomMessage, time: &str) {
+    ui.with_layout(
+        if m.from_me {
+            Layout::right_to_left(Align::TOP)
+        } else {
+            Layout::left_to_right(Align::TOP)
+        },
+        |ui| {
+            let max_w = ui.available_width() * 0.82;
+            let (fill, text_color, border) = if m.from_me {
+                (t::BRAND_2, Color32::WHITE, t::with_alpha(t::BRAND, 0.0))
+            } else {
+                (t::SURFACE_HI, t::TEXT, t::STROKE_SOFT)
+            };
+            egui::Frame::none()
+                .fill(fill)
+                .rounding(Rounding::same(12.0))
+                .stroke(Stroke::new(1.0_f32, border))
+                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                .show(ui, |ui| {
+                    ui.set_max_width(max_w);
+                    // Ник и текст — один LabelJob: ник отдельной строкой над
+                    // пузырём не рисовался, а вложенная вертикальная
+                    // раскладка растягивала пузырь на всю панель.
+                    let mut job = egui::text::LayoutJob::default();
+                    if !m.from_me {
+                        job.append(
+                            &format!("{}\n", m.nick),
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(8.5),
+                                color: t::BRAND,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    job.append(
+                        &m.text,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(11.5),
+                            color: text_color,
+                            ..Default::default()
+                        },
+                    );
+                    job.append(
+                        &format!("  {time}"),
+                        0.0,
+                        egui::TextFormat {
+                            font_id: egui::FontId::proportional(8.5),
+                            color: t::with_alpha(text_color, 0.55),
+                            ..Default::default()
+                        },
+                    );
+                    ui.label(job);
+                    ui.add_space(1.0);
+                    // Время — частью того же LabelJob ниже, без вложенной
+                    // раскладки: `with_layout(right_to_left)` внутри пузыря
+                    // растягивала рамку на всю панель (та же болячка в личке).
+                });
+        },
+    );
+    ui.add_space(6.0);
 }
