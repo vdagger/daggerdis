@@ -397,6 +397,15 @@ impl RadioApp {
                                     };
                                     match video_session::VideoSession::start(fps) {
                                         Ok(v) => {
+                                            // Адаптация битрейта: потери канала
+                                            // feed будут опускать целевой
+                                            // битрейт энкодера и поднимать назад.
+                                            if let Some(link) = &self.video_link {
+                                                link.set_bitrate_control(
+                                                    v.bitrate_target(),
+                                                    v.bitrate_base(),
+                                                );
+                                            }
                                             self.video = Some(v);
                                             self.video_error = None;
                                             // Анонс новой трансляции: зрители

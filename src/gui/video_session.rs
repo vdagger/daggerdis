@@ -250,6 +250,16 @@ pub struct VideoSession {
 }
 
 impl VideoSession {
+    /// Целевой битрейт для адаптации канала: сюда пишет `VideoLink`.
+    pub fn bitrate_target(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        self.publisher.bitrate.clone()
+    }
+
+    /// Битрейт пресета — потолок адаптации.
+    pub fn bitrate_base(&self) -> u32 {
+        self.publisher.bitrate_base
+    }
+
     pub fn start(fps: u32) -> Result<Self, String> {
         let publisher = ScreenPublisher::start(fps)?;
         // превью — в половинном разрешении: на экране оно всё равно мелкое,

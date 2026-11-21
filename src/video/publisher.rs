@@ -26,11 +26,16 @@ pub struct ScreenPublisher {
     pub encode_fps: Arc<AtomicU32>,
     /// Сколько килобит в секунду уходит в сеть за последнюю секунду (диагностика).
     pub encode_kbps: Arc<AtomicU32>,
+    /// Целевой битрейт на ходу (0 — не трогать): сюда пишет адаптация канала
+    /// из `VideoLink`, энкодер применяет значение в своём цикле.
+    pub bitrate: Arc<AtomicU32>,
+    /// Битрейт пресета — верхняя граница, к которой адаптация возвращается.
+    pub bitrate_base: u32,
 }
 
 impl ScreenPublisher {
     pub fn start(fps: u32) -> Result<Self, String> {
-        let (init_tx, init_rx) = channel::<Result<(StreamInfo, String), String>>();
+        let (init_tx, init_rx) = channel::<Result<(StreamInfo, String, u32), String>>();
         let (frame_tx, frame_rx) = channel::<EncodedUnit>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
@@ -38,6 +43,8 @@ impl ScreenPublisher {
         let encode_fps_thread = encode_fps.clone();
         let encode_kbps = Arc::new(AtomicU32::new(0));
         let encode_kbps_thread = encode_kbps.clone();
+        let bitrate = Arc::new(AtomicU32::new(0));
+        let bitrate_thread = bitrate.clone();
 
         let handle = std::thread::Builder::new()
             .name("video-publisher".into())
@@ -49,6 +56,7 @@ impl ScreenPublisher {
                     &init_tx,
                     &encode_fps_thread,
                     &encode_kbps_thread,
+                    &bitrate_thread,
                 ) {
                     eprintln!("[ВИДЕО] Публикация остановлена: {e}");
                 }
@@ -57,7 +65,7 @@ impl ScreenPublisher {
 
         // ждём инициализации захвата и энкодера, иначе нечего показывать
         match init_rx.recv() {
-            Ok(Ok((info, source))) => Ok(Self {
+            Ok(Ok((info, source, base))) => Ok(Self {
                 stop,
                 handle: Some(handle),
                 rx: frame_rx,
@@ -65,6 +73,8 @@ impl ScreenPublisher {
                 source,
                 encode_fps,
                 encode_kbps,
+                bitrate,
+                bitrate_base: base,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -88,9 +98,10 @@ fn run(
     stop: &AtomicBool,
     fps: u32,
     tx: &Sender<EncodedUnit>,
-    init: &Sender<Result<(StreamInfo, String), String>>,
+    init: &Sender<Result<(StreamInfo, String, u32), String>>,
     encode_fps: &AtomicU32,
     encode_kbps: &AtomicU32,
+    bitrate: &AtomicU32,
 ) -> Result<(), String> {
     // целимся в нативное разрешение экрана: апскейл тратит битрейт зря
     let mut capture = match ScreenCapture::new(None, fps) {
@@ -121,7 +132,10 @@ fn run(
         "{} {}x{} → {}x{}",
         capture.adapter_name, capture.source_width, capture.source_height, target.width, target.height
     );
-    let _ = init.send(Ok((info, source)));
+    let base_bitrate = target.bitrate_bps;
+    let _ = init.send(Ok((info, source, base_bitrate)));
+    // Какой битрейт сейчас стоит у энкодера: меняем только при отличии.
+    let mut applied_bitrate = base_bitrate;
 
     let period = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
     let mut next = Instant::now();
@@ -139,6 +153,21 @@ fn run(
             Ok(None) => continue, // экран не менялся
             Err(e) => return Err(e),
         };
+        // Адаптация канала: `VideoLink` пишет сюда новый битрейт, энкодер
+        // применяет его без перезапуска потока. 0 — «не трогать».
+        let wanted = bitrate.load(Ordering::Relaxed);
+        if wanted != 0 && wanted != applied_bitrate {
+            let previous = applied_bitrate;
+            if encoder.set_mean_bitrate(wanted) {
+                applied_bitrate = wanted;
+                println!(
+                    "[ВИДЕО] Битрейт {:.1} → {:.1} Мбит/с (потолок {:.1})",
+                    previous as f32 / 1_000_000.0,
+                    wanted as f32 / 1_000_000.0,
+                    base_bitrate as f32 / 1_000_000.0
+                );
+            }
+        }
         match encoder.push_nv12(&frame) {
             Ok(units) => {
                 for unit in units {

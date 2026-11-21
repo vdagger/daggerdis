@@ -44,6 +44,8 @@ pub struct MfEncoder {
     pub mft_name: String,
     /// Что не удалось применить из ICodecAPI (диагностика).
     pub notes: Vec<String>,
+    /// Средний битрейт, который сейчас реально стоит у кодека.
+    applied_bitrate: u32,
 }
 
 impl MfEncoder {
@@ -183,6 +185,7 @@ impl MfEncoder {
             .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
             .map_err(|e| e.to_string())?;
 
+        let applied_bitrate = mean_bitrate_for(&name, target);
         Ok(Self {
             transform,
             events,
@@ -194,10 +197,39 @@ impl MfEncoder {
             sequence_header,
             mft_name: name,
             notes,
+            applied_bitrate,
         })
     }
 
     /// Отдаёт один кадр NV12. Возвращает кадры, которые энкодер успел выдать.
+    /// Меняет средний битрейт на ходу — адаптация под потери в канале.
+    ///
+    /// CBR пересчитывается кодеком по этому значению; `false` — кодек
+    /// не принял (тогда остаётся прежний битрейт, поток не рвётся).
+    pub fn set_mean_bitrate(&mut self, bps: u32) -> bool {
+        let target = VideoTarget {
+            bitrate_bps: bps,
+            ..self.target
+        };
+        let applied = mean_bitrate_for(&self.mft_name, &target);
+        if applied == self.applied_bitrate {
+            return true;
+        }
+        unsafe {
+            let Ok(codec) = self.transform.cast::<ICodecAPI>() else {
+                return false;
+            };
+            if codec
+                .SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var_ui4(applied))
+                .is_err()
+            {
+                return false;
+            }
+        }
+        self.applied_bitrate = applied;
+        true
+    }
+
     pub fn push_nv12(&mut self, nv12: &[u8]) -> Result<Vec<EncodedUnit>, String> {
         let mut out = Vec::new();
         let deadline = Instant::now() + WAIT;

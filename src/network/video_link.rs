@@ -564,6 +564,10 @@ pub struct VideoLink {
     feeding: std::sync::Mutex<FeedState>,
     next_id: AtomicU64,
     viewers: std::sync::Mutex<Vec<Viewer>>,
+    /// Куда писать адаптированный битрейт: сюда смотрит энкодер издателя.
+    bitrate_target: std::sync::Mutex<Option<Arc<AtomicU32>>>,
+    /// Потолок адаптации — битрейт пресета (0 — адаптация не подключена).
+    bitrate_base: AtomicU32,
 }
 
 impl VideoLink {
@@ -591,6 +595,8 @@ impl VideoLink {
             feeding: std::sync::Mutex::new(FeedState::default()),
             next_id: AtomicU64::new(0),
             viewers: std::sync::Mutex::new(Vec::new()),
+            bitrate_target: std::sync::Mutex::new(None),
+            bitrate_base: AtomicU32::new(0),
         });
         let l = link.clone();
         link.rt.spawn(async move { l.accept_loop().await });
@@ -957,6 +963,25 @@ impl VideoLink {
     /// Начинает новую трансляцию. Номер ненулевой и не равен предыдущему —
     /// по нему зрители отличают перезапуск. Relay и feed при этом снимаются:
     /// в одном окне своя картинка и чужой поток не живут.
+    /// Подключает адаптацию битрейта: `target` — атомик энкодера, `base` —
+    /// его потолок. Наблюдение за каналом feed пишет туда новое значение.
+    pub fn set_bitrate_control(&self, target: Arc<AtomicU32>, base: u32) {
+        if let Ok(mut slot) = self.bitrate_target.lock() {
+            *slot = Some(target);
+        }
+        self.bitrate_base.store(base, Ordering::Relaxed);
+    }
+
+    /// Пара (атомик энкодера, потолок) или `None`, если адаптация не нужна.
+    fn bitrate_control(&self) -> Option<(Arc<AtomicU32>, u32)> {
+        let base = self.bitrate_base.load(Ordering::Relaxed);
+        if base == 0 {
+            return None;
+        }
+        let target = self.bitrate_target.lock().ok()?.clone()?;
+        Some((target, base))
+    }
+
     pub fn begin_stream(&self) -> u32 {
         let mut gen = self.directory.allocate_gen();
         if self.last_gen.swap(gen, Ordering::SeqCst) == gen {
@@ -1433,6 +1458,15 @@ impl VideoLink {
             return false;
         }
         println!("[ВИДЕО] Поток хосту {} отдан (поколение {gen})", node);
+        // Канал feed — единственный, по которому уходит наша картинка: его
+        // потери и делают поток слайд-шоу у зрителей. Наблюдаем и подстраиваем
+        // битрейт энкодера, пока поток жив.
+        if let Some((target, base)) = self.bitrate_control() {
+            let conn = conn.clone();
+            let stop = stop.clone();
+            self.rt
+                .spawn(async move { watch_feed_bitrate(conn, target, base, stop).await });
+        }
         self.send_frames(conn, stop.clone(), Some(gen)).await;
         true
     }
@@ -1532,6 +1566,101 @@ fn decide_control(
             }
         }
     }
+}
+
+/// Следующий целевой битрейт по потерям канала.
+///
+/// `lost_bp` — потерянные пакеты за окно в сотых долях процента (10000 = 100 %),
+/// `clean_secs` — сколько секунд подряд потерь не было. Растём медленно и только
+/// после пяти чистых секунд, падаем быстро: перегруженный канал должен успеть
+/// раньше, чем зритель увидит слайд-шоу.
+fn next_bitrate(current: u32, base: u32, lost_bp: u32, clean_secs: u32) -> u32 {
+    let floor = (base / 4).max(300_000);
+    if lost_bp > 50 {
+        let lower = (current as u64 * 85 / 100) as u32;
+        return lower.max(floor).min(current);
+    }
+    if lost_bp == 0 && clean_secs >= 5 && current < base {
+        let step = (base / 10).max(100_000);
+        return (current + step).min(base);
+    }
+    current
+}
+
+/// Наблюдает за каналом feed и подстраивает битрейт энкодера раз в секунду.
+async fn watch_feed_bitrate(
+    conn: Connection,
+    target: Arc<AtomicU32>,
+    base: u32,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut current = base;
+    let mut last = path_counters(&conn);
+    let mut clean_secs = 0u32;
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    target.store(0, Ordering::Relaxed);
+                    return;
+                }
+            }
+            _ = conn.closed() => {
+                target.store(0, Ordering::Relaxed);
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        let (lost_bp, sent_delta) = match (last, path_counters(&conn)) {
+            (Some((lost0, sent0)), Some((lost1, sent1))) => {
+                let lost = lost1.saturating_sub(lost0);
+                let sent = sent1.saturating_sub(sent0);
+                last = Some((lost1, sent1));
+                if sent == 0 {
+                    (0, 0)
+                } else {
+                    (((lost as u128 * 10_000) / sent as u128) as u32, sent)
+                }
+            }
+            (_, None) => (0, 0),
+            _ => (0, 0),
+        };
+        if sent_delta == 0 {
+            continue;
+        }
+        if lost_bp == 0 {
+            clean_secs = clean_secs.saturating_add(1);
+        } else {
+            clean_secs = 0;
+        }
+        let lost_bp = (lost_bp + fake_loss_bp()).min(10_000);
+        let next = next_bitrate(current, base, lost_bp, clean_secs);
+        if next != current {
+            current = next;
+            target.store(next, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Тестовый крючок: `ALBUS_FAKE_LOSS_BP` подмешивает потери в наблюдение,
+/// чтобы проверить адаптацию без реальной порчи пакетов. В обычном запуске
+/// переменной нет — значение 0, наблюдение честное.
+fn fake_loss_bp() -> u32 {
+    std::env::var("ALBUS_FAKE_LOSS_BP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// (потеряно, отправлено) выбранного пути QUIC.
+fn path_counters(conn: &Connection) -> Option<(u64, u64)> {
+    let paths = conn.paths();
+    let path = paths
+        .iter()
+        .find(|p| p.is_selected())
+        .or_else(|| paths.iter().next())?;
+    let stats = path.stats();
+    Some((stats.lost_packets, stats.sent_packets))
 }
 
 fn encode_subscribe(gen: u32) -> [u8; 5] {
@@ -1958,6 +2087,26 @@ mod tests {
             decide_control(&cmd, 0, true, true, true, None),
             Action::Reject
         );
+    }
+
+    #[test]
+    fn adaptive_bitrate_drops_fast_and_rises_slowly() {
+        let base = 8_000_000;
+        // Потери 2 % — шаг вниз на 15 %.
+        assert_eq!(next_bitrate(base, base, 200, 0), 6_800_000);
+        // Потери меньше 0.5 % не трогают битрейт.
+        assert_eq!(next_bitrate(base, base, 10, 0), base);
+        // Пять чистых секунд — шаг вверх на 10 % от потолка.
+        assert_eq!(next_bitrate(4_000_000, base, 0, 5), 4_800_000);
+        // Меньше пяти — ждём.
+        assert_eq!(next_bitrate(4_000_000, base, 0, 4), 4_000_000);
+        // Выше потолка не поднимаемся.
+        assert_eq!(next_bitrate(7_900_000, base, 0, 9), base);
+        // Ниже четверти пресета не опускаемся.
+        let low = next_bitrate(2_100_000, base, 900, 0);
+        assert_eq!(low, 2_000_000);
+        // Опускание не поднимает битрейт (защита от «опустили чуть-чуть вверх»).
+        assert!(next_bitrate(1_000_000, base, 900, 0) <= 1_000_000);
     }
 
     #[test]
