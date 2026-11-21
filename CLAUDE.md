@@ -128,7 +128,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/network/iroh_service.rs` | `spawn_iroh_receiver`: Iroh listener, sender_id↔NodeID check, full-mesh, relay, friends, chat, звонки (гейт по `CallManager::is_blocked`) |
 | `src/network/broadcast.rs` | `spawn_audio_broadcast`: parallel voice fan-out over Iroh |
 | `src/network/message.rs` | `NetworkMessage` enum + hand-rolled binary (de)serialization |
-| `src/gui/mod.rs` | `RadioApp`: eframe window, "Cyber Slate" theme, 60 FPS, network-error banner; console layout bottom-up, rail as one card, settings/chat overlays |
+| `src/gui/mod.rs` | `RadioApp`: состояние, `update`, тема и общие помощники; оверлеи и панели вынесены в `gui/` |
 | `src/gui/theme.rs` | Tokens (PAGE/SURFACE/INNER/INSET, BRAND, LIVE, STROKE_SOFT), `draw_icon`, `avatar`, `primary_button`, `chip_button`, radial fills/rings, level bars |
 | `src/widgets/hero.rs` | Диск рации (шкала, дуга уровня, кольцо с точкой), заголовок эфира, полоса «линия» |
 | `src/gui/stream_control.rs` | Hot-swap audio devices at runtime |
