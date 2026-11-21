@@ -240,6 +240,7 @@ impl UniversalAudioCapture {
         device: Option<cpal::Device>,
         rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
         mixer: std::sync::Arc<crate::mixer::AudioMixer>,
+        diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
         let output_device = match device {
@@ -328,15 +329,27 @@ impl UniversalAudioCapture {
                 buffer_size: cpal::BufferSize::Default,
             };
             let built = match format {
-                cpal::SampleFormat::F32 => {
-                    Self::build_playback::<f32>(&output_device, &config, rx.clone(), mixer.clone())
-                }
-                cpal::SampleFormat::I32 => {
-                    Self::build_playback::<i32>(&output_device, &config, rx.clone(), mixer.clone())
-                }
-                cpal::SampleFormat::I16 => {
-                    Self::build_playback::<i16>(&output_device, &config, rx.clone(), mixer.clone())
-                }
+                cpal::SampleFormat::F32 => Self::build_playback::<f32>(
+                    &output_device,
+                    &config,
+                    rx.clone(),
+                    mixer.clone(),
+                    diag.clone(),
+                ),
+                cpal::SampleFormat::I32 => Self::build_playback::<i32>(
+                    &output_device,
+                    &config,
+                    rx.clone(),
+                    mixer.clone(),
+                    diag.clone(),
+                ),
+                cpal::SampleFormat::I16 => Self::build_playback::<i16>(
+                    &output_device,
+                    &config,
+                    rx.clone(),
+                    mixer.clone(),
+                    diag.clone(),
+                ),
                 _ => continue,
             };
             match built {
@@ -367,6 +380,7 @@ impl UniversalAudioCapture {
         config: &cpal::StreamConfig,
         rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
         mixer: std::sync::Arc<crate::mixer::AudioMixer>,
+        diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>>
     where
         T: cpal::SizedSample + cpal::FromSample<f32>,
@@ -429,10 +443,11 @@ impl UniversalAudioCapture {
             ((2.0 * std::f64::consts::PI * freq * t).sin() * env * 0.10) as f32
         };
         let mut peers: std::collections::HashMap<u64, Peer> = std::collections::HashMap::new();
-        // диагностика приёма: по этим числам видно, что именно рвёт звук
-        let (mut underruns, mut concealed, mut stale_resets, mut burst_drops) =
-            (0u32, 0u32, 0u32, 0u32);
+        // Диагностика приёма: те же события видны и в консоли (раз в 10 с), и в
+        // панели «Диагностика» — там счётчики накопительные, поэтому журнал
+        // печатает разницу с прошлым отчётом.
         let mut last_report = std::time::Instant::now();
+        let mut last_printed = diag.rx.snapshot();
 
         let stream = output_device.build_output_stream(
             config,
@@ -473,7 +488,7 @@ impl UniversalAudioCapture {
                             peer.next = seq;
                             peer.queue.clear();
                             peer.stale = 0;
-                            stale_resets += 1;
+                            diag.rx.restart();
                         }
                         peer.stale = 0;
                         peer.queue.insert(seq, packet);
@@ -491,7 +506,7 @@ impl UniversalAudioCapture {
                                     for r in 0..missing {
                                         let fade = 1.0 - (r as f32 + 1.0) / (missing as f32 + 1.0);
                                         peer.pcm.extend(peer.last_pcm.iter().map(|s| s * fade));
-                                        concealed += 1;
+                                        diag.rx.concealed();
                                     }
                                 }
                                 peer.next = lowest;
@@ -503,7 +518,7 @@ impl UniversalAudioCapture {
                             let oldest = *peer.queue.keys().next().unwrap();
                             peer.queue.remove(&oldest);
                             peer.next = oldest.wrapping_add(1);
-                            burst_drops += 1;
+                            diag.rx.drop();
                         }
 
                         // Выдаём все кадры строго по порядку
@@ -538,15 +553,15 @@ impl UniversalAudioCapture {
                 // по этим числам видно, из-за чего у собеседника «робот» —
                 // дырки в сети, перезапуск отправителя или провалы звуковой карты.
                 if last_report.elapsed() >= std::time::Duration::from_secs(10) {
-                    if underruns + concealed + stale_resets + burst_drops > 0 {
+                    let now = diag.rx.snapshot();
+                    let window = last_printed.delta(&now);
+                    if window.events() > 0 {
                         eprintln!(
-                            "[АУДИО] приём: провалов буфера {underruns}, маскировано кадров {concealed}, перезапусков потока {stale_resets}, выброшено пачкой {burst_drops}"
+                            "[АУДИО] приём: провалов буфера {}, маскировано кадров {}, перезапусков потока {}, выброшено пачкой {}",
+                            window.underruns, window.concealed, window.restarts, window.drops
                         );
-                        underruns = 0;
-                        concealed = 0;
-                        stale_resets = 0;
-                        burst_drops = 0;
                     }
+                    last_printed = now;
                     last_report = std::time::Instant::now();
                 }
 
@@ -569,7 +584,7 @@ impl UniversalAudioCapture {
                     if peer.pcm.len() > max_buffer {
                         let excess = peer.pcm.len() - keep_buffer;
                         peer.pcm.drain(..excess);
-                        burst_drops += 1;
+                        diag.rx.drop();
                     }
                     if !peer.started {
                         if peer.pcm.len() >= min_prebuffer {
@@ -583,7 +598,7 @@ impl UniversalAudioCapture {
                         // Провал посреди реплики — это потеря; отпущенный PTT
                         // так же оставляет буфер пустым, но это норма.
                         if peer.last_fill.elapsed() < std::time::Duration::from_millis(300) {
-                            underruns += 1;
+                            diag.rx.underrun();
                         }
                         continue;
                     }
@@ -696,3 +711,4 @@ mod tests {
         assert!(!channel_usable(0, 0));
     }
 }
+

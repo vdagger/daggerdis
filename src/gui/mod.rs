@@ -57,6 +57,17 @@ pub struct RadioApp {
     theme_configured: bool,
     settings_open: bool,
     chat_open: bool,
+    /// Панель «Диагностика»: числа и «Скопировать отчёт».
+    diag_open: bool,
+    /// Общая точка диагностики: счётчики приёма голоса пишет аудиоколбэк.
+    diagnostics: Arc<crate::diagnostics::Diagnostics>,
+    /// Прошлый снимок счётчиков приёма и время: по ним считается «за N с».
+    diag_prev: (crate::diagnostics::RxSnapshot, Instant),
+    /// Прирост счётчиков за последнее окно — показывается в панели.
+    diag_window: crate::diagnostics::RxSnapshot,
+    diag_window_secs: f32,
+    /// Сколько кадров чужой трансляции принято (для отчёта).
+    remote_frames: u64,
     toast: Option<(String, Instant)>,
     wave: VecDeque<f32>,
     config: crate::config::AppConfig,
@@ -136,6 +147,7 @@ impl RadioApp {
         network_error: Option<String>,
         calls: Arc<crate::calls::CallManager>,
         presence: Arc<crate::presence::PresenceTracker>,
+        diagnostics: Arc<crate::diagnostics::Diagnostics>,
     ) -> Self {
         let initial_input = selected_input.load(std::sync::atomic::Ordering::Relaxed);
         let initial_output = selected_output.load(std::sync::atomic::Ordering::Relaxed);
@@ -186,6 +198,12 @@ impl RadioApp {
             theme_configured: false,
             settings_open: false,
             chat_open: false,
+            diag_open: false,
+            diagnostics: diagnostics.clone(),
+            diag_prev: (diagnostics.rx.snapshot(), Instant::now()),
+            diag_window: crate::diagnostics::RxSnapshot::default(),
+            diag_window_secs: 0.0,
+            remote_frames: 0,
             toast: None,
             wave: VecDeque::new(),
             config,
@@ -509,6 +527,131 @@ impl RadioApp {
         self.show_toast("NodeID скопирован — отправьте другу");
     }
 
+    /// Раз в секунду пересчитывает окно счётчиков приёма.
+    ///
+    /// Накопительные числа отвечают на вопрос «что было за сессию», а окно —
+    /// «что происходит прямо сейчас»: при разборе «робота» важно второе.
+    fn sample_diagnostics(&mut self) {
+        let elapsed = self.diag_prev.1.elapsed();
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let current = self.diagnostics.rx.snapshot();
+        self.diag_window = self.diag_prev.0.delta(&current);
+        self.diag_window_secs = elapsed.as_secs_f32();
+        self.diag_prev = (current, Instant::now());
+    }
+
+    /// Всё, что попадает в отчёт и в панель: собирается в одном месте, чтобы
+    /// экран и скопированный текст показывали одни и те же числа.
+    fn diagnostics_input(&self) -> crate::diagnostics::ReportInput {
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let friends = self.friends.friends();
+        let friends_online = friends
+            .iter()
+            .filter(|f| self.presence.is_online(&f.node_id))
+            .count();
+        let links = self
+            .iroh
+            .as_ref()
+            .map(|p2p| p2p.link_stats())
+            .unwrap_or_default();
+
+        let mut errors = Vec::new();
+        if let Some(e) = &self.network_error {
+            errors.push(e.clone());
+        }
+        if let Some(e) = self.input2_error.as_deref() {
+            errors.push(format!("второй вход: {e}"));
+        }
+
+        let mut own_video: Option<crate::diagnostics::OwnVideo> = None;
+        let mut remote_video: Option<crate::diagnostics::RemoteVideo> = None;
+        #[cfg(windows)]
+        {
+            if let Some(video) = &self.video {
+                let (decode_ms, gpu_ms, image_ms) = video.timings();
+                own_video = Some(crate::diagnostics::OwnVideo {
+                    show_fps: video.fps(),
+                    target_fps: video.info().fps,
+                    encode_fps: video.encode_fps(),
+                    kbps: video.encode_kbps(),
+                    decode_ms,
+                    gpu_ms,
+                    image_ms,
+                });
+                if let Some(e) = video.last_error() {
+                    errors.push(format!("видео: {e}"));
+                }
+            }
+            if let Some(remote) = &self.remote {
+                let (decode_ms, gpu_ms, image_ms) = remote.timings();
+                remote_video = Some(crate::diagnostics::RemoteVideo {
+                    peer: remote.peer.clone(),
+                    fps: remote.fps(),
+                    decode_ms,
+                    gpu_ms,
+                    image_ms,
+                    buffer_ms: self.config.video_buffer_ms.unwrap_or(2000),
+                    frames: self.remote_frames,
+                });
+                if let Some(e) = remote.last_error() {
+                    errors.push(format!("приём видео: {e}"));
+                }
+            }
+            if let Some(e) = &self.video_error {
+                errors.push(format!("видео: {e}"));
+            }
+        }
+
+        let input2 = self.selected_input2.load(relaxed) as usize;
+
+        crate::diagnostics::ReportInput {
+            node_id: self.my_node_id.clone(),
+            is_host: self.is_host.load(relaxed),
+            // +1 — сам узел: в комнате он тоже участник, и шапка «1 узел»
+            // считает так же. Иначе панель и шапка показывали разные числа.
+            members_in_room: self.room.get_all_peers().len() + 1,
+            left_room: self.room.is_left(),
+            friends_online,
+            friends_total: friends.len(),
+            links,
+            rx_total: self.diagnostics.rx.snapshot(),
+            rx_window: self.diag_window,
+            rx_window_secs: self.diag_window_secs.max(1.0),
+            mic_device: self
+                .input_devices
+                .get(self.selected_input.load(relaxed) as usize)
+                .cloned(),
+            input2_device: if input2 == 0 {
+                None
+            } else {
+                self.input_devices.get(input2 - 1).cloned()
+            },
+            output_device: self
+                .output_devices
+                .get(self.selected_output.load(relaxed) as usize)
+                .cloned(),
+            mic_muted: self.mixer.is_mic_muted(),
+            mic_level: self.mixer.input1_peak().max(self.mixer.input2_peak()),
+            opus_kbps: self.mixer.opus_bitrate() / 1000,
+            own_video,
+            remote_video,
+            errors,
+            uptime: self.diagnostics.uptime(),
+        }
+    }
+
+    /// «Скопировать отчёт»: тот же текст, что видно в панели, но целиком и
+    /// с полным NodeID — его отправляют собеседнику при разборе «плохо слышно».
+    fn copy_diagnostics(&mut self, ctx: &egui::Context) {
+        let report = crate::diagnostics::render(&self.diagnostics_input());
+        // Заодно в журнал: консоль под рукой у того, кто смотрит процесс.
+        println!("{report}");
+        ctx.output_mut(|o| o.copied_text = report);
+        self.show_toast("Отчёт диагностики скопирован");
+    }
+
     fn unread_total(&self) -> usize {
         self.friends
             .friends()
@@ -727,6 +870,8 @@ impl eframe::App for RadioApp {
                     if let Some(remote) = &mut self.remote {
                         remote.feed(frame.unit, ctx);
                     }
+                    // счётчик для отчёта: сколько кадров реально принято
+                    self.remote_frames += 1;
                 }
             }
             // забрать готовый кадр, даже если новых не пришло
@@ -756,6 +901,7 @@ impl eframe::App for RadioApp {
                     self.playback_rx.clone(),
                     device_name.clone(),
                     self.mixer.clone(),
+                    self.diagnostics.clone(),
                 ) {
                     self.show_toast(&format!("Динамики не переключились: {e}"));
                 }
@@ -778,6 +924,8 @@ impl eframe::App for RadioApp {
             .input1_peak()
             .max(self.mixer.input2_peak())
             .clamp(0.0, 1.0);
+
+        self.sample_diagnostics();
 
         self.wave.push_back(level);
         while self.wave.len() > 56 {
@@ -868,6 +1016,10 @@ impl eframe::App for RadioApp {
             });
 
         // одновременно открыт только один оверлей
+        if self.diag_open && (self.settings_open || self.chat_open) {
+            self.settings_open = false;
+            self.chat_open = false;
+        }
         if self.settings_open && self.chat_open {
             self.chat_open = false;
         }
@@ -876,6 +1028,9 @@ impl eframe::App for RadioApp {
         }
         if self.chat_open {
             self.draw_chat_overlay(ctx);
+        }
+        if self.diag_open {
+            self.draw_diagnostics(ctx);
         }
         self.draw_call_overlay(ctx);
         self.draw_toast(ctx);
@@ -896,6 +1051,7 @@ impl RadioApp {
 
         let total_h = (ui.available_height() - 2.0).max(420.0);
         let mut open_chat = false;
+        let mut open_diagnostics = false;
 
         egui::Frame::none()
             .fill(t::SURFACE)
@@ -932,6 +1088,12 @@ impl RadioApp {
                         let unread = self.unread_total();
                         if chat_chip(ui, unread, self.chat_open).clicked() {
                             open_chat = true;
+                        }
+                        ui.add_space(6.0);
+                        // Диагностика рядом с чатом: когда «плохо слышно», её
+                        // ищут в первую очередь, а не в настройках.
+                        if t::chip_button(ui, "Диагностика", self.diag_open).clicked() {
+                            open_diagnostics = true;
                         }
                     });
                 });
@@ -1046,6 +1208,9 @@ impl RadioApp {
 
         if open_chat {
             self.open_chat();
+        }
+        if open_diagnostics {
+            self.diag_open = !self.diag_open;
         }
     }
 
@@ -1493,6 +1658,127 @@ impl RadioApp {
             }
         }
         self.show_toast("Вы вышли из эфира");
+    }
+
+    /// Панель «Диагностика»: сеть, звук, видео и кнопка «Скопировать отчёт».
+    ///
+    /// Числа берутся из того же `ReportInput`, что уходит в буфер обмена, —
+    /// экран и отчёт не расходятся. Панель не управляет звуком и видео: это
+    /// только наблюдение, поэтому и прав тут нет.
+    fn draw_diagnostics(&mut self, ctx: &egui::Context) {
+        let input = self.diagnostics_input();
+        let screen = ctx.screen_rect();
+        let mut close = false;
+        let mut copy = false;
+
+        let scrim = egui::Area::new(egui::Id::new("diag_scrim"))
+            .fixed_pos(screen.min)
+            .order(Order::Middle)
+            .show(ctx, |ui| {
+                let (rect, resp) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
+                resp
+            })
+            .inner;
+        if scrim.clicked() {
+            close = true;
+        }
+
+        let sheet_w = 620.0_f32.min(screen.width() - 60.0);
+        let sheet_h = 560.0_f32.min(screen.height() - 70.0);
+        let pos = egui::pos2(
+            screen.center().x - sheet_w * 0.5,
+            screen.center().y - sheet_h * 0.5,
+        );
+
+        egui::Area::new(egui::Id::new("diag_sheet"))
+            .fixed_pos(pos)
+            .order(Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(t::SURFACE)
+                    .rounding(Rounding::same(16.0))
+                    .stroke(Stroke::new(1.0_f32, t::STROKE))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 18.0),
+                        blur: 50.0,
+                        spread: 0.0,
+                        color: egui::Color32::from_black_alpha(170),
+                    })
+                    .inner_margin(egui::Margin::symmetric(18.0, 14.0))
+                    .show(ui, |ui| {
+                        ui.set_width(sheet_w - 36.0);
+                        ui.set_height(sheet_h - 28.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Диагностика")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(t::TEXT),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("наблюдение, ничего не меняет")
+                                    .size(9.5)
+                                    .color(t::TEXT_MUTED),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if t::icon_button(ui, t::Icon::Close, 26.0, false)
+                                    .on_hover_text("Закрыть")
+                                    .clicked()
+                                {
+                                    close = true;
+                                }
+                            });
+                        });
+
+                        ui.add_space(4.0);
+                        t::divider(ui);
+                        ui.add_space(6.0);
+
+                        egui::ScrollArea::vertical()
+                            .max_height(sheet_h - 132.0)
+                            .auto_shrink([false; 2])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                draw_diagnostics_body(ui, &input);
+                            });
+
+                        ui.add_space(6.0);
+                        t::divider(ui);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if t::primary_button(
+                                ui,
+                                "Скопировать отчёт",
+                                egui::vec2(180.0, 30.0),
+                            )
+                            .clicked()
+                            {
+                                copy = true;
+                            }
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "отчёт можно вставить в чат: у собеседника будут те же числа",
+                                )
+                                .size(9.5)
+                                .color(t::TEXT_MUTED),
+                            );
+                        });
+                    });
+            });
+
+        if copy {
+            self.copy_diagnostics(ctx);
+        }
+        // Esc закрывает панель, как и клик по затемнению
+        if close || (!ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape)))
+        {
+            self.diag_open = false;
+        }
     }
 
     fn draw_settings_overlay(&mut self, ctx: &egui::Context) {
@@ -2352,6 +2638,177 @@ impl RadioApp {
             self.last_save = Instant::now();
         }
     }
+}
+
+/// Строка «подпись — значение» в панели диагностики.
+fn diag_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(132.0, 16.0),
+            egui::Label::new(
+                egui::RichText::new(label)
+                    .size(9.5)
+                    .color(t::TEXT_MUTED),
+            ),
+        );
+        ui.label(
+            egui::RichText::new(value)
+                .size(10.5)
+                .monospace()
+                .color(t::TEXT),
+        );
+    });
+}
+
+/// Тело панели диагностики. Отдельной функцией: рисует только то, что уже
+/// собрано в `ReportInput`, поэтому экран и скопированный отчёт не расходятся.
+fn draw_diagnostics_body(ui: &mut egui::Ui, input: &crate::diagnostics::ReportInput) {
+    let short = crate::diagnostics::short_id;
+
+    t::section_label(ui, "СЕТЬ");
+    ui.add_space(4.0);
+    diag_row(ui, "Узел", &short(&input.node_id));
+    diag_row(
+        ui,
+        "Роль",
+        if input.is_host { "хост" } else { "гость" },
+    );
+    diag_row(
+        ui,
+        "В комнате",
+        &format!(
+            "{} (вышли: {})",
+            members_label(input.members_in_room),
+            if input.left_room { "да" } else { "нет" }
+        ),
+    );
+    diag_row(
+        ui,
+        "Друзья в сети",
+        &format!("{} из {}", input.friends_online, input.friends_total),
+    );
+    if input.links.is_empty() {
+        diag_row(ui, "Соединения", "нет");
+    } else {
+        for link in &input.links {
+            let bw = match link.bandwidth_bps {
+                Some(bps) => format!(" · {:.1} Мбит/с", bps as f64 / 1_000_000.0),
+                None => String::new(),
+            };
+            diag_row(
+                ui,
+                &short(&link.node_id),
+                &format!(
+                    "{} · RTT {} мс · потерь {}{bw}",
+                    if link.relay { "релей" } else { "напрямую" },
+                    link.rtt_ms,
+                    link.lost_packets
+                ),
+            );
+        }
+    }
+
+    ui.add_space(10.0);
+    t::section_label(ui, "ГОЛОС");
+    ui.add_space(4.0);
+    diag_row(
+        ui,
+        "Микрофон",
+        input.mic_device.as_deref().unwrap_or("по умолчанию"),
+    );
+    diag_row(
+        ui,
+        "Второй вход",
+        input.input2_device.as_deref().unwrap_or("то же устройство"),
+    );
+    diag_row(
+        ui,
+        "Динамики",
+        input.output_device.as_deref().unwrap_or("по умолчанию"),
+    );
+    diag_row(
+        ui,
+        "Передача",
+        &format!(
+            "{} кбит/с · уровень {:.2}{}",
+            input.opus_kbps,
+            input.mic_level,
+            if input.mic_muted { " · микрофон выключен" } else { "" }
+        ),
+    );
+    let all = &input.rx_total;
+    diag_row(
+        ui,
+        "Приём, всего",
+        &format!(
+            "провалов {} · маскировано {} · перезапусков {} · выброшено {}",
+            all.underruns, all.concealed, all.restarts, all.drops
+        ),
+    );
+    let win = &input.rx_window;
+    diag_row(
+        ui,
+        "Приём, окно",
+        &format!(
+            "за {:.0} с: провалов {} · маскировано {} · перезапусков {} · выброшено {}",
+            input.rx_window_secs, win.underruns, win.concealed, win.restarts, win.drops
+        ),
+    );
+
+    ui.add_space(10.0);
+    t::section_label(ui, "ВИДЕО");
+    ui.add_space(4.0);
+    match &input.own_video {
+        Some(v) => diag_row(
+            ui,
+            "Своя трансляция",
+            &format!(
+                "показ {:.0}/{:.0} FPS · захват {:.0} · {:.1} Мбит/с · декод {:.1} мс · GPU {:.1} мс · картинка {:.1} мс",
+                v.show_fps,
+                v.target_fps as f32,
+                v.encode_fps as f32,
+                v.kbps as f32 / 1000.0,
+                v.decode_ms,
+                v.gpu_ms,
+                v.image_ms
+            ),
+        ),
+        None => diag_row(ui, "Своя трансляция", "не идёт"),
+    }
+    match &input.remote_video {
+        Some(v) => diag_row(
+            ui,
+            "Приём",
+            &format!(
+                "{} · {:.0} FPS · кадров {} · буфер {:.1} с",
+                short(&v.peer),
+                v.fps,
+                v.frames,
+                v.buffer_ms as f32 / 1000.0
+            ),
+        ),
+        None => diag_row(ui, "Приём", "нет"),
+    }
+
+    ui.add_space(10.0);
+    t::section_label(ui, "ПРОЧЕЕ");
+    ui.add_space(4.0);
+    let errors_text = if input.errors.is_empty() {
+        "нет".to_string()
+    } else {
+        input.errors.join(" · ")
+    };
+    diag_row(ui, "Ошибки", &errors_text);
+    diag_row(
+        ui,
+        "Время работы",
+        &format!(
+            "{:02}:{:02}:{:02}",
+            input.uptime.as_secs() / 3600,
+            (input.uptime.as_secs() / 60) % 60,
+            input.uptime.as_secs() % 60
+        ),
+    );
 }
 
 /// «0:07» — длительность звонка в оверлее

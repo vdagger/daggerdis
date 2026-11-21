@@ -157,6 +157,9 @@ fn main() {
     let (playback_tx, playback_rx) = tokio::sync::mpsc::channel::<(u64, u32, Vec<u8>)>(100);
     let playback_rx = Arc::new(std::sync::Mutex::new(playback_rx));
     let playback_stream = Arc::new(Mutex::new(None));
+    // Общая точка диагностики: счётчики приёма пишет аудиоколбэк, показывает
+    // панель «Диагностика» и копирует в отчёт. Живёт всё время работы.
+    let diagnostics = Arc::new(albus::diagnostics::Diagnostics::new());
 
     let configured_output = config
         .output_device
@@ -169,6 +172,7 @@ fn main() {
         configured_output,
         playback_rx.clone(),
         mixer.clone(),
+        diagnostics.clone(),
     ) {
         Ok(stream) => *playback_stream.lock().unwrap() = Some(stream),
         Err(e) => eprintln!(
@@ -366,6 +370,7 @@ fn main() {
                 network_error,
                 calls,
                 presence,
+                diagnostics,
             );
 
             #[cfg(windows)]

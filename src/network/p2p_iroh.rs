@@ -223,6 +223,42 @@ impl IrohP2pManager {
         self.connections.lock().await.keys().cloned().collect()
     }
 
+    /// Состояние путей до подключённых узлов: RTT, потери, окно, «напрямую или
+    /// через релей».
+    ///
+    /// RTT считает сам QUIC по своему пути, а не приложение пингами: это то же
+    /// число, по которому работают таймеры повторов, то есть честная задержка
+    /// транспорта. Метод синхронный (`try_lock`): его зовёт GUI каждый кадр, и
+    /// пропустить кадр дешевле, чем ждать карту соединений.
+    pub fn link_stats(&self) -> Vec<crate::diagnostics::LinkLine> {
+        let Ok(conns) = self.connections.try_lock() else {
+            return Vec::new();
+        };
+        conns
+            .iter()
+            .filter(|(_, conn)| conn.close_reason().is_none())
+            .filter_map(|(node_id, conn)| {
+                let paths = conn.paths();
+                // Показываем выбранный путь: именно по нему идут данные.
+                // Запасной релей в списке есть, но «через релей» ещё не значит
+                // «идём через релей», и путать это в диагностике нельзя.
+                let path = paths
+                    .iter()
+                    .find(|p| p.is_selected())
+                    .or_else(|| paths.iter().next())?;
+                let stats = path.stats();
+                Some(crate::diagnostics::LinkLine {
+                    node_id: node_id.clone(),
+                    relay: path.is_relay(),
+                    rtt_ms: stats.rtt.as_millis() as u64,
+                    lost_packets: stats.lost_packets,
+                    cwnd: stats.cwnd,
+                    bandwidth_bps: stats.bandwidth_estimate,
+                })
+            })
+            .collect()
+    }
+
     /// Отправляет сырые байты (Opus / NetworkMessage) указанному NodeID.
     ///
     /// Датаграм уходит только в живое соединение. Раньше запись в закрытое

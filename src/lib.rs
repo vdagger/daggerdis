@@ -3,6 +3,7 @@ pub mod calls;
 pub mod chat;
 pub mod config;
 pub mod devices;
+pub mod diagnostics;
 pub mod firewall;
 pub mod friends;
 pub mod gui;

@@ -310,6 +310,13 @@ impl VideoSession {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Сколько килобит в секунду уходит в сеть (оценка энкодера за секунду).
+    pub fn encode_kbps(&self) -> u32 {
+        self.publisher
+            .encode_kbps
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn last_error(&self) -> Option<&String> {
         self.renderer.last_error.as_ref()
     }

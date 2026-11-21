@@ -24,6 +24,8 @@ pub struct ScreenPublisher {
     pub source: String,
     /// Фактическая частота кодирования за последнюю секунду (диагностика).
     pub encode_fps: Arc<AtomicU32>,
+    /// Сколько килобит в секунду уходит в сеть за последнюю секунду (диагностика).
+    pub encode_kbps: Arc<AtomicU32>,
 }
 
 impl ScreenPublisher {
@@ -34,11 +36,20 @@ impl ScreenPublisher {
         let stop_thread = stop.clone();
         let encode_fps = Arc::new(AtomicU32::new(0));
         let encode_fps_thread = encode_fps.clone();
+        let encode_kbps = Arc::new(AtomicU32::new(0));
+        let encode_kbps_thread = encode_kbps.clone();
 
         let handle = std::thread::Builder::new()
             .name("video-publisher".into())
             .spawn(move || {
-                if let Err(e) = run(&stop_thread, fps, &frame_tx, &init_tx, &encode_fps_thread) {
+                if let Err(e) = run(
+                    &stop_thread,
+                    fps,
+                    &frame_tx,
+                    &init_tx,
+                    &encode_fps_thread,
+                    &encode_kbps_thread,
+                ) {
                     eprintln!("[ВИДЕО] Публикация остановлена: {e}");
                 }
             })
@@ -53,6 +64,7 @@ impl ScreenPublisher {
                 info,
                 source,
                 encode_fps,
+                encode_kbps,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -78,6 +90,7 @@ fn run(
     tx: &Sender<EncodedUnit>,
     init: &Sender<Result<(StreamInfo, String), String>>,
     encode_fps: &AtomicU32,
+    encode_kbps: &AtomicU32,
 ) -> Result<(), String> {
     // целимся в нативное разрешение экрана: апскейл тратит битрейт зря
     let mut capture = match ScreenCapture::new(None, fps) {
@@ -116,6 +129,9 @@ fn run(
     // в целевой fps или в захват/энкодер
     let mut fps_window = Instant::now();
     let mut fps_frames = 0u32;
+    // сколько байт ушло в сеть за окно: битрейт важнее целевого, потому что
+    // он и определяет, перегружен ли канал
+    let mut window_bytes: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         let frame = match capture.next_nv12(50) {
@@ -127,6 +143,7 @@ fn run(
             Ok(units) => {
                 for unit in units {
                     fps_frames += 1;
+                    window_bytes += unit.data.len() as u64;
                     if tx.send(unit).is_err() {
                         return Ok(()); // получатель закрылся
                     }
@@ -136,9 +153,16 @@ fn run(
         }
         let dt = fps_window.elapsed();
         if dt >= Duration::from_secs(1) {
-            encode_fps.store((fps_frames as f32 / dt.as_secs_f32()).round() as u32, Ordering::Relaxed);
+            let secs = dt.as_secs_f32();
+            encode_fps.store((fps_frames as f32 / secs).round() as u32, Ordering::Relaxed);
+            // килобиты в секунду: байты × 8 / 1000
+            encode_kbps.store(
+                (window_bytes as f32 * 8.0 / 1000.0 / secs).round() as u32,
+                Ordering::Relaxed,
+            );
             fps_window = Instant::now();
             fps_frames = 0;
+            window_bytes = 0;
         }
 
         // не кодируем чаще целевого fps, даже если экран обновляется быстрее
@@ -153,3 +177,5 @@ fn run(
     let _ = encoder.finish();
     Ok(())
 }
+
+

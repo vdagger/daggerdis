@@ -109,6 +109,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/friends.rs` | `FriendsManager`: `friends.json` (node_id/name/date), incoming/outgoing requests |
 | `src/presence.rs` | `PresenceTracker`: кто из друзей недавно подавал признаки жизни (TTL 12 с) + фоновый ping-цикл раз в 4 с |
 | `src/chat.rs` | `ChatLog`: session-only DM history in memory (per-NodeID threads, unread counts) |
+| `src/diagnostics.rs` | `RxStats` (счётчики приёма голоса в атомиках), `LinkLine`/`OwnVideo`/`RemoteVideo`, `ReportInput` + `render()` — текст отчёта для панели «Диагностика» и «Скопировать отчёт» |
 | `src/calls.rs` | `CallManager`: состояние звонка (Idle/Outgoing/Incoming/Active), переходы под одним замком, проверка `call_id` в Accept/Decline/Cancel/End, приглашения с переотправкой, таймауты, «занято», блокировка нодоступного собеседника в комнате, тон звонка |
 | `src/room.rs` | `RoomManager`: `Mutex<Vec<Peer>>`, peer upsert/remove, next-host election, флаг `left` («Выйти из эфира») |
 | `src/migration.rs` | `MigrationManager`: 1 s IrohSync broadcast, host failover |
@@ -121,7 +122,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/firewall.rs` | `setup_firewall_rules()`: Windows firewall inbound UDP rule for the current exe — идемпотентно (лишние одноимённые записи чистятся) |
 | `src/menu.rs` | `handle_command()`: console `/mute`, `/vol`, `/mic`, `/devices` (dormant — see below) |
 | `src/network/mod.rs` | Re-exports `NetworkMessage`; declares `broadcast`, `iroh_service`, `message`, `p2p_iroh`, `video_directory`, `video_link` |
-| `src/network/p2p_iroh.rs` | `IrohP2pManager`: QUIC datagrams + uni-стримы (`send_bytes` с переподключением, `spawn_stream_receiver`), connect by NodeID, `broadcast_bytes`, `disconnect_peer`/`disconnect_all` |
+| `src/network/p2p_iroh.rs` | `IrohP2pManager`: QUIC datagrams + uni-стримы (`send_bytes` с переподключением, `spawn_stream_receiver`), connect by NodeID, `broadcast_bytes`, `disconnect_peer`/`disconnect_all`, `link_stats()` — RTT/потери/окно/«напрямую или релей» по выбранному пути QUIC (для диагностики) |
 | `src/network/iroh_service.rs` | `spawn_iroh_receiver`: Iroh listener, sender_id↔NodeID check, full-mesh, relay, friends, chat, звонки (гейт по `CallManager::is_blocked`) |
 | `src/network/broadcast.rs` | `spawn_audio_broadcast`: parallel voice fan-out over Iroh |
 | `src/network/message.rs` | `NetworkMessage` enum + hand-rolled binary (de)serialization |
@@ -624,6 +625,20 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   a *driver* device; disabling an already-active endpoint with
   `Disable-PnpDevice` does **not** change its WASAPI state (it stays `ACTIVE` in
   `MMDevices`), so it cannot be used to fake a removal.
+- **Diagnostics panel: the numbers come from QUIC and from the audio callback, not
+  from pings.** `p2p_iroh::link_stats()` reads the *selected* QUIC path
+  (`Connection::paths()` → `is_selected()`, `rtt()`, `lost_packets`, `cwnd`,
+  `bandwidth_estimate`, `is_relay()`), so RTT is the same value the retransmission
+  timers use and it exists for every connection (the presence ping only reaches
+  friends that have been silent). It takes `try_lock`: the connection map lives
+  under `tokio::sync::Mutex` while the GUI is synchronous, and skipping one frame
+  is cheaper than blocking. Voice-reception counters are atomics in
+  `diagnostics::RxStats`, written from the playback callback — they replaced the
+  old per-10-s local variables, and the console log now prints the delta between
+  snapshots. `ReportInput` + `diagnostics::render()` produce the text for both the
+  panel and «Скопировать отчёт» (clipboard + console), so the screen and the
+  copied report cannot diverge. The panel is read-only on purpose: a second path
+  that changes audio/video next to the settings overlay would drift from it.
 - **A multichannel endpoint gets the signal in two channels only.** On a
   virtual 7.1 output (`Динамики (7.1 Surround Sound)`, 8 channels) writing the
   same mono sample into all eight made the peer's speech a mush: the
