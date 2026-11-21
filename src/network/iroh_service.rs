@@ -315,7 +315,7 @@ pub fn spawn_iroh_receiver(
                         }
                         NetworkMessage::CallInvite {
                             sender_id,
-                            call_id,
+                            room_id,
                             nick,
                         } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
@@ -334,44 +334,82 @@ pub fn spawn_iroh_receiver(
                                 "[ЗВОНКИ] Входящий звонок от {} ({})",
                                 nick, pkt.sender_id
                             );
-                            calls_iroh.on_invite(&pkt.sender_id, &nick, call_id);
+                            calls_iroh.on_invite(&pkt.sender_id, &nick, room_id);
                         }
                         NetworkMessage::CallAccept {
                             sender_id,
-                            call_id,
+                            room_id,
                         } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            calls_iroh.on_accept(&pkt.sender_id, call_id);
+                            calls_iroh.on_accept(&pkt.sender_id, room_id);
                         }
                         NetworkMessage::CallDecline {
                             sender_id,
-                            call_id,
+                            room_id,
                             reason,
                         } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            calls_iroh.on_decline(&pkt.sender_id, call_id, reason);
+                            calls_iroh.on_decline(&pkt.sender_id, room_id, reason);
                         }
                         NetworkMessage::CallCancel {
                             sender_id,
-                            call_id,
+                            room_id,
                         } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            calls_iroh.on_cancel(&pkt.sender_id, call_id);
+                            calls_iroh.on_cancel(&pkt.sender_id, room_id);
                         }
                         NetworkMessage::CallEnd {
                             sender_id,
-                            call_id,
+                            room_id,
                         } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
                                 continue;
                             }
-                            calls_iroh.on_end(&pkt.sender_id, call_id);
+                            calls_iroh.on_end(&pkt.sender_id, room_id);
+                        }
+                        NetworkMessage::RoomMembers {
+                            sender_id,
+                            room_id,
+                            members,
+                        } => {
+                            if !sender_id_verified(&pkt.sender_id, sender_id) {
+                                continue;
+                            }
+                            // Номер комнаты известен только приглашённым: список
+                            // от чужого (или от другой комнаты) не применяем.
+                            if calls_iroh.room_id() != Some(room_id) {
+                                eprintln!(
+                                    "[КОМНАТА] Список комнаты от {} не для нашей комнаты — отброшен",
+                                    pkt.sender_id
+                                );
+                                continue;
+                            }
+                            println!(
+                                "[КОМНАТА] Список комнаты от {}: {} участник(ов)",
+                                pkt.sender_id,
+                                members.len()
+                            );
+                            // Дотягиваемся до каждого участника: без этого новый
+                            // в комнате остался бы соединён только с пригласившим
+                            // и не слышал бы остальных.
+                            for node in members {
+                                if node == p2p_recv.my_node_id {
+                                    continue;
+                                }
+                                let p2p = p2p_recv.clone();
+                                tokio::spawn(async move {
+                                    let connected = p2p.get_connected_peers().await;
+                                    if !connected.contains(&node) {
+                                        let _ = p2p.connect_to_peer(&node).await;
+                                    }
+                                });
+                            }
                         }
                         NetworkMessage::PresencePing { sender_id } => {
                             if !sender_id_verified(&pkt.sender_id, sender_id) {
@@ -399,3 +437,4 @@ pub fn spawn_iroh_receiver(
         });
     }
 }
+

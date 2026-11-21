@@ -37,6 +37,15 @@ fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32, position: &mut f
     output
 }
 
+/// Пакетная потеря кадра: декодер продолжает сигнал по модели.
+///
+/// В Opus пустой пакет для `decode` — это и есть PLC (`opus_decode` с
+/// `data = NULL`): продолжение тона и формы спектра по истории, а не повтор
+/// последнего кадра. Возвращает 0, если декодер ещё не слышал ни одного пакета.
+fn plc(decoder: &mut rusty_opus::OpusDecoder, out: &mut [f32; 960]) -> usize {
+    decoder.decode(&[], 960, out).unwrap_or(0)
+}
+
 impl UniversalAudioCapture {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(UniversalAudioCapture)
@@ -496,16 +505,61 @@ impl UniversalAudioCapture {
                         // Дырка в нумерации: один потерянный датаграм не должен
                         // останавливать воспроизведение. Иначе звук замирает, пока
                         // не наберётся полный буфер, и выплёвывается пачкой — на слух
-                        // это «робот». Если впереди уже несколько пакетов, ждать
-                        // потерянный бессмысленно: считаем его потерянным и
-                        // маскируем: повторяем последний кадр с затуханием.
+                        // это «робот». Но и повтор последнего кадра «роботом» звучит:
+                        // одна и та же волна дважды. Поэтому восстанавливаем кадр
+                        // по порядку цены и качества:
+                        //   1) in-band FEC — Opus кладёт в следующий пакет копию
+                        //      предыдущего кадра (SILK/hybrid), берём её;
+                        //   2) PLC декодера — продолжает сигнал по модели (тон и
+                        //      форма спектра), а не повторяет кадр;
+                        //   3) повтор с затуханием — только если декодер ещё ничего
+                        //      не слышал и восстанавливать нечем.
                         if !peer.queue.contains_key(&peer.next) && peer.queue.len() >= 3 {
                             if let Some(&lowest) = peer.queue.keys().next() {
                                 let missing = lowest.wrapping_sub(peer.next) as usize;
                                 if missing <= 3 && !peer.last_pcm.is_empty() {
                                     for r in 0..missing {
-                                        let fade = 1.0 - (r as f32 + 1.0) / (missing as f32 + 1.0);
-                                        peer.pcm.extend(peer.last_pcm.iter().map(|s| s * fade));
+                                        let mut restored = [0.0f32; 960];
+                                        // FEC отдаёт ровно один кадр — тот, что был
+                                        // до следующего пакета; остальные дырки
+                                        // закрывает PLC.
+                                        let len = if r == 0 {
+                                            match peer.queue.get(&lowest) {
+                                                Some(next) => match peer.decoder.decode_fec(
+                                                    next,
+                                                    960,
+                                                    &mut restored,
+                                                ) {
+                                                    Ok(n) if n > 0 => {
+                                                        diag.rx.fec();
+                                                        n
+                                                    }
+                                                    _ => plc(&mut peer.decoder, &mut restored),
+                                                },
+                                                None => plc(&mut peer.decoder, &mut restored),
+                                            }
+                                        } else {
+                                            plc(&mut peer.decoder, &mut restored)
+                                        };
+                                        if len == 0 {
+                                            let fade =
+                                                1.0 - (r as f32 + 1.0) / (missing as f32 + 1.0);
+                                            peer.pcm
+                                                .extend(peer.last_pcm.iter().map(|s| s * fade));
+                                        } else {
+                                            mixer.process_output(sender_id, &mut restored[..len]);
+                                            let chunk: Vec<f32> = if sample_rate != 48000 {
+                                                resample_linear(
+                                                    &restored[..len],
+                                                    48000,
+                                                    sample_rate,
+                                                    &mut peer.resample_pos,
+                                                )
+                                            } else {
+                                                restored[..len].to_vec()
+                                            };
+                                            peer.pcm.extend_from_slice(&chunk);
+                                        }
                                         diag.rx.concealed();
                                     }
                                 }

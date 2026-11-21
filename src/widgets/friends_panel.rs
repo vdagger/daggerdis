@@ -286,16 +286,23 @@ pub fn draw_friends_panel(
                     *chat_open = true;
                 }
                 if t::icon_button(ui, t::Icon::Phone, 22.0, false)
-                    .on_hover_text(if online {
-                        "Позвонить"
-                    } else {
+                    .on_hover_text(if !online {
                         "Не в сети"
+                    } else if matches!(
+                        calls.view(),
+                        crate::calls::CallView::Active { .. } | crate::calls::CallView::Outgoing { .. }
+                    ) {
+                        // Мы уже в комнате — собеседника зовём в неё, а не
+                        // открываем второй разговор
+                        "Пригласить в комнату"
+                    } else {
+                        "Позвонить"
                     })
                     .clicked()
                 {
                     if online {
-                        // Собеседник получает приглашение и сам решает, отвечать ли:
-                        // в комнату он попадает только после «Принять».
+                        // Собеседник получает приглашение и сам решает, входить
+                        // ли: в комнату он попадает только после «Войти».
                         calls.start_outgoing(&friend.node_id, &friend.name, nick);
                     } else {
                         // Иначе гудок шёл бы 35 секунд в никуда: друг либо

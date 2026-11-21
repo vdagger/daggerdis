@@ -2098,6 +2098,14 @@ impl RadioApp {
         // Esc работает как крупная кнопка: выйти из звонка, не целясь мышью.
         // Но только когда фокус не в текстовом поле: там Esc — для текста,
         // иначе он заодно обрывал бы разговор при правке сообщения.
+        // Enter — войти в комнату, не целясь мышью: приглашение часто приходит,
+        // когда окно не в фокусе, а Esc рядом отклоняет.
+        if !ctx.wants_keyboard_input()
+            && matches!(view, crate::calls::CallView::Incoming { .. })
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        {
+            accept = true;
+        }
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             match view {
                 crate::calls::CallView::Incoming { .. } => decline = true,
@@ -2107,7 +2115,24 @@ impl RadioApp {
             }
         }
 
-        if let crate::calls::CallView::Active { nick, elapsed } = &view {
+        if let crate::calls::CallView::Active {
+            members,
+            peer,
+            elapsed,
+        } = &view
+        {
+            // В комнате на N подписью служит число участников; имя показываем,
+            // когда собеседник один — как в прежнем личном звонке.
+            let label = match (members, peer) {
+                (2, Some(node)) => self
+                    .friends
+                    .friends()
+                    .into_iter()
+                    .find(|f| &f.node_id == node)
+                    .map(|f| f.name)
+                    .unwrap_or_else(|| crate::diagnostics::short_id(node)),
+                _ => format!("{members} в комнате"),
+            };
             // Идёт разговор: никакой карточки поверх окна — стрим и комната
             // должны оставаться видны. Только компактная плашка в углу.
             egui::Area::new(egui::Id::new("call_pill"))
@@ -2134,7 +2159,7 @@ impl RadioApp {
                                 ui.painter().circle_filled(dot.center(), 3.0, t::LIVE);
                                 ui.add_space(6.0);
                                 ui.label(
-                                    egui::RichText::new(nick)
+                                    egui::RichText::new(&label)
                                         .size(11.5)
                                         .strong()
                                         .color(t::TEXT),
@@ -2150,7 +2175,7 @@ impl RadioApp {
                                 if ui
                                     .add(
                                         egui::Button::new(
-                                            egui::RichText::new("Завершить")
+                                            egui::RichText::new("Выйти")
                                                 .size(10.0)
                                                 .strong()
                                                 .color(egui::Color32::WHITE),
@@ -2158,7 +2183,7 @@ impl RadioApp {
                                         .fill(t::REC)
                                         .rounding(Rounding::same(7.0)),
                                     )
-                                    .on_hover_text("Завершить звонок (ESC)")
+                                    .on_hover_text("Выйти из комнаты (ESC)")
                                     .clicked()
                                 {
                                     end = true;
@@ -2193,7 +2218,7 @@ impl RadioApp {
                                     ui.add_space(4.0);
                                     ui.vertical(|ui| {
                                         ui.label(
-                                            egui::RichText::new("Входящий звонок")
+                                            egui::RichText::new("Приглашение в комнату")
                                                 .size(9.0)
                                                 .strong()
                                                 .color(t::TEXT_MUTED),
@@ -2211,14 +2236,14 @@ impl RadioApp {
                                     if t::chip_button(ui, "Отклонить", false).clicked() {
                                         decline = true;
                                     }
-                                    if t::primary_button(ui, "Принять", egui::vec2(150.0, 30.0))
+                                    if t::primary_button(ui, "Войти", egui::vec2(150.0, 30.0))
                                         .clicked()
                                     {
                                         accept = true;
                                     }
                                 });
                                 ui.add_space(4.0);
-                                t::micro(ui, "ESC — отклонить");
+                                t::micro(ui, "ENTER — войти · ESC — отклонить");
                             }
                             crate::calls::CallView::Outgoing { nick, elapsed } => {
                                 ui.horizontal(|ui| {
@@ -2226,7 +2251,7 @@ impl RadioApp {
                                     ui.add_space(4.0);
                                     ui.vertical(|ui| {
                                         ui.label(
-                                            egui::RichText::new("Звоним…")
+                                            egui::RichText::new("Приглашаем…")
                                                 .size(9.0)
                                                 .strong()
                                                 .color(t::TEXT_MUTED),
@@ -2253,7 +2278,7 @@ impl RadioApp {
                                     .add_sized(
                                         egui::vec2(w, 30.0),
                                         egui::Button::new(
-                                            egui::RichText::new("Отменить звонок")
+                                            egui::RichText::new("Отменить приглашение")
                                                 .size(11.0)
                                                 .strong()
                                                 .color(egui::Color32::WHITE),
@@ -2266,7 +2291,7 @@ impl RadioApp {
                                     cancel = true;
                                 }
                                 ui.add_space(4.0);
-                                t::micro(ui, "ESC — отменить");
+                                t::micro(ui, "ESC — отменить приглашение");
                             }
                             // Идущий разговор рисуется плашкой выше, не карточкой
                             crate::calls::CallView::Active { .. } => {}
@@ -2741,8 +2766,8 @@ fn draw_diagnostics_body(ui: &mut egui::Ui, input: &crate::diagnostics::ReportIn
         ui,
         "Приём, всего",
         &format!(
-            "провалов {} · маскировано {} · перезапусков {} · выброшено {}",
-            all.underruns, all.concealed, all.restarts, all.drops
+            "провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}",
+            all.underruns, all.concealed, all.fec, all.restarts, all.drops
         ),
     );
     let win = &input.rx_window;
@@ -2750,8 +2775,8 @@ fn draw_diagnostics_body(ui: &mut egui::Ui, input: &crate::diagnostics::ReportIn
         ui,
         "Приём, окно",
         &format!(
-            "за {:.0} с: провалов {} · маскировано {} · перезапусков {} · выброшено {}",
-            input.rx_window_secs, win.underruns, win.concealed, win.restarts, win.drops
+            "за {:.0} с: провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}",
+            input.rx_window_secs, win.underruns, win.concealed, win.fec, win.restarts, win.drops
         ),
     );
 
@@ -2937,4 +2962,8 @@ fn mixer_row(ui: &mut egui::Ui, label: &str, value: &mut u32, level: f32) {
         *value = (f * 100.0).round() as u32;
     }
 }
+
+
+
+
 

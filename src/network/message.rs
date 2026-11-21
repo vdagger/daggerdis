@@ -45,26 +45,26 @@ pub enum NetworkMessage {
     /// Звонок: приглашение. Попасть в комнату можно только после `CallAccept`.
     CallInvite {
         sender_id: u64,
-        call_id: u32,
+        room_id: u32,
         nick: String,
     },
     CallAccept {
         sender_id: u64,
-        call_id: u32,
+        room_id: u32,
     },
     /// Причина: 0 — отклонил, 1 — занят, 2 — не отвечает/таймаут
     CallDecline {
         sender_id: u64,
-        call_id: u32,
+        room_id: u32,
         reason: u8,
     },
     CallCancel {
         sender_id: u64,
-        call_id: u32,
+        room_id: u32,
     },
     CallEnd {
         sender_id: u64,
-        call_id: u32,
+        room_id: u32,
     },
     /// «Я в сети»: друг проверяет, доступен ли узел. Ответ — `PresencePong`.
     /// Отдельный пакет, а не Heartbeat: тот живёт только внутри комнаты.
@@ -74,6 +74,19 @@ pub enum NetworkMessage {
     /// Ответ на `PresencePing` — сам пинг отправителю тоже не нужен.
     PresencePong {
         sender_id: u64,
+    },
+    /// Кто ещё в комнате: пригласивший отдаёт список участников тому, кто
+    /// только что принял приглашение.
+    ///
+    /// Без этого список комнаты не собирается: новый участник соединён только
+    /// с пригласившим, а остальные узнают о нём лишь когда он сам им напишет.
+    /// Полный mesh строится по этому списку (каждый участник соединяется с
+    /// каждым — голос идёт напрямую, без сервера).
+    RoomMembers {
+        sender_id: u64,
+        room_id: u32,
+        /// NodeID участников, не считая получателя.
+        members: Vec<String>,
     },
 }
 
@@ -175,38 +188,38 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
         }
         NetworkMessage::CallInvite {
             sender_id,
-            call_id,
+            room_id,
             nick,
         } => {
             data.push(10);
             data.extend_from_slice(&sender_id.to_le_bytes());
-            data.extend_from_slice(&call_id.to_le_bytes());
+            data.extend_from_slice(&room_id.to_le_bytes());
             push_str(&mut data, nick);
         }
-        NetworkMessage::CallAccept { sender_id, call_id } => {
+        NetworkMessage::CallAccept { sender_id, room_id } => {
             data.push(11);
             data.extend_from_slice(&sender_id.to_le_bytes());
-            data.extend_from_slice(&call_id.to_le_bytes());
+            data.extend_from_slice(&room_id.to_le_bytes());
         }
         NetworkMessage::CallDecline {
             sender_id,
-            call_id,
+            room_id,
             reason,
         } => {
             data.push(12);
             data.extend_from_slice(&sender_id.to_le_bytes());
-            data.extend_from_slice(&call_id.to_le_bytes());
+            data.extend_from_slice(&room_id.to_le_bytes());
             data.push(*reason);
         }
-        NetworkMessage::CallCancel { sender_id, call_id } => {
+        NetworkMessage::CallCancel { sender_id, room_id } => {
             data.push(13);
             data.extend_from_slice(&sender_id.to_le_bytes());
-            data.extend_from_slice(&call_id.to_le_bytes());
+            data.extend_from_slice(&room_id.to_le_bytes());
         }
-        NetworkMessage::CallEnd { sender_id, call_id } => {
+        NetworkMessage::CallEnd { sender_id, room_id } => {
             data.push(14);
             data.extend_from_slice(&sender_id.to_le_bytes());
-            data.extend_from_slice(&call_id.to_le_bytes());
+            data.extend_from_slice(&room_id.to_le_bytes());
         }
         NetworkMessage::PresencePing { sender_id } => {
             data.push(15);
@@ -215,6 +228,19 @@ pub fn serialize_msg(msg: &NetworkMessage) -> Vec<u8> {
         NetworkMessage::PresencePong { sender_id } => {
             data.push(16);
             data.extend_from_slice(&sender_id.to_le_bytes());
+        }
+        NetworkMessage::RoomMembers {
+            sender_id,
+            room_id,
+            members,
+        } => {
+            data.push(17);
+            data.extend_from_slice(&sender_id.to_le_bytes());
+            data.extend_from_slice(&room_id.to_le_bytes());
+            data.extend_from_slice(&(members.len() as u16).to_le_bytes());
+            for member in members {
+                push_str(&mut data, member);
+            }
         }
     }
     data
@@ -309,38 +335,38 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
         }
         10 if bytes.len() >= 13 => {
             let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            let room_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
             let mut off = 13;
             let nick = read_str(bytes, &mut off)?;
             Some(NetworkMessage::CallInvite {
                 sender_id,
-                call_id,
+                room_id,
                 nick,
             })
         }
         11 if bytes.len() >= 13 => {
             let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
-            Some(NetworkMessage::CallAccept { sender_id, call_id })
+            let room_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            Some(NetworkMessage::CallAccept { sender_id, room_id })
         }
         12 if bytes.len() >= 14 => {
             let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            let room_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
             Some(NetworkMessage::CallDecline {
                 sender_id,
-                call_id,
+                room_id,
                 reason: bytes[13],
             })
         }
         13 if bytes.len() >= 13 => {
             let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
-            Some(NetworkMessage::CallCancel { sender_id, call_id })
+            let room_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            Some(NetworkMessage::CallCancel { sender_id, room_id })
         }
         14 if bytes.len() >= 13 => {
             let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-            let call_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
-            Some(NetworkMessage::CallEnd { sender_id, call_id })
+            let room_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            Some(NetworkMessage::CallEnd { sender_id, room_id })
         }
         15 if bytes.len() >= 9 => {
             let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
@@ -349,6 +375,25 @@ pub fn deserialize_msg(bytes: &[u8]) -> Option<NetworkMessage> {
         16 if bytes.len() >= 9 => {
             let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
             Some(NetworkMessage::PresencePong { sender_id })
+        }
+        17 if bytes.len() >= 15 => {
+            let sender_id = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+            let room_id = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
+            let count = u16::from_le_bytes([bytes[13], bytes[14]]) as usize;
+            // Больше 64 участников не бывает: пакет с таким числом — мусор.
+            if count > 64 {
+                return None;
+            }
+            let mut off = 15;
+            let mut members = Vec::with_capacity(count);
+            for _ in 0..count {
+                members.push(read_str(bytes, &mut off)?);
+            }
+            Some(NetworkMessage::RoomMembers {
+                sender_id,
+                room_id,
+                members,
+            })
         }
         _ => None,
     }
@@ -406,30 +451,51 @@ mod tests {
         });
         roundtrip(NetworkMessage::CallInvite {
             sender_id: 5,
-            call_id: 0xDEAD_BEEF,
+            room_id: 0xDEAD_BEEF,
             nick: "Костя".into(),
         });
         roundtrip(NetworkMessage::CallAccept {
             sender_id: 6,
-            call_id: 9,
+            room_id: 9,
         });
         roundtrip(NetworkMessage::CallDecline {
             sender_id: 7,
-            call_id: 10,
+            room_id: 10,
             reason: 2,
         });
         roundtrip(NetworkMessage::CallCancel {
             sender_id: 8,
-            call_id: 11,
+            room_id: 11,
         });
         roundtrip(NetworkMessage::CallEnd {
             sender_id: 9,
-            call_id: 12,
+            room_id: 12,
         });
         roundtrip(NetworkMessage::PresencePing { sender_id: 10 });
         roundtrip(NetworkMessage::PresencePong {
             sender_id: 0xFFFF_FFFF_FFFF_FFFF,
         });
+        roundtrip(NetworkMessage::RoomMembers {
+            sender_id: 12,
+            room_id: 0x0BAD_F00D,
+            members: vec!["ab".repeat(32), "cd".repeat(32)],
+        });
+    }
+
+    #[test]
+    fn room_members_layout_and_truncation() {
+        let bytes = serialize_msg(&NetworkMessage::RoomMembers {
+            sender_id: 1,
+            room_id: 7,
+            members: vec!["aa".into(), "bb".into()],
+        });
+        assert_eq!(&bytes[..1], &[17]);
+        assert_eq!(u32::from_le_bytes(bytes[9..13].try_into().unwrap()), 7);
+        assert_eq!(u16::from_le_bytes([bytes[13], bytes[14]]), 2);
+        assert!(deserialize_msg(&bytes).is_some());
+        // обрезанный список не должен превращаться в комнату без участников
+        assert!(deserialize_msg(&bytes[..bytes.len() - 1]).is_none());
+        assert!(deserialize_msg(&bytes[..14]).is_none());
     }
 
     #[test]
@@ -501,20 +567,20 @@ mod tests {
     fn truncated_calls_rejected() {
         let accept = serialize_msg(&NetworkMessage::CallAccept {
             sender_id: 1,
-            call_id: 2,
+            room_id: 2,
         });
         assert!(deserialize_msg(&accept[..12]).is_none());
 
         let decline = serialize_msg(&NetworkMessage::CallDecline {
             sender_id: 1,
-            call_id: 2,
+            room_id: 2,
             reason: 1,
         });
         assert!(deserialize_msg(&decline[..13]).is_none());
 
         let invite = serialize_msg(&NetworkMessage::CallInvite {
             sender_id: 1,
-            call_id: 2,
+            room_id: 2,
             nick: "ник".into(),
         });
         // никовое поле не влезло целиком
@@ -528,3 +594,5 @@ mod tests {
         assert!(deserialize_msg(&[0]).is_none());
     }
 }
+
+

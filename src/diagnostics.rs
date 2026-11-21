@@ -17,6 +17,8 @@ use std::time::Duration;
 pub struct RxStats {
     underruns: AtomicU64,
     concealed: AtomicU64,
+    /// Из маскированных кадров — восстановленные in-band FEC (а не PLC)
+    fec: AtomicU64,
     restarts: AtomicU64,
     drops: AtomicU64,
 }
@@ -26,6 +28,8 @@ pub struct RxStats {
 pub struct RxSnapshot {
     pub underruns: u64,
     pub concealed: u64,
+    /// Сколько из маскированных кадров восстановлено FEC
+    pub fec: u64,
     pub restarts: u64,
     pub drops: u64,
 }
@@ -41,6 +45,7 @@ impl RxSnapshot {
         RxSnapshot {
             underruns: later.underruns.saturating_sub(self.underruns),
             concealed: later.concealed.saturating_sub(self.concealed),
+            fec: later.fec.saturating_sub(self.fec),
             restarts: later.restarts.saturating_sub(self.restarts),
             drops: later.drops.saturating_sub(self.drops),
         }
@@ -56,6 +61,10 @@ impl RxStats {
         self.concealed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn fec(&self) {
+        self.fec.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn restart(&self) {
         self.restarts.fetch_add(1, Ordering::Relaxed);
     }
@@ -68,6 +77,7 @@ impl RxStats {
         RxSnapshot {
             underruns: self.underruns.load(Ordering::Relaxed),
             concealed: self.concealed.load(Ordering::Relaxed),
+            fec: self.fec.load(Ordering::Relaxed),
             restarts: self.restarts.load(Ordering::Relaxed),
             drops: self.drops.load(Ordering::Relaxed),
         }
@@ -250,17 +260,19 @@ pub fn render(input: &ReportInput) -> String {
         if input.mic_muted { "да" } else { "нет" }
     ));
     out.push_str(&format!(
-        "Приём голоса (всего): провалов {} · маскировано {} · перезапусков {} · выброшено {}\n",
+        "Приём голоса (всего): провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}\n",
         input.rx_total.underruns,
         input.rx_total.concealed,
+        input.rx_total.fec,
         input.rx_total.restarts,
         input.rx_total.drops
     ));
     out.push_str(&format!(
-        "Приём голоса (за {:.0} с): провалов {} · маскировано {} · перезапусков {} · выброшено {}\n",
+        "Приём голоса (за {:.0} с): провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}\n",
         input.rx_window_secs,
         input.rx_window.underruns,
         input.rx_window.concealed,
+        input.rx_window.fec,
         input.rx_window.restarts,
         input.rx_window.drops
     ));
@@ -331,12 +343,14 @@ mod tests {
         let before = RxSnapshot {
             underruns: 1,
             concealed: 2,
+            fec: 1,
             restarts: 0,
             drops: 3,
         };
         let later = RxSnapshot {
             underruns: 4,
             concealed: 2,
+            fec: 3,
             restarts: 1,
             drops: 3,
         };
@@ -352,6 +366,7 @@ mod tests {
         let s = RxSnapshot {
             underruns: 1,
             concealed: 2,
+            fec: 0,
             restarts: 3,
             drops: 4,
         };
@@ -379,11 +394,13 @@ mod tests {
             rx_total: RxSnapshot {
                 underruns: 3,
                 concealed: 12,
+                fec: 7,
                 restarts: 1,
                 drops: 0,
             },
             rx_window: RxSnapshot {
                 concealed: 2,
+                fec: 1,
                 ..Default::default()
             },
             rx_window_secs: 5.0,
@@ -428,7 +445,7 @@ mod tests {
             "Звук: микрофон «1-2 (QUAD-CAPTURE)»",
             "второй вход по умолчанию",
             "Передача: 64 кбит/с",
-            "Приём голоса (всего): провалов 3",
+            "Приём голоса (всего): провалов 3 · маскировано 12 (FEC 7)",
             "Приём голоса (за 5 с): провалов 0 · маскировано 2",
             "Видео (своя): показ 58/60 FPS",
             "Видео (приём): 40e69338…",
@@ -458,4 +475,7 @@ mod tests {
         assert!(render(&input).contains("микрофон выключен: да"));
     }
 }
+
+
+
 

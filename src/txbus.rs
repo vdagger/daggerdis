@@ -279,6 +279,13 @@ impl TxWorker {
     pub(crate) fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let mut encoder = rusty_opus::OpusEncoder::new(48000, 1, rusty_opus::Application::Voip)?;
         encoder.bitrate_bps = 64_000;
+        // In-band FEC: Opus кладёт в каждый пакет копию предыдущего кадра
+        // (SILK/hybrid). Получатель восстанавливает потерянный датаграм из
+        // следующего, а не повторяет последний кадр — именно повтор и звучал
+        // «роботом». `packet_loss_perc` заставляет энкодер держать запас
+        // устойчивости: при потерях речь остаётся разборчивой.
+        encoder.use_inband_fec = true;
+        encoder.packet_loss_perc = 8;
         Ok(Self {
             encoder,
             limiter: Limiter::new(48_000),
