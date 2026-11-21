@@ -126,9 +126,49 @@ impl RadioApp {
         if let Some(remote) = &mut self.remote {
             remote.tick(ctx);
         }
-        // забрать готовый кадр, даже если новых не пришло
-        if let Some(remote) = &mut self.remote {
-            remote.tick(ctx);
+
+        // Раз в 5 с числа потока — в журнал: «не 60 fps» разбирается по этим
+        // строкам, а не на глаз. Показ и обновления показаны отдельно:
+        // первое — сколько кадров зритель реально увидел, второе — сколько
+        // раз окно успело перерисоваться. Ожидания GPU и выброшенные кадры
+        // показывают, где именно теряется остальное.
+        if (self.video.is_some() || self.remote.is_some())
+            && self.video_log_at.elapsed() >= Duration::from_secs(5)
+        {
+            self.video_log_at = Instant::now();
+            let queued = self
+                .video_link
+                .as_ref()
+                .map(|l| l.remote_queue_len())
+                .unwrap_or(0);
+            if let Some(v) = &mut self.video {
+                let (waits, dropped) = v.take_diag();
+                println!(
+                    "[ВИДЕО] показ {:.0} FPS (обновлений {:.0}/с) · захват {} FPS · {} кбит/с · пресет {} · ждали GPU {} · выброшено {}",
+                    v.fps(),
+                    v.update_fps(),
+                    v.encode_fps(),
+                    v.encode_kbps(),
+                    v.preset().label(),
+                    waits,
+                    dropped
+                );
+            }
+            if let Some(r) = &mut self.remote {
+                let (waits, dropped) = r.take_diag();
+                let (decode, gpu, image) = r.timings();
+                println!(
+                    "[ВИДЕО] приём: показ {:.0} FPS (обновлений {:.0}/с) · в очереди {} кадров · декод {:.1} / GPU {:.1} / картинка {:.1} мс · ждали GPU {} · выброшено {}",
+                    r.fps(),
+                    r.update_fps(),
+                    queued,
+                    decode,
+                    gpu,
+                    image,
+                    waits,
+                    dropped
+                );
+            }
         }
     }
 }

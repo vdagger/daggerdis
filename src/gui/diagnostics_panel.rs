@@ -178,7 +178,10 @@ impl RadioApp {
                     decode_ms,
                     gpu_ms,
                     image_ms,
-                    buffer_ms: self.config.video_buffer_ms.unwrap_or(2000),
+                    buffer_ms: self
+                        .config
+                        .video_buffer_ms
+                        .unwrap_or(crate::network::video_link::DEFAULT_BUFFER_MS),
                     frames: self.remote_frames,
                 });
                 if let Some(e) = remote.last_error() {

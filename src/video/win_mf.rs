@@ -230,8 +230,23 @@ impl MfEncoder {
         true
     }
 
-    pub fn push_nv12(&mut self, nv12: &[u8]) -> Result<Vec<EncodedUnit>, String> {
-        let mut out = Vec::new();
+    /// Просит энкодер выдать IDR на следующем кадре.
+    ///
+    /// Нужен вошедшему зрителю: без него он ждёт планового ключевого кадра
+    /// (до `keyframe_secs`), а с ним получает картинку через один-два кадра.
+    /// `false` — кодек запрос не принял; тогда работает обычный GOP.
+    pub fn force_keyframe(&mut self) -> bool {
+        unsafe {
+            let Ok(codec) = self.transform.cast::<ICodecAPI>() else {
+                return false;
+            };
+            codec
+                .SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &var_ui4(1))
+                .is_ok()
+        }
+    }
+
+    pub fn push_nv12(&mut self, nv12: &[u8]) -> Result<Vec<EncodedUnit>, String> {        let mut out = Vec::new();
         let deadline = Instant::now() + WAIT;
 
         while !self.need_input {
@@ -520,6 +535,30 @@ fn apply_codec_api(transform: &IMFTransform, target: &VideoTarget, name: &str) -
         }
         if let Err(e) = codec.SetValue(&CODECAPI_AVEncCommonRealTime, &var_bool(true)) {
             notes.push(format!("realtime: {e}"));
+        }
+        // Качество при том же битрейте. CABAC в High profile экономит 5-15 %:
+        // без него аппаратный энкодер кодирует всё энтропийным кодированием
+        // CAVLC, и в быстрых сценах картинка «мылится» заметно раньше.
+        if let Err(e) = codec.SetValue(&CODECAPI_AVEncH264CABACEnable, &var_bool(true)) {
+            notes.push(format!("cabac: {e}"));
+        }
+        // B-кадров не просим: каждый добавляет задержку переупорядочивания,
+        // а для игры важнее отклик, чем 10 % битрейта.
+        if let Err(e) = codec.SetValue(&CODECAPI_AVEncMPVDefaultBPictureCount, &var_ui4(0)) {
+            notes.push(format!("b-frames: {e}"));
+        }
+        // У некоторых MFT тяга по умолчанию в сторону скорости: середина
+        // оставляет запас, чтобы 1080p60 не упирался в энкодер.
+        if let Err(e) = codec.SetValue(&CODECAPI_AVEncCommonQualityVsSpeed, &var_ui4(50)) {
+            notes.push(format!("quality/speed: {e}"));
+        }
+        // VBV: всплеск не выше 1.25 среднего, буфер на полсекунды. Без него
+        // CBR выдаёт пачку в ключевом кадре и канал на секунду захлёбывается.
+        if let Err(e) = codec.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &var_ui4(mean + mean / 4)) {
+            notes.push(format!("max bitrate: {e}"));
+        }
+        if let Err(e) = codec.SetValue(&CODECAPI_AVEncCommonBufferSize, &var_ui4(mean / 2)) {
+            notes.push(format!("vbv buffer: {e}"));
         }
     }
     notes

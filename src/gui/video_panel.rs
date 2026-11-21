@@ -357,18 +357,39 @@ impl RadioApp {
                         );
 
                         let subtitle = if let Some(v) = &self.video {
-                            let (w, h) = v.size();
                             let viewers = self
                                 .video_link
                                 .as_ref()
                                 .map(|l| l.viewer_count())
                                 .unwrap_or(0);
+                            // Размер — самого потока, а не превью: в карточке
+                            // раньше стояло 960×540 (половинное превью), и
+                            // выглядело это как «транслирую в 540p».
+                            let info = v.info();
+                            let mbit = if v.encode_kbps() > 0 {
+                                v.encode_kbps() as f32 / 1000.0
+                            } else {
+                                v.bitrate_base() as f32 / 1_000_000.0
+                            };
+                            // Поток уходит хосту — значит его смотрит хост
+                            // (и его зрители). «0 зрит.» здесь было бы враньём.
+                            let audience = if self
+                                .video_link
+                                .as_ref()
+                                .map(|l| l.feed_node().is_some())
+                                .unwrap_or(false)
+                            {
+                                "смотрит хост".to_string()
+                            } else {
+                                format!("{} зрит.", viewers)
+                            };
                             format!(
-                                "{}×{} · {} FPS · {} зрит.",
-                                w,
-                                h,
+                                "{}×{} · {} FPS · ~{:.1} Мбит/с · {}",
+                                info.width,
+                                info.height,
                                 v.encode_fps(),
-                                viewers
+                                mbit,
+                                audience
                             )
                         } else {
                             "Не запущена".to_string()
@@ -429,6 +450,60 @@ impl RadioApp {
                             {
                                 self.capture_windows = crate::video::win_windows::list_windows();
                             }
+
+                            // Качество потока: пресет — это биты на пиксель,
+                            // то есть и качество, и требуемая полоса. «Авто»
+                            // берёт пресет по разрешению источника.
+                            let preset_now = self
+                                .config
+                                .video_preset
+                                .as_deref()
+                                .and_then(crate::video::VideoPreset::from_key);
+                            let preset_label = preset_now
+                                .map(|p| p.label().to_string())
+                                .unwrap_or_else(|| "Авто (по разрешению)".to_string());
+                            let hint = preset_now
+                                .map(|p| format!("{}: ~{:.0} Мбит/с при 1080p60", p.label(), p.mbit_1080p60()))
+                                .unwrap_or_else(|| {
+                                    "Авто: качество по разрешению источника".to_string()
+                                });
+                            egui::ComboBox::new("video_preset", "")
+                                .width(170.0)
+                                .selected_text(egui::RichText::new(preset_label).size(9.0))
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.config.video_preset.is_none(),
+                                            egui::RichText::new("Авто (по разрешению)").size(9.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.config.video_preset = None;
+                                        self.pending_save = true;
+                                    }
+                                    for p in crate::video::VideoPreset::all() {
+                                        let selected = self.config.video_preset.as_deref()
+                                            == Some(p.key());
+                                        let text = format!(
+                                            "{} · ~{:.0} Мбит/с",
+                                            p.label(),
+                                            p.mbit_1080p60()
+                                        );
+                                        if ui
+                                            .selectable_label(
+                                                selected,
+                                                egui::RichText::new(text).size(9.0),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.config.video_preset =
+                                                Some(p.key().to_string());
+                                            self.pending_save = true;
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text(hint);
                         }
 
                         ui.add_space(6.0);
@@ -447,9 +522,21 @@ impl RadioApp {
                                         Some(30) => 30,
                                         _ => 60,
                                     };
+                                    let preset = self
+                                        .config
+                                        .video_preset
+                                        .as_deref()
+                                        .and_then(crate::video::VideoPreset::from_key);
+                                    // Флаг «выдай IDR»: подписчик получит
+                                    // картинку сразу, а не через секунду.
+                                    let keyframe = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(false),
+                                    );
                                     match video_session::VideoSession::start(
                                         fps,
                                         self.capture_window.as_ref().map(|(hwnd, _)| *hwnd),
+                                        preset,
+                                        keyframe,
                                     ) {
                                         Ok(v) => {
                                             // Адаптация битрейта: потери канала
@@ -459,6 +546,9 @@ impl RadioApp {
                                                 link.set_bitrate_control(
                                                     v.bitrate_target(),
                                                     v.bitrate_base(),
+                                                );
+                                                link.set_keyframe_control(
+                                                    v.keyframe_target(),
                                                 );
                                             }
                                             self.video = Some(v);

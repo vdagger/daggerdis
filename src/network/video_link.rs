@@ -92,11 +92,31 @@ const RECENT_FRAMES: usize = 180;
 const RECENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Буфер показа по умолчанию, мс (настройка `video_buffer_ms`).
-pub const DEFAULT_BUFFER_MS: u32 = 2000;
-/// Очередь: `buffer*fps + GOP на догон + запас`, не меньше 96 кадров и
-/// не больше 600; отдельный байтовый предел на 4K-потоки.
-const MIN_QUEUE: usize = 96;
+///
+/// 400 мс, а не 2 с: буфер — это задержка, а не качество. При P2P и RTT в
+/// единицы-десятки миллисекунд 24 кадра запаса с избытком покрывают джиттер,
+/// а зритель игры видит происходящее почти одновременно с голосом. Кому нужно
+/// больше (дальний релей, плохой канал) — поднимает ползунком до 5 с.
+pub const DEFAULT_BUFFER_MS: u32 = 400;
+
+/// Насколько старым может быть ключевой кадр, с которого начинается показ
+/// нового зрителя. Свежий IDR приходит раз в секунду, так что ждать его
+/// дешевле, чем показывать хвост двухсекундной давности: иначе зритель
+/// навсегда отстаёт от живого потока на эту разницу.
+const HANDOFF_MAX_AGE_MS: u64 = 500;
+/// Очередь: буфер показа плюс небольшой запас на пачку кадров. Не больше
+/// 600 кадров; отдельный байтовый предел на 4K-потоки.
+///
+/// Раньше здесь было `buffer*fps + fps*2 + 30`: под 2-секундный буфер это
+/// давало запас на целый GOP, и очередь спокойно накапливала секунду-полторы
+/// кадров на старте (пока создаётся декодер). Такой запас — это задержка,
+/// которую зритель носит на себе весь сеанс: очередь не рассасывается, ведь
+/// показ и приход идут с одной частотой. Теперь запас — четверть секунды,
+/// а всё, что выше, сбрасывает очередь и ждёт ключевой кадр: лучше секунда
+/// ожидания на старте, чем постоянное отставание.
+const MIN_QUEUE: usize = 40;
 const MAX_QUEUE: usize = 600;
+const QUEUE_SLACK: usize = 24;
 const QUEUE_BYTES: usize = 96 * 1024 * 1024;
 
 /// Пришедший по сети кадр.
@@ -145,10 +165,9 @@ impl RemoteQueue {
         let fps = frame.fps.max(1) as usize;
         let buffer_frames =
             (fps as u64 * buffer.as_millis() as u64 / 1000) as usize;
-        // Полный GOP на догон (fps*2 — интервал ключевых кадров 2 с), сам
-        // буфер и запас. Старый предел в 30 кадров при буфере 2 с чистил
-        // очередь сам, ещё до показа.
-        let frames_cap = (buffer_frames + fps * 2 + 30).clamp(MIN_QUEUE, MAX_QUEUE);
+        // Буфер плюс запас на пачку: глубже очередь — это лишняя задержка,
+        // которую показ уже не догонит (приход и показ идут с одной частотой).
+        let frames_cap = (buffer_frames + QUEUE_SLACK).clamp(MIN_QUEUE, MAX_QUEUE);
         let cost = Self::frame_cost(&frame);
         if self.frames.len() >= frames_cap || self.bytes + cost > QUEUE_BYTES {
             self.frames.clear();
@@ -201,6 +220,9 @@ struct Published {
     seq: u32,
     keyframe: bool,
     data: Vec<u8>,
+    /// Когда кадр опубликован: по этой метке хвост отсекает устаревшие
+    /// кадры, чтобы вошедший зритель не отставал от живого потока навсегда.
+    at: Instant,
 }
 
 /// Окно недавних кадров: с него новый подписчик начинает показ.
@@ -222,6 +244,12 @@ impl Recent {
     }
 
     fn push(&mut self, keyframe: bool, data: Vec<u8>) -> Arc<Published> {
+        self.push_at(keyframe, data, Instant::now())
+    }
+
+    /// То же с явной меткой времени: так проверяется отсечение старого хвоста
+    /// без `sleep` в тестах.
+    fn push_at(&mut self, keyframe: bool, data: Vec<u8>, at: Instant) -> Arc<Published> {
         self.next_seq = self.next_seq.wrapping_add(1);
         if self.next_seq == 0 {
             self.next_seq = 1;
@@ -236,6 +264,7 @@ impl Recent {
             seq: self.next_seq,
             keyframe,
             data,
+            at,
         });
         if keyframe {
             self.last_keyframe = Some(published.clone());
@@ -258,18 +287,19 @@ impl Recent {
 
     /// Хвост от последнего ключевого кадра и номер последнего кадра в нём.
     /// Без ключевого хвост пуст: P-кадры без опоры декодеру не нужны.
-    fn handoff(&self) -> (Vec<Arc<Published>>, u32) {
-        let mut tail = Vec::new();
-        if let Some(keyframe) = self.last_keyframe.clone() {
-            let after = keyframe.seq;
-            tail.push(keyframe);
-            tail.extend(
-                self.frames
-                    .iter()
-                    .filter(|f| f.seq > after)
-                    .map(|f| (*f).clone()),
-            );
+    /// `max_age` — насколько старым может быть сам ключевой кадр: если он
+    /// старше, хвост пуст и подписчик ждёт свежий IDR, а не отстаёт навсегда.
+    fn handoff(&self, max_age: Duration) -> (Vec<Arc<Published>>, u32) {
+        let Some(keyframe) = self.last_keyframe.clone() else {
+            return (Vec::new(), self.next_seq);
+        };
+        if keyframe.at.elapsed() > max_age {
+            return (Vec::new(), self.next_seq);
         }
+        let after = keyframe.seq;
+        let tail: Vec<Arc<Published>> = std::iter::once(keyframe)
+            .chain(self.frames.iter().filter(|f| f.seq > after).cloned())
+            .collect();
         let last = tail.last().map(|f| f.seq).unwrap_or(self.next_seq);
         (tail, last)
     }
@@ -568,6 +598,8 @@ pub struct VideoLink {
     bitrate_target: std::sync::Mutex<Option<Arc<AtomicU32>>>,
     /// Потолок адаптации — битрейт пресета (0 — адаптация не подключена).
     bitrate_base: AtomicU32,
+    /// Флаг «выдай IDR» у своего энкодера: ставится, когда подписался зритель.
+    keyframe_target: std::sync::Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl VideoLink {
@@ -597,6 +629,7 @@ impl VideoLink {
             viewers: std::sync::Mutex::new(Vec::new()),
             bitrate_target: std::sync::Mutex::new(None),
             bitrate_base: AtomicU32::new(0),
+            keyframe_target: std::sync::Mutex::new(None),
         });
         let l = link.clone();
         link.rt.spawn(async move { l.accept_loop().await });
@@ -718,6 +751,9 @@ impl VideoLink {
             }
             _ => {
                 println!("[ВИДЕО] Зритель подписался: {}", from);
+                // Своему энкодеру — просьба выдать IDR: зритель начнёт показ
+                // с живого кадра, а не станет ждать планового ключевого.
+                self.request_keyframe();
                 self.start_sender(conn, from);
             }
         }
@@ -828,10 +864,11 @@ impl VideoLink {
     /// Подписывается на broadcast и снимает окно недавних кадров под одним
     /// мьютексом с публикацией: хвост и последующие кадры стыкуются без дыр.
     fn handoff(&self) -> (broadcast::Receiver<Arc<Published>>, Vec<Arc<Published>>, u32) {
+        let max_age = Duration::from_millis(HANDOFF_MAX_AGE_MS);
         match self.window.lock() {
             Ok(window) => {
                 let rx = self.outgoing.subscribe();
-                let (tail, last) = window.recent.handoff();
+                let (tail, last) = window.recent.handoff(max_age);
                 (rx, tail, last)
             }
             Err(_) => (self.outgoing.subscribe(), Vec::new(), 0),
@@ -972,6 +1009,26 @@ impl VideoLink {
         self.bitrate_base.store(base, Ordering::Relaxed);
     }
 
+    /// Подключает свой энкодер к просьбам о ключевом кадре: сюда пишет
+    /// `handle_control`, когда подписался зритель.
+    pub fn set_keyframe_control(&self, flag: Arc<AtomicBool>) {
+        if let Ok(mut slot) = self.keyframe_target.lock() {
+            *slot = Some(flag);
+        }
+    }
+
+    /// Просит энкодер выдать IDR на следующем кадре. Своего энкодера нет
+    /// (хост раздаёт чужой поток) — просьба никуда не идёт: там зритель
+    /// дождётся планового ключевого кадра, он приходит раз в секунду.
+    fn request_keyframe(&self) {
+        if let Ok(slot) = self.keyframe_target.lock() {
+            if let Some(flag) = slot.as_ref() {
+                flag.store(true, Ordering::Relaxed);
+                println!("[ВИДЕО] Нужен ключевой кадр — просим энкодер выдать IDR");
+            }
+        }
+    }
+
     /// Пара (атомик энкодера, потолок) или `None`, если адаптация не нужна.
     fn bitrate_control(&self) -> Option<(Arc<AtomicU32>, u32)> {
         let base = self.bitrate_base.load(Ordering::Relaxed);
@@ -1035,6 +1092,16 @@ impl VideoLink {
             Ok(viewers) => viewers.iter().filter(|v| v.alive.load(Ordering::Relaxed)).count(),
             Err(_) => 0,
         }
+    }
+
+    /// Кому сейчас отдаём свой поток (хост комнаты). Если он есть, картинку
+    /// принимает он и его зрители: «0 зрит.» в карточке тогда не значит
+    /// «никто не смотрит».
+    pub fn feed_node(&self) -> Option<String> {
+        self.feeding
+            .lock()
+            .ok()
+            .and_then(|feed| feed.active.as_ref().map(|a| a.node.clone()))
     }
 
     /// Публикует свой кадр: нумерует, кладёт в окно и рассылает подписчикам —
@@ -1491,6 +1558,12 @@ impl VideoLink {
             .lock()
             .map(|q| !q.frames.is_empty())
             .unwrap_or(false)
+    }
+
+    /// Сколько кадров ждёт показа. Растёт — значит показ не успевает или
+    /// буфер велик; в журнале это число отвечает на «дёргается или отстаёт».
+    pub fn remote_queue_len(&self) -> usize {
+        self.remote.lock().map(|q| q.frames.len()).unwrap_or(0)
     }
 }
 
@@ -2202,14 +2275,18 @@ mod tests {
         let mut queue = RemoteQueue::new();
         let now = Instant::now();
         let buffer = Duration::from_secs(2);
-        // При 60 fps и буфере 2 с предел очереди — 270 кадров.
+        // Буфер 2 с при 60 fps — это 120 кадров плюс небольшой запас. Глубже
+        // очередь не растёт: она не рассасывается сама, и всё сверх буфера
+        // стало бы постоянным отставанием зрителя.
+        let cap = (60 * 2 + QUEUE_SLACK).clamp(MIN_QUEUE, MAX_QUEUE);
+        assert!(cap < 60 * 2 + 60, "запас — доли секунды, не целый GOP");
         let mut accepted = 0;
-        for i in 0..270 {
+        for i in 0..cap {
             if queue.push(frame("n", i == 0, i as i64, now), buffer) {
                 accepted += 1;
             }
         }
-        assert_eq!(accepted, 270);
+        assert_eq!(accepted, cap);
         // Следующий кадр переполняет очередь: она чистится, и P-кадр
         // выбрасывается — показывать его не с чем.
         assert!(!queue.push(frame("n", false, 1000, now), buffer));
@@ -2227,7 +2304,7 @@ mod tests {
         // Второй IDR: хвост должен начинаться с него, а не с первого.
         let key2 = recent.push(true, encode_frame(&unit(true, 3, 4), &info));
         let p4 = recent.push(false, encode_frame(&unit(false, 4, 4), &info));
-        let (tail, last) = recent.handoff();
+        let (tail, last) = recent.handoff(Duration::from_secs(5));
         let seqs: Vec<u32> = tail.iter().map(|f| f.seq).collect();
         assert_eq!(seqs, vec![key2.seq, p4.seq], "хвост — от последнего IDR");
         assert_eq!(last, p4.seq);
@@ -2240,7 +2317,7 @@ mod tests {
         let mut recent = Recent::new();
         recent.push(false, encode_frame(&unit(false, 1, 4), &info));
         recent.push(false, encode_frame(&unit(false, 2, 4), &info));
-        let (tail, last) = recent.handoff();
+        let (tail, last) = recent.handoff(Duration::from_secs(5));
         assert!(tail.is_empty(), "P-кадры без IDR новому зрителю не отдаём");
         assert_eq!(last, recent.next_seq);
     }
@@ -2443,7 +2520,7 @@ mod tests {
         recent.push(false, vec![4]);
         recent.push(false, vec![5]);
 
-        let (tail, last) = recent.handoff();
+        let (tail, last) = recent.handoff(Duration::from_secs(5));
         assert_eq!(tail.first().unwrap().seq, keyframe.seq);
         assert!(tail.first().unwrap().keyframe);
         assert_eq!(tail.len(), 3);
@@ -2456,10 +2533,34 @@ mod tests {
         let mut recent = Recent::new();
         recent.push(false, vec![1]);
         recent.push(false, vec![2]);
-        let (tail, last) = recent.handoff();
+        let (tail, last) = recent.handoff(Duration::from_secs(5));
         assert!(tail.is_empty());
         assert_eq!(last, recent.next_seq);
         assert_eq!(last, 2);
+    }
+
+    #[test]
+    fn handoff_drops_stale_keyframe_instead_of_holding_back_live_playback() {
+        // Ключевой кадр старше предела: хвост пуст, зритель ждёт свежий IDR.
+        // Иначе он начал бы показ с устаревшей картинки и отставал бы на эту
+        // разницу всё время — буфер показывает «с задержкой», а не «навсегда».
+        let mut recent = Recent::new();
+        recent.push_at(true, vec![1], Instant::now() - Duration::from_millis(900));
+        recent.push(false, vec![2]);
+        let (tail, last) = recent.handoff(Duration::from_millis(500));
+        assert!(tail.is_empty(), "устаревший IDR не отдаём");
+        assert_eq!(last, recent.next_seq);
+        // Тот же поток, но предел больше возраста кадра — хвост отдаётся.
+        let (tail, _) = recent.handoff(Duration::from_secs(5));
+        assert_eq!(tail.len(), 2);
+    }
+
+    #[test]
+    fn default_buffer_is_snappy() {
+        // Буфер показа — задержка, а не качество: 2 с делали из игры
+        // «запись», где зритель видит происходящее на два такта позже.
+        let default = DEFAULT_BUFFER_MS;
+        assert!(default <= 500, "по умолчанию буфер должен быть меньше полсекунды");
     }
 
     #[test]
@@ -2471,7 +2572,7 @@ mod tests {
         }
         assert!(recent.last_keyframe.is_none());
         assert!(recent.frames.len() <= RECENT_FRAMES);
-        let (tail, _) = recent.handoff();
+        let (tail, _) = recent.handoff(Duration::from_secs(5));
         assert!(tail.is_empty());
     }
 

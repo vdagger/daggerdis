@@ -147,7 +147,7 @@ Transport is Iroh-only. The old raw-UDP mesh (`receiver.rs`, `manager.rs`, `stun
 | `src/video/win_windows.rs` | Список окон (`EnumWindows`, рамка без тени) + `clamp_rect`: пересечение с экраном и чётные размеры |
 | `src/video/publisher.rs` | `video-publisher` thread: capture at the chosen fps (30/60) → NV12 → encode → mpsc of `EncodedUnit`; `encode_fps` counter for diagnostics |
 | `src/network/video_directory.rs` | `VideoDirectory`: номер своей трансляции (`my_gen`) + анонсы соседей из IrohSync (`video_gen`), TTL 5 с; общая для миграции, сервиса приёма и видео |
-| `src/network/video_link.rs` | `discordrf-video/1`: контроль `kind=2/3/4/5` (подписка, ответ, feed издателя, релей-подписка) в первом bi-стриме, окно недавних кадров и relay под одним замком (180 / 64 МиБ, отдача с последнего ключевого), релей хоста без ре-энкода, маршрутизация зрителя, очередь зрителя со сдвигом показа на буфер |
+| `src/network/video_link.rs` | `discordrf-video/1`: контроль `kind=2/3/4/5` (подписка, ответ, feed издателя, релей-подписка) в первом bi-стриме, окно недавних кадров и relay под одним замком (180 / 64 МиБ, отдача с последнего ключевого не старше 500 мс, `force_keyframe` по подписке), релей хоста без ре-энкода, маршрутизация зрителя, очередь зрителя со сдвигом показа на буфер (не глубже `буфер + 24` кадра) |
 | `src/gui/video_session.rs` | `Renderer` (decode → BGRA → egui texture), `VideoSession` (own stream), `RemoteView` (peer stream) |
 | `tools/video_probe/` | Separate probe crate: `--capture`, `--gpu`, `--loopback` headless checks |
 | `tools/agent/` | Скрипты для агента: `albus.ps1` (запуск GUI с редиректом stdio, скриншоты, клики, клавиши, позиционирование окна), `build.ps1` (check/test/clippy/release с журналом), `group.ps1` (N экземпляров с взаимной дружбой: свой `%APPDATA%`, NodeID из журнала, friends.json до запуска — для проверки группы) |
@@ -247,14 +247,14 @@ about a second without any manual recipient picker.
 `is_host` — the same rule `migration.rs` uses to elect a host. Self is not in
 `peers`, so `None` means "I am the host, or there is no host yet".
 
-**Late joiners start from a keyframe.** `publish` always keeps a ring of the
-last 180 frames / 64 MiB (`Recent`), keyed by an in-memory `seq`, even when
-nobody is subscribed. `handoff()` creates the broadcast receiver and snapshots
-the ring from the last keyframe **under the same mutex `publish` uses**, so a
-new subscriber gets a gap-free chain; P-frames before the first keyframe are
-skipped (if the ring has no keyframe, the task waits for the next IDR). The
-broadcast capacity is 240 frames; after `Lagged` the task takes a fresh handoff
-instead of continuing from a P-frame. The wire frame format is unchanged.
+**Late joiners start from a keyframe.** `publish` keeps a ring of the last 180
+frames / 64 MiB (`Recent`) keyed by an in-memory `seq`; `handoff(max_age)`
+snapshots it from the last keyframe **under the mutex `publish` uses**, and drops
+the tail when that keyframe is older than 500 мс — иначе зритель навсегда отставал
+бы от живого потока. По подписке издатель просит у энкодера свежий IDR
+(`CODECAPI_AVEncVideoForceKeyFrame`), поэтому показ начинается сразу с живого
+кадра; если ключевого в окне нет, задача ждёт следующего. Broadcast — 240
+кадров, после `Lagged` — новый handoff вместо продолжения с P-кадра.
 
 The ring and the relay live under **one mutex** (`Window { recent, relay }`):
 `publish_own` re-checks `directory.my_gen()` under the lock, `publish_relay`
@@ -427,7 +427,8 @@ that sender's queued frames and waits for a keyframe.
   `input2_profile` (0 — голос, 1 — инструмент, прочее отбрасывается). `opus_bitrate`
   is 64000, 96000 or 128000 (anything else is dropped). Per-peer volume
   is stored as `peer_<id>_volume` keyed by the stable `my_id`. Stream rate is `video_fps` (30 or 60; missing or invalid means 60), viewer delay
-is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
+is `video_buffer_ms` (0..5000, default 400; larger values are clamped), preset is
+`video_preset` (`low`/`balanced`/`quality`; неизвестное отбрасывается). `friends.rs` stores `%APPDATA%\Albus\friends.json` (serde_json). Files are
   written on change with a 400 ms throttle, never on exit.
 - **Голосовая комната (`src/calls.rs`) — это и есть «звонок», на N человек.**
   `Active { room_id, pending }` вместо пары «звонящий/принявший»: приглашение
@@ -507,62 +508,54 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
 - **Video pipeline (Windows):** DXGI capture (BGRA, GPU) → `ID3D11VideoProcessor`
   converts/scales to NV12 on the GPU → hardware H.264 MFT → iroh → decoder MFT →
   NV12 → Video Processor → BGRA → egui texture. Bitrate is `pixels × fps ×
-  bits_per_pixel` (Low 0.04 / Balanced 0.07 / Quality 0.10, capped 1.5–40 Mbps),
-  so 1080p60 ≈ 8.7 Mbps and 1440p60 ≈ 18–22 Mbps. Захват — в нативном
-  разрешении (апскейл тратит битрейт). Битрейт **адаптивный**: издатель раз в
-  секунду смотрит потери своего feed-канала и опускает/поднимает его
-  (`watch_feed_bitrate`; вниз 15 % при потерях > 0.5 %, вверх 10 % потолка
-  после 5 чистых секунд, пол — четверть пресета), энкодер принимает значение
-  на ходу. Источник — весь экран или одно окно: прямоугольник окна вырезается
-  из кадра стола через `VideoProcessorSetStreamSourceRect`, поэтому захват идёт
-  в размер окна. Через WGC (`win_wgc.rs`) окно снимается независимо от
-  перекрытия; если система WGC не даёт — работает вырезка из экрана.
+  bits_per_pixel` (Low 0.04 / Balanced 0.07 / Quality 0.12, capped 1.5–40 Mbps),
+  so 1080p60 ≈ 5 / 8.7 / 14.9 Mbps; пресет выбирается в карточке трансляции
+  (`video_preset`, «Авто» — по разрешению источника). Энкодер просит CABAC,
+  0 B-кадров, «качество/скорость» 50 и VBV (пик 1.25 среднего, буфер 0.5 с);
+  NVIDIA MFT не принимает `AVEncCommonRealTime` и `DefaultBPictureCount` — это
+  видно строкой `ICodecAPI: [...]`, поток не рвётся. GOP 1 с: вошедший зритель
+  получает картинку сразу (IDR по подписке), потеря лечится без двухсекундного
+  ожидания. Битрейт **адаптивный**: потери feed-канала опускают его
+  (`watch_feed_bitrate`, вниз 15 %/с, вверх после 5 чистых секунд). Источник —
+  весь экран или одно окно: прямоугольник окна вырезается из кадра стола через
+  `VideoProcessorSetStreamSourceRect`; через WGC (`win_wgc.rs`) окно снимается
+  независимо от перекрытия, иначе работает вырезка из экрана. Измерено на
+  1080p60: захват 60 FPS, зритель 58-61 FPS.
 - **AMF encoder quirk:** the AMD MFT ignores `MF_MT_FRAME_RATE` and computes rate
   control against 30 fps — at 60 fps the stream came out twice the requested
-  bitrate. `win_mf::mean_bitrate_for()` compensates with `30/fps` for MFTs whose
-  friendly name contains "amd"; re-check when the NVIDIA MFT is selected instead.
+  bitrate; `win_mf::mean_bitrate_for()` compensates with `30/fps` for "amd" MFTs.
 - **DXGI capture needs an interactive desktop.** По SSH `ScreenCapture::new`
-  отвечает «не найден экран»; проверять `tools/video_probe --capture` в сессии
-  пользователя.
+  отвечает «не найден экран»; проверять `tools/video_probe --capture` в сессии.
 - **A fresh output sample per `ProcessOutput` call:** `win_decode.rs` and
   `win_mf.rs` allocate a new `IMFSample` for every call. Reusing one persistent
   sample makes the Microsoft H.264 decoder fail every frame with
   `ProcessOutput: CopyDecodedFrame failed (0x80004005)`.
-- **The viewer shows frames on a delay (`video_buffer_ms`, default 2000).** Each
+- **The viewer shows frames on a delay (`video_buffer_ms`, default 400).** Each
   `RemoteFrame` carries `arrived: Instant`; `RemoteQueue::pop_due(buffer, now)`
-  releases the head only when `arrived + buffer <= now`. The queue is in display
-  order, so a frame that arrives 1.5 s late holds its successors instead of being
-  skipped — that is the whole point of the buffer: the network gets time to
-  deliver. `0` means "show at once", as before. The cap is
-  `buffer*fps + fps*2 + 30` frames (clamped to 96..600) and 96 MiB: it must cover
-  the buffer plus the join burst of a whole GOP, or the queue would clear itself
-  right after subscribing. On overflow the queue is dropped and the stream waits
-  for a keyframe — P-frames without their references decode to garbage. The GUI
-  decodes at most 4 frames per update so one slow frame cannot stall the UI.
-- **Display is capped at the stream's own fps** (`show_period` in `video_session.rs`,
-  taken from `StreamInfo.fps` — 30 or 60): preview and remote stream still push every
-  frame through the decoder (a skipped P-frame breaks the chain) but only show that
-  many per second, so a burst cannot flood the GPU readback and texture upload. The
-  threshold is 75% of the period on purpose: at a 75 Hz repaint (13.3 ms per update) a
-  hard 16.7 ms period skipped every second update and pinned the preview at ~32 fps
-  even though each frame cost only ~4 ms. A frame that cannot go to the GPU right
-  away (previous conversion still pending, or the rate check said "too early") is
-  kept in `Renderer.queued` and retried on the next update instead of being dropped;
-  a newer frame replaces it. Dropping it instead cost ~8 fps (52 instead of 60),
-  because every readback that landed one update late threw away the frame after it.
+  releases the head only when `arrived + buffer <= now`. 2 с по умолчанию были
+  задержкой поверх качества: зритель игры видел происходящее на два такта позже
+  голоса. The cap is
+  `buffer*fps + 24` frames (clamped to 40..600) and 96 MiB — глубже очередь не
+  растёт, потому что приход и показ идут с одной частотой, и лишние кадры стали
+  бы постоянным отставанием. On overflow the queue is dropped and the stream
+  waits for a keyframe — P-frames without their references decode to garbage.
+  The GUI decodes at most 4 frames per update so one slow frame cannot stall the UI.
+- **Показ не ограничивается искусственным периодом.** Период `0.75·(1/fps)`
+  выбрасывал кадр, если апдейт приходил на 12.5 мс при 74 Гц (13.5 мс), — зритель
+  видел 44-46 из 60. Потолок задаёт сам поток, а декодированные кадры ждут в
+  очереди `Renderer.queued` (3 кадра), поэтому два кадра в одном апдейте не
+  теряются. `take_diag()` отдаёт «ждали GPU / выброшено» для журнала раз в 5 с.
 - **Readback never blocks the GUI:** `Renderer` runs the GPU conversion
   (`converter.convert` → `copy_to_staging`, which also calls `Flush`) and collects the
   result on a later update with `read_back_nowait` (`D3D11_MAP_FLAG_DO_NOT_WAIT`;
   `DXGI_ERROR_WAS_STILL_DRAWING` yields `Ok(None)` and the frame is retried next
   update). A blocking `Map` waits for the video processor to finish — at 1080p that
-  cost ~30 ms per frame and pinned the preview at ~30 fps even though the stream ran
-  at 60. Do **not** call `CopyResource` inside the retry path: a fresh copy marks the
+  cost ~30 ms per frame. Do **not** call `CopyResource` inside the retry path: a fresh copy marks the
   staging texture busy again, `Map` answers "still drawing" forever and the preview
   never shows a frame. `pending_since` drops a readback after 500 ms as a safety valve.
 - **Own preview runs at half resolution** (`Renderer::new(info, 2)`): the frame is
   still decoded at full size, but the GPU converter writes half-size BGRA, so the
-  readback, `bgra_to_image` and texture upload cost 4× less — at 1080p those three
-  stages alone held the preview at ~30 fps. Peer streams stay full-size
+  readback, `bgra_to_image` and texture upload cost 4× less. Peer streams stay full-size
   (`Renderer::new(info, 1)`). `Renderer::timings()` feeds the "декод · чтение с GPU ·
   картинка" line under the broadcast button.
 - **The audio reorder buffer must not wait for a lost datagram:** in `audio.rs`

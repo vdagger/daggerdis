@@ -47,15 +47,47 @@ impl VideoPreset {
         }
     }
 
+    /// Ключ для `config.ini`: настройка переживает перезапуск.
+    pub fn key(self) -> &'static str {
+        match self {
+            VideoPreset::Low => "low",
+            VideoPreset::Balanced => "balanced",
+            VideoPreset::Quality => "quality",
+        }
+    }
+
+    /// Обратный разбор ключа. Неизвестное значение — не пресет: молча
+    /// подставлять «сбалансированный» нельзя, иначе испорченный файл
+    /// незаметно меняет качество трансляции.
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key.trim().to_lowercase().as_str() {
+            "low" => Some(VideoPreset::Low),
+            "balanced" => Some(VideoPreset::Balanced),
+            "quality" => Some(VideoPreset::Quality),
+            _ => None,
+        }
+    }
+
+    /// Все пресеты для выпадающего списка в карточке трансляции.
+    pub fn all() -> [VideoPreset; 3] {
+        [VideoPreset::Low, VideoPreset::Balanced, VideoPreset::Quality]
+    }
+
     /// Биты на пиксель кадра при H.264 и длинном GOP.
-    /// Рабочий стол и текст требуют больше, чем видео: 0.10 при 1920x1080x60
-    /// даёт ~12 Мбит/с, при 2560x1440x60 — ~22 Мбит/с.
+    /// Рабочий стол и текст требуют больше, чем видео: 0.12 при 1920x1080x60
+    /// даёт ~15 Мбит/с, при 2560x1440x60 — ~27 Мбит/с.
     pub fn bits_per_pixel(self) -> f64 {
         match self {
             VideoPreset::Low => 0.04,
             VideoPreset::Balanced => 0.07,
-            VideoPreset::Quality => 0.10,
+            VideoPreset::Quality => 0.12,
         }
+    }
+
+    /// Ориентир для карточки трансляции: сколько Мбит/с даёт пресет на
+    /// 1080p60. Реальный битрейт считается от размера источника.
+    pub fn mbit_1080p60(self) -> f32 {
+        (1920.0 * 1080.0 * 60.0 * self.bits_per_pixel() / 1e6) as f32
     }
 
     /// Разумный пресет по умолчанию для такого разрешения.
@@ -91,7 +123,11 @@ impl VideoTarget {
             height,
             fps,
             bitrate_bps: (raw as u32).clamp(1_500_000, 40_000_000),
-            keyframe_secs: 2,
+            // Ключевой кадр раз в секунду: с ним зритель, вошедший в середину
+            // трансляции, начинает показ не позже секунды, а потеря кадров
+            // лечится пересылкой IDR, а не ожиданием двух секунд. При CBR
+            // лишний IDR стоит 2-3 % битрейта — незаметно.
+            keyframe_secs: 1,
         }
     }
 }

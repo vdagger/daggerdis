@@ -15,6 +15,10 @@ use super::{EncodedUnit, VideoPreset, VideoTarget};
 
 pub use super::StreamInfo;
 
+/// Ответ потока публикации на старте: описание потока, подпись источника,
+/// битрейт пресета и фактический пресет (для карточки и журнала).
+type InitReport = Result<(StreamInfo, String, u32, VideoPreset), String>;
+
 use super::win_wgc::WindowCapture;
 
 /// Откуда берём кадры: весь экран (или его область) либо одно окно через WGC.
@@ -87,13 +91,24 @@ pub struct ScreenPublisher {
     pub bitrate: Arc<AtomicU32>,
     /// Битрейт пресета — верхняя граница, к которой адаптация возвращается.
     pub bitrate_base: u32,
+    /// Пресет, с которым запущен поток (диагностика и карточка).
+    pub preset: VideoPreset,
+    /// Просьба выдать IDR: сюда пишет `VideoLink`, когда подписался новый
+    /// зритель или зритель потерял опору. `false` — сбросить нечего.
+    pub keyframe: Arc<AtomicBool>,
 }
 
 impl ScreenPublisher {
     /// `window` — окно, которое транслируем вместо всего экрана: его
     /// прямоугольник вырезается из кадра рабочего стола.
-    pub fn start(fps: u32, window: Option<isize>) -> Result<Self, String> {
-        let (init_tx, init_rx) = channel::<Result<(StreamInfo, String, u32), String>>();
+    /// `preset` — качество из настроек; `None` — по разрешению источника.
+    pub fn start(
+        fps: u32,
+        window: Option<isize>,
+        preset: Option<VideoPreset>,
+        keyframe: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let (init_tx, init_rx) = channel::<InitReport>();
         let (frame_tx, frame_rx) = channel::<EncodedUnit>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
@@ -103,6 +118,7 @@ impl ScreenPublisher {
         let encode_kbps_thread = encode_kbps.clone();
         let bitrate = Arc::new(AtomicU32::new(0));
         let bitrate_thread = bitrate.clone();
+        let keyframe_thread = keyframe.clone();
 
         let handle = std::thread::Builder::new()
             .name("video-publisher".into())
@@ -111,11 +127,13 @@ impl ScreenPublisher {
                     &stop_thread,
                     fps,
                     window,
+                    preset,
                     &frame_tx,
                     &init_tx,
                     &encode_fps_thread,
                     &encode_kbps_thread,
                     &bitrate_thread,
+                    &keyframe_thread,
                 ) {
                     eprintln!("[ВИДЕО] Публикация остановлена: {e}");
                 }
@@ -124,7 +142,7 @@ impl ScreenPublisher {
 
         // ждём инициализации захвата и энкодера, иначе нечего показывать
         match init_rx.recv() {
-            Ok(Ok((info, source, base))) => Ok(Self {
+            Ok(Ok((info, source, base, used))) => Ok(Self {
                 stop,
                 handle: Some(handle),
                 rx: frame_rx,
@@ -134,6 +152,8 @@ impl ScreenPublisher {
                 encode_kbps,
                 bitrate,
                 bitrate_base: base,
+                preset: used,
+                keyframe,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -158,11 +178,13 @@ fn run(
     stop: &AtomicBool,
     fps: u32,
     window: Option<isize>,
+    preset: Option<VideoPreset>,
     tx: &Sender<EncodedUnit>,
-    init: &Sender<Result<(StreamInfo, String, u32), String>>,
+    init: &Sender<InitReport>,
     encode_fps: &AtomicU32,
     encode_kbps: &AtomicU32,
     bitrate: &AtomicU32,
+    keyframe: &AtomicBool,
 ) -> Result<(), String> {
     // Окно — через WGC, если система умеет; иначе вырезка из кадра экрана.
     // Целимся в размер источника: апскейл тратит битрейт зря.
@@ -173,7 +195,8 @@ fn run(
             return Err(e);
         }
     };
-    let target = VideoTarget::new(w, h, fps, VideoPreset::default_for(w, h));
+    let used = preset.unwrap_or_else(|| VideoPreset::default_for(w, h));
+    let target = VideoTarget::new(w, h, fps, used);
     let mut encoder = match MfEncoder::new(&target) {
         Ok(e) => e,
         Err(e) => {
@@ -181,6 +204,21 @@ fn run(
             return Err(e);
         }
     };
+    // Пресет и битрейт — в журнал: по нему видно, с каким качеством идёт
+    // поток и не «съел» ли его адаптер.
+    println!(
+        "[ВИДЕО] {} → {}x{} @ {} FPS · пресет {} · {:.1} Мбит/с · MFT {}",
+        label,
+        target.width,
+        target.height,
+        target.fps,
+        used.label(),
+        target.bitrate_bps as f32 / 1_000_000.0,
+        encoder.mft_name
+    );
+    if !encoder.notes.is_empty() {
+        println!("[ВИДЕО] ICodecAPI: {:?}", encoder.notes);
+    }
 
     let info = StreamInfo {
         width: target.width,
@@ -190,7 +228,7 @@ fn run(
     };
     let source = format!("{label} → {}x{}", target.width, target.height);
     let base_bitrate = target.bitrate_bps;
-    let _ = init.send(Ok((info, source, base_bitrate)));
+    let _ = init.send(Ok((info, source, base_bitrate, used)));
     // Какой битрейт сейчас стоит у энкодера: меняем только при отличии.
     let mut applied_bitrate = base_bitrate;
 
@@ -203,6 +241,10 @@ fn run(
     // сколько байт ушло в сеть за окно: битрейт важнее целевого, потому что
     // он и определяет, перегружен ли канал
     let mut window_bytes: u64 = 0;
+    // Раз в 5 с печатаем фактические числа: по ним видно, упирается ли поток
+    // в захват/энкодер, и сколько реально уходит в сеть.
+    let mut log_windows = 0u32;
+    let mut keyframe_warned = false;
 
     while !stop.load(Ordering::Relaxed) {
         let frame = match capture.next_nv12(50) {
@@ -225,6 +267,12 @@ fn run(
                 );
             }
         }
+        // Вошедшему зрителю нужен ключевой кадр сразу, а не через секунду:
+        // `VideoLink` ставит флаг при подписке.
+        if keyframe.swap(false, Ordering::Relaxed) && !encoder.force_keyframe() && !keyframe_warned {
+            keyframe_warned = true;
+            println!("[ВИДЕО] Энкодер не принял запрос ключевого кадра — зритель ждёт планового IDR");
+        }
         match encoder.push_nv12(&frame) {
             Ok(units) => {
                 for unit in units {
@@ -240,15 +288,21 @@ fn run(
         let dt = fps_window.elapsed();
         if dt >= Duration::from_secs(1) {
             let secs = dt.as_secs_f32();
-            encode_fps.store((fps_frames as f32 / secs).round() as u32, Ordering::Relaxed);
+            let captured = (fps_frames as f32 / secs).round() as u32;
+            encode_fps.store(captured, Ordering::Relaxed);
             // килобиты в секунду: байты × 8 / 1000
-            encode_kbps.store(
-                (window_bytes as f32 * 8.0 / 1000.0 / secs).round() as u32,
-                Ordering::Relaxed,
-            );
+            let kbps = (window_bytes as f32 * 8.0 / 1000.0 / secs).round() as u32;
+            encode_kbps.store(kbps, Ordering::Relaxed);
             fps_window = Instant::now();
             fps_frames = 0;
             window_bytes = 0;
+            log_windows += 1;
+            if log_windows.is_multiple_of(5) {
+                println!(
+                    "[ВИДЕО] захват {captured} FPS · {kbps} кбит/с · цель {:.1} Мбит/с",
+                    applied_bitrate as f32 / 1_000_000.0
+                );
+            }
         }
 
         // не кодируем чаще целевого fps, даже если экран обновляется быстрее

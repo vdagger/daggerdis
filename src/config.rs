@@ -38,8 +38,11 @@ pub struct AppConfig {
     pub continuous_mode: Option<bool>,
     /// Частота трансляции экрана (30 или 60 fps); по умолчанию 60.
     pub video_fps: Option<u32>,
-    /// Буфер показа видео у зрителя, мс (0…5000); по умолчанию 2000.
+    /// Буфер показа видео у зрителя, мс (0…5000); по умолчанию 400.
     pub video_buffer_ms: Option<u32>,
+    /// Пресет качества трансляции (`low` / `balanced` / `quality`). Нет ключа
+    /// — пресет выбирается по разрешению, как раньше.
+    pub video_preset: Option<String>,
     pub nick: Option<String>,
     /// Старый общий тумблер «обработка звука» (гейт + AGC + лимитер).
     /// Читается, только когда новых ключей эффектов в файле нет.
@@ -149,6 +152,12 @@ impl AppConfig {
                 "video_buffer_ms" => {
                     cfg.video_buffer_ms = value.parse().ok().map(|v: u32| v.min(5000))
                 }
+                // Неизвестный пресет отбрасываем: испорченная строка не должна
+                // незаметно менять качество трансляции.
+                "video_preset" => {
+                    cfg.video_preset = crate::video::VideoPreset::from_key(value)
+                        .map(|p| p.key().to_string())
+                }
                 "nick" => cfg.nick = Some(value.to_string()),
                 "mic_processing" => cfg.mic_processing = value.parse().ok(),
                 "tx_limiter" => cfg.tx_limiter = value.parse().ok(),
@@ -223,6 +232,9 @@ impl AppConfig {
         }
         if let Some(value) = self.video_buffer_ms {
             out.push_str(&format!("video_buffer_ms={}\n", value));
+        }
+        if let Some(value) = &self.video_preset {
+            out.push_str(&format!("video_preset={}\n", value));
         }
         if let Some(value) = &self.nick {
             out.push_str(&format!("nick={}\n", value));
@@ -342,6 +354,22 @@ mod tests {
         assert_eq!(missing.video_buffer_ms, None, "старый конфиг — буфер по умолчанию");
         assert_eq!(AppConfig::parse("video_buffer_ms=99999\n").video_buffer_ms, Some(5000));
         assert_eq!(AppConfig::parse("video_buffer_ms=abc\n").video_buffer_ms, None);
+    }
+
+    #[test]
+    fn video_preset_roundtrip_and_garbage() {
+        let cfg = AppConfig::parse("video_preset=quality\n");
+        assert_eq!(cfg.video_preset.as_deref(), Some("quality"));
+        let again = AppConfig::parse(&cfg.to_text());
+        assert_eq!(again.video_preset.as_deref(), Some("quality"));
+        // Регистр и пробелы — не повод менять качество: ключ нормализуется.
+        assert_eq!(
+            AppConfig::parse("video_preset= LOW \n").video_preset.as_deref(),
+            Some("low")
+        );
+        // Неизвестный пресет не подменяется «сбалансированным» молча.
+        assert_eq!(AppConfig::parse("video_preset=ultra\n").video_preset, None);
+        assert_eq!(AppConfig::parse("video_fps=60\n").video_preset, None);
     }
 
     #[test]

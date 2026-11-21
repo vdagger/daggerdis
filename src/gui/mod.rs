@@ -138,6 +138,10 @@ pub struct RadioApp {
     /// картинку не показываем, даже если источник тот же.
     #[cfg(windows)]
     remote_epoch_seen: u64,
+    /// Когда последний раз писали в журнал числа видео: раз в 5 с, чтобы
+    /// «не 60 fps» разбиралось по логу, а не на глаз.
+    #[cfg(windows)]
+    video_log_at: Instant,
     #[cfg(windows)]
     video_link: Option<Arc<crate::network::video_link::VideoLink>>,
     /// Кто в комнате сейчас в эфире: по этой карте зритель выбирает поток
@@ -274,6 +278,8 @@ impl RadioApp {
             remote: None,
             #[cfg(windows)]
             remote_epoch_seen: 0,
+            #[cfg(windows)]
+            video_log_at: Instant::now(),
             #[cfg(windows)]
             video_link: None,
             #[cfg(windows)]

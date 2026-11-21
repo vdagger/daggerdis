@@ -33,15 +33,21 @@ pub struct Renderer {
     decode_ms: f32,
     readback_ms: f32,
     image_ms: f32,
-    /// Потолок показа = частота самого потока (30 или 60 fps).
-    show_period: Duration,
-    last_shown: Option<Instant>,
+    /// Частота апдейтов GUI, в которых этот показ участвовал: по ней видно,
+    /// упёрся ли показ в свой период или в редкие кадры окна.
+    update_window_start: Instant,
+    update_window_ticks: u32,
+    update_fps: f32,
     /// Конверсия на GPU запущена, кадр ещё не забран в память.
     pending_since: Option<Instant>,
-    /// Свежий декодированный кадр, ещё не отправленный в D3D. Держим один:
-    /// если кадр пришёл, пока GPU занят, он не теряется, а ждёт следующего
-    /// апдейта; более новый просто заменяет его.
-    queued: Option<Vec<u8>>,
+    /// Декодированные кадры, ждущие отправки в D3D. Очередь, а не один слот:
+    /// сеть отдаёт кадры пачками, два могут стать готовыми в одном апдейте,
+    /// и второй молча пропадал — показ честно терял ~16 кадров из 60.
+    queued: std::collections::VecDeque<Vec<u8>>,
+    /// Сколько раз за окно GPU не был готов сразу (показ ждал) и сколько
+    /// кадров выбросили из очереди показа. Это и есть ответ на «почему не 60».
+    readback_waits: u32,
+    dropped: u32,
     pub last_error: Option<String>,
 }
 
@@ -84,10 +90,13 @@ impl Renderer {
             decode_ms: 0.0,
             readback_ms: 0.0,
             image_ms: 0.0,
-            show_period: Duration::from_secs_f64(1.0 / info.fps.max(1) as f64),
-            last_shown: None,
+            update_window_start: Instant::now(),
+            update_window_ticks: 0,
+            update_fps: 0.0,
             pending_since: None,
-            queued: None,
+            queued: std::collections::VecDeque::new(),
+            readback_waits: 0,
+            dropped: 0,
             last_error: None,
         })
     }
@@ -124,7 +133,14 @@ impl Renderer {
                     need
                 ));
             } else {
-                self.queued = Some(nv12);
+                // Показ берёт не больше одного кадра за апдейт, поэтому
+                // очередь короткая: два-три кадра — это 30-50 мс задержки,
+                // зато пачка из сети не теряет кадр целиком.
+                if self.queued.len() >= 3 {
+                    self.queued.pop_front();
+                    self.dropped += 1;
+                }
+                self.queued.push_back(nv12);
             }
         }
 
@@ -134,6 +150,13 @@ impl Renderer {
     /// Забирает готовый кадр, не дожидаясь GPU (блокирующий `Map` стоит
     /// десятки миллисекунд на кадр — из-за него превью шло ~30 fps).
     pub fn tick(&mut self, ctx: &egui::Context) {
+        self.update_window_ticks += 1;
+        let dt = self.update_window_start.elapsed();
+        if dt >= Duration::from_secs(1) {
+            self.update_fps = self.update_window_ticks as f32 / dt.as_secs_f32();
+            self.update_window_start = Instant::now();
+            self.update_window_ticks = 0;
+        }
         self.pump(ctx);
     }
 
@@ -148,20 +171,12 @@ impl Renderer {
         if self.pending_since.is_some() {
             return;
         }
-        // Показ не чаще частоты потока. Кадр всё равно проходит декодер (иначе
-        // порвётся цепочка P-кадров), но в D3D и на экран не идёт.
-        //
-        // Порог с запасом 25%: при мониторе 75 Гц апдейты идут через 13.3 мс,
-        // и жёсткий период 16.7 мс пропускал каждый второй — показ залипал на
-        // половине (32-37 fps вместо 60). Один кадр на апдейт всё равно не
-        // превышает частоту потока.
-        if let Some(last) = self.last_shown {
-            if last.elapsed() < self.show_period.mul_f32(0.75) {
-                return;
-            }
-        }
-
-        let Some(nv12) = self.queued.take() else {
+        // Потолок показа задаёт сам поток: каждый кадр показывается один раз,
+        // и приходит их не больше fps. Искусственный период 0.75·(1/fps) здесь
+        // только вредил: при 74 Гц апдейты идут через 13.5 мс, любой апдейт на
+        // 12.5 мс отбрасывался и кадр ждал ещё один — показ держался на 44-46
+        // FPS при потоке 60.
+        let Some(nv12) = self.queued.pop_front() else {
             return;
         };
         upload_nv12(&self.d3d.context, &self.nv12_tex, self.width, &nv12);
@@ -174,7 +189,6 @@ impl Renderer {
             return;
         }
         self.pending_since = Some(Instant::now());
-        self.last_shown = Some(Instant::now());
     }
 
     fn poll_readback(&mut self, ctx: &egui::Context) {
@@ -189,7 +203,11 @@ impl Renderer {
         let t_read = Instant::now();
         let bgra = match self.converter.read_back_nowait() {
             Ok(Some(b)) => b,
-            Ok(None) => return, // GPU ещё считает
+            Ok(None) => {
+                // GPU ещё считает: кадр не потерян, покажем следующим апдейтом.
+                self.readback_waits += 1;
+                return;
+            }
             Err(e) => {
                 self.pending_since = None;
                 self.last_error = Some(e);
@@ -236,9 +254,25 @@ impl Renderer {
         self.fps
     }
 
+    /// Апдейтов GUI в секунду. Если показ ниже потока, а это число высокое —
+    /// виноват показ; если низкое — само окно перерисовывается редко.
+    pub fn update_fps(&self) -> f32 {
+        self.update_fps
+    }
+
     /// Стоимость этапов последнего кадра: декод, чтение с GPU, картинка+текстура.
     pub fn timings(&self) -> (f32, f32, f32) {
         (self.decode_ms, self.readback_ms, self.image_ms)
+    }
+
+    /// Счётчики с прошлого вызова за окно журнала: сколько раз показ ждал
+    /// GPU и сколько кадров не поместилось в очередь показа. Без них «44 из
+    /// 60» — догадка, с ними — причина.
+    pub fn take_diag(&mut self) -> (u32, u32) {
+        let out = (self.readback_waits, self.dropped);
+        self.readback_waits = 0;
+        self.dropped = 0;
+        out
     }
 }
 
@@ -260,9 +294,24 @@ impl VideoSession {
         self.publisher.bitrate_base
     }
 
+    /// Флаг «выдай IDR»: сюда пишет `VideoLink`, когда подписался зритель.
+    pub fn keyframe_target(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.publisher.keyframe.clone()
+    }
+
+    /// Пресет, с которым идёт поток (для карточки и журнала).
+    pub fn preset(&self) -> crate::video::VideoPreset {
+        self.publisher.preset
+    }
+
     /// `window` — транслировать окно вместо всего экрана.
-    pub fn start(fps: u32, window: Option<isize>) -> Result<Self, String> {
-        let publisher = ScreenPublisher::start(fps, window)?;
+    pub fn start(
+        fps: u32,
+        window: Option<isize>,
+        preset: Option<crate::video::VideoPreset>,
+        keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, String> {
+        let publisher = ScreenPublisher::start(fps, window, preset, keyframe)?;
         // превью — в половинном разрешении: на экране оно всё равно мелкое,
         // а полный 1080p readback не даёт держать 60 кадров в секунду
         let renderer = Renderer::new(&publisher.info, 2)?;
@@ -310,8 +359,17 @@ impl VideoSession {
         self.renderer.fps()
     }
 
+    pub fn update_fps(&self) -> f32 {
+        self.renderer.update_fps()
+    }
+
     pub fn timings(&self) -> (f32, f32, f32) {
         self.renderer.timings()
+    }
+
+    /// (ждали GPU, выброшено кадров) с прошлого вызова — для журнала.
+    pub fn take_diag(&mut self) -> (u32, u32) {
+        self.renderer.take_diag()
     }
 
     /// Фактическая частота кодирования (не показа).
@@ -369,11 +427,20 @@ impl RemoteView {
         self.renderer.fps()
     }
 
+    pub fn update_fps(&self) -> f32 {
+        self.renderer.update_fps()
+    }
+
     /// Стоимость этапов показа (декод, чтение с GPU, картинка), мс.
     /// Нужна, чтобы по логу/экрану зрителя отличить слабый компьютер
     /// (дорогой декод или чтение с GPU) от потерь в сети.
     pub fn timings(&self) -> (f32, f32, f32) {
         self.renderer.timings()
+    }
+
+    /// (ждали GPU, выброшено кадров) с прошлого вызова — для журнала.
+    pub fn take_diag(&mut self) -> (u32, u32) {
+        self.renderer.take_diag()
     }
 
     pub fn last_error(&self) -> Option<&String> {
