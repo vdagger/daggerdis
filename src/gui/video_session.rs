@@ -358,9 +358,19 @@ impl VideoSession {
         keyframe: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let publisher = ScreenPublisher::start(fps, window, preset, keyframe)?;
-        // превью — в половинном разрешении: на экране оно всё равно мелкое,
-        // а полный 1080p readback не даёт держать 60 кадров в секунду
-        let renderer = Renderer::new(&publisher.info, 2)?;
+        // Превью своей трансляции: половинное разрешение нужно только большим
+        // потокам (1080p и выше), чтобы чтение с GPU и загрузка текстуры не
+        // съедали 60 кадров. Для окна 1110x610 половинное превью — это 555 px,
+        // которые потом растягиваются в окно показа, и текст выглядит
+        // «пикселями»: там дешевле показать кадр как есть.
+        let scale = if publisher.info.width as u64 * publisher.info.height as u64
+            >= 1280 * 720
+        {
+            2
+        } else {
+            1
+        };
+        let renderer = Renderer::new(&publisher.info, scale)?;
         Ok(Self {
             source: publisher.source.clone(),
             publisher,

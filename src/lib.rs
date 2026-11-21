@@ -3,6 +3,8 @@ pub mod autostart;
 pub mod calls;
 pub mod chat;
 pub mod config;
+#[cfg(windows)]
+pub mod desktop_audio;
 pub mod devices;
 pub mod diagnostics;
 pub mod firewall;

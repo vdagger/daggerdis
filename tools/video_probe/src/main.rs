@@ -45,6 +45,12 @@ fn main() {
             rest.get(2).cloned().unwrap_or_else(|| "window".into()),
             nums.get(2).copied().unwrap_or(60),
         ),
+        // --desktop <секунды> <префикс>: захват звука рабочего стола (process
+        // loopback с исключением своего процесса). Пишет сырой f32 стерео.
+        "--desktop" => run_desktop(
+            nums.first().copied().unwrap_or(3) as u64,
+            rest.get(1).cloned().unwrap_or_else(|| "desktop".into()),
+        ),
         "--gpu" => run_gpu(
             nums.first().copied().unwrap_or(2560),
             nums.get(1).copied().unwrap_or(1440),
@@ -527,6 +533,43 @@ fn main() {
                 println!("ОШИБКА показа {ow}x{oh}: {e}");
             }
         }
+    }
+
+    /// Захват звука рабочего стола: проверка, что process loopback вообще
+    /// поднимается и что в него попадает чужой звук (мы сами исключены).
+    fn run_desktop(seconds: u64, prefix: String) {
+        use albus::desktop_audio::{frame_level, DesktopCapture};
+        use std::time::{Duration, Instant};
+
+        let cap = match DesktopCapture::start() {
+            Ok(c) => c,
+            Err(e) => {
+                println!("ОШИБКА захвата звука стола: {e}");
+                std::process::exit(1);
+            }
+        };
+        println!("Захват звука стола пошёл (свой процесс исключён)");
+        let mut all: Vec<f32> = Vec::new();
+        let (mut max_rms, mut max_peak, mut frames) = (0.0f32, 0.0f32, 0u32);
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < deadline {
+            let frame = cap.read_frame();
+            let (rms, peak) = frame_level(&frame);
+            max_rms = max_rms.max(rms);
+            max_peak = max_peak.max(peak);
+            all.extend_from_slice(&frame);
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let bytes: Vec<u8> = all.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let path = format!("{prefix}.f32");
+        let _ = std::fs::write(&path, &bytes);
+        println!(
+            "Кадров: {frames}, сэмплов: {}, RMS макс {max_rms:.4}, пик {max_peak:.4}, недоборов {}",
+            all.len(),
+            cap.underruns()
+        );
+        println!("Записано: {path} ({} байт)", bytes.len());
     }
 
     /// Полный круг без экрана и сети: синтетика → H.264 → декодер.
