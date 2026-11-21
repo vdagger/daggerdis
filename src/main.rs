@@ -175,6 +175,9 @@ fn main() {
         playback_rx.clone(),
         mixer.clone(),
         diagnostics.clone(),
+        albus::audio::UniversalAudioCapture::parse_output_format(
+            config.output_format.as_deref().unwrap_or("auto"),
+        ),
     ) {
         Ok(stream) => *playback_stream.lock().unwrap() = Some(stream),
         Err(e) => eprintln!(

@@ -647,7 +647,10 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   (f32 before i16, then fewer channels), and the callback writes only the
   first two channels (`active_channels = channels.min(2)`), leaving the rest
   silent: LFE/центр/тыл копией фронта не кормим. У виртуального «7.1» Razer
-  ломается `f32` (cpal#892), поэтому `i32` тоже кандидат и пробуется раньше.
+  ломается `f32` (cpal#892): правило выбора — `audio::plan_output_candidates`
+  (для таких имён i32 → i16 → f32, формат важнее каналов), ручной
+  `output_format` в настройках звука, `u8` тоже поддержан; частота — 48 кГц
+  или своя.
 - **Build stamp:** `build.rs` отдаёт `ALBUS_BUILD_STAMP` (самый свежий mtime в
   `src/`), при старте печатается `[СБОРКА] Albus <version> · сборка <stamp>`.
   У двух узлов штамп обязан совпадать — экземпляр, скопированный на другую
@@ -687,8 +690,6 @@ is `video_buffer_ms` (0..5000, default 2000; larger values are clamped). `friend
   growth both during a stream and across broadcast start/stop cycles (the
   driver frees it late). `win_d3d.rs` now `ManuallyDrop::take`s it on every
   `Blt` outcome. Проверка утечек: `tools/video_probe` (`ALBUS_NO_ADMIN_MANIFEST=1`).
-- **Video window:** превью и чужие потоки — в окне «Albus — трансляция».
-  Превью на своём мониторе подкармливает захват — норма.
 - Source comments and user-facing strings are **Russian (UTF-8)**. One known cosmetic
   bug: `build.rs` stores its error string as mojibake (double-encoded cp866).
 - `Cargo.lock` is committed and must stay committed (binary app — do **not** gitignore it).

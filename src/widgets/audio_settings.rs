@@ -24,6 +24,9 @@ pub fn draw_audio_settings(
     selected_output: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     mixer: &crate::mixer::AudioMixer,
     ptt_bind: &mut Option<crate::keybind::PttBind>,
+    // Формат вывода из настроек: auto / f32 / i32 / i16.
+    output_format: &mut Option<String>,
+    pending_save: &mut bool,
 ) {
     let in_idx = selected_input.load(std::sync::atomic::Ordering::Relaxed) as usize;
     let in_count = input_channel_counts.get(in_idx).copied().unwrap_or(0) as usize;
@@ -208,6 +211,58 @@ pub fn draw_audio_settings(
                 }
             }
         });
+
+    ui.add_space(10.0);
+    // Формат вывода: авто подбирает сам (и на виртуальных 7.1 уходит в i32,
+    // потому что их драйвер портит f32 — RustAudio/cpal#892). Ручной выбор
+    // нужен, когда имя устройства не выдаёт проблему, а звук всё равно плохой.
+    let current_format = output_format
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Формат вывода")
+                .size(11.5)
+                .color(t::TEXT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            egui::ComboBox::from_id_source("output_format_combo")
+                .width(120.0)
+                .selected_text(match current_format.as_str() {
+                    "f32" => "f32",
+                    "i32" => "i32",
+                    "i16" => "i16",
+                    _ => "авто",
+                })
+                .show_ui(ui, |ui| {
+                    for (value, label) in [
+                        ("auto", "авто"),
+                        ("f32", "f32"),
+                        ("i32", "i32"),
+                        ("i16", "i16"),
+                    ] {
+                        let selected = current_format == value;
+                        if ui.selectable_label(selected, label).clicked() {
+                            *output_format = if value == "auto" {
+                                None
+                            } else {
+                                Some(value.to_string())
+                            };
+                            *pending_save = true;
+                            println!(
+                                "[АУДИО] Формат вывода: {} (перезапустите звук или приложение)",
+                                value
+                            );
+                        }
+                    }
+                });
+        });
+    });
+    ui.label(
+        egui::RichText::new("i32 спасает на виртуальных 7.1 (Razer и подобных)")
+            .size(8.5)
+            .color(t::TEXT_MUTED),
+    );
 
     ui.add_space(16.0);
     ui.separator();

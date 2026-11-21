@@ -67,6 +67,7 @@ pub fn restart_playback_stream(
     device_name: String,
     mixer: std::sync::Arc<crate::mixer::AudioMixer>,
     diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
+    forced_format: Option<cpal::SampleFormat>,
 ) -> Result<(), String> {
     use cpal::traits::StreamTrait;
 
@@ -92,7 +93,13 @@ pub fn restart_playback_stream(
         let _ = old.pause();
     }
 
-    match crate::audio::UniversalAudioCapture::create_playback_stream(device, rx, mixer, diag) {
+    match crate::audio::UniversalAudioCapture::create_playback_stream(
+        device,
+        rx,
+        mixer,
+        diag,
+        forced_format,
+    ) {
         Ok(new_stream) => {
             *stream_lock = Some(new_stream);
             println!("[GUI] Поток воспроизведения переключен на: {}", device_name);

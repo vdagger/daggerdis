@@ -46,6 +46,88 @@ fn plc(decoder: &mut rusty_opus::OpusDecoder, out: &mut [f32; 960]) -> usize {
     decoder.decode(&[], 960, out).unwrap_or(0)
 }
 
+/// Похоже ли имя устройства на виртуальный 7.1-выход.
+///
+/// Именно такие устройства (Razer 7.1 Surround Sound и подобные драйверы)
+/// отдают f32, но воспроизводят его перекошенным: `cpal` тут ни при чём,
+/// ломается сам драйвер — в issue RustAudio/cpal#892 автор подтвердил, что
+/// i32 на том же устройстве звучит чисто.
+pub fn risky_output_device(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("7.1") || n.contains("razer") || n.contains("surround") || n.contains("virtual")
+}
+
+/// Порядок, в котором пробуем открыть поток вывода.
+///
+/// `ranges` — пары (формат, каналы) из `supported_output_configs`, уже
+/// отфильтрованные по 48 кГц. Возвращает порядок попыток: первый успешный
+/// и станет потоком.
+///
+/// Правила:
+///  * ручной выбор (`forced`) — только этот формат (если он у устройства есть);
+///  * виртуальный 7.1 — i32, затем i16, затем f32: драйвер портит f32
+///    независимо от числа каналов, поэтому формат важнее каналов;
+///  * обычное устройство — сначала меньше каналов (стерео на виртуалке не
+///    размазывается), внутри одного числа каналов f32 для стерео и i32 для
+///    многоканальных.
+pub fn plan_output_candidates(
+    device_name: &str,
+    ranges: &[(cpal::SampleFormat, u16)],
+    forced: Option<cpal::SampleFormat>,
+) -> Vec<(cpal::SampleFormat, u16)> {
+    use cpal::SampleFormat;
+    let mut out: Vec<(SampleFormat, u16)> = Vec::new();
+    for &(format, channels) in ranges {
+        if !out.contains(&(format, channels)) {
+            out.push((format, channels));
+        }
+    }
+    let risky = risky_output_device(device_name);
+    if let Some(forced) = forced {
+        let only: Vec<(SampleFormat, u16)> = out
+            .iter()
+            .copied()
+            .filter(|(f, _)| *f == forced)
+            .collect();
+        // Если такого формата у устройства нет, оставляем авто: человек не
+        // должен остаться без звука из-за настройки.
+        if !only.is_empty() {
+            out = only;
+        }
+    }
+    let rank = |format: SampleFormat, channels: u16| -> u8 {
+        if risky {
+            match format {
+                SampleFormat::I32 => 0,
+                SampleFormat::I16 => 1,
+                SampleFormat::F32 => 2,
+                _ => 3,
+            }
+        } else if channels > 2 {
+            match format {
+                SampleFormat::I32 => 0,
+                SampleFormat::F32 => 1,
+                SampleFormat::I16 => 2,
+                _ => 3,
+            }
+        } else {
+            match format {
+                SampleFormat::F32 => 0,
+                SampleFormat::I16 => 1,
+                SampleFormat::I32 => 2,
+                _ => 3,
+            }
+        }
+    };
+    if risky {
+        // На виртуальном 7.1 формат важнее каналов.
+        out.sort_by_key(|(format, channels)| (rank(*format, *channels), *channels));
+    } else {
+        out.sort_by_key(|(format, channels)| (*channels, rank(*format, *channels)));
+    }
+    out
+}
+
 impl UniversalAudioCapture {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(UniversalAudioCapture)
@@ -245,11 +327,25 @@ impl UniversalAudioCapture {
         Ok(stream)
     }
 
+    /// Формат вывода, выбранный пользователем в настройках.
+    ///
+    /// `auto`/пусто — решаем сами; `i32` — жёстко, это лекарство от
+    /// виртуальных 7.1-устройств (см. `plan_output_candidates`).
+    pub fn parse_output_format(value: &str) -> Option<cpal::SampleFormat> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "f32" => Some(cpal::SampleFormat::F32),
+            "i32" => Some(cpal::SampleFormat::I32),
+            "i16" => Some(cpal::SampleFormat::I16),
+            _ => None,
+        }
+    }
+
     pub fn create_playback_stream(
         device: Option<cpal::Device>,
         rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
         mixer: std::sync::Arc<crate::mixer::AudioMixer>,
         diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
+        forced_format: Option<cpal::SampleFormat>,
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
         let host = cpal::default_host();
         let output_device = match device {
@@ -269,54 +365,45 @@ impl UniversalAudioCapture {
             .map(|configs| configs.collect())
             .unwrap_or_default();
 
-        // i32 нужен из-за виртуальных 7.1-устройств (Razer 7.1 Surround Sound):
-        // там драйвер отдаёт f32, но воспроизводит его перекошенным — речь
-        // превращается в свист, зато тот же поток в i32 звучит нормально
-        // (RustAudio/cpal#892). Поэтому i32 тоже в списке кандидатов.
-        let mut candidates: Vec<(cpal::SampleFormat, u32, u16)> = Vec::new();
-        for format in [
-            cpal::SampleFormat::F32,
-            cpal::SampleFormat::I32,
-            cpal::SampleFormat::I16,
-        ] {
-            for range in &ranges {
-                if range.sample_format() != format
-                    || range.min_sample_rate().0 > 48000
-                    || range.max_sample_rate().0 < 48000
-                {
-                    continue;
-                }
-                let cand = (format, 48000u32, range.channels());
-                if !candidates.contains(&cand) {
-                    candidates.push(cand);
-                }
+        // Порядок форматов — в чистой `plan_output_candidates`: там же правило
+        // про виртуальные 7.1-устройства (f32 на них искажается, i32 звучит
+        // чисто — RustAudio/cpal#892) и ручной выбор формата из настроек.
+        //
+        // Частота: 48 кГц, если устройство её умеет, иначе его собственная
+        // (QUAD-CAPTURE живёт на 44100). Раньше кандидаты строились только по
+        // 48 кГц, и на 44.1-устройстве список оказывался пуст — работал только
+        // «последний шанс» с форматом по умолчанию, а ручной выбор i32 молча
+        // игнорировался.
+        let device_name = output_device.name().unwrap_or_default();
+        let default_rate = output_device
+            .default_output_config()
+            .map(|c| c.sample_rate().0)
+            .unwrap_or(48_000);
+        let rate_for = |format: cpal::SampleFormat, channels: u16| -> u32 {
+            ranges
+                .iter()
+                .find(|r| r.sample_format() == format && r.channels() == channels)
+                .map(|r| {
+                    if r.min_sample_rate().0 <= 48000 && r.max_sample_rate().0 >= 48000 {
+                        48000
+                    } else {
+                        default_rate.clamp(r.min_sample_rate().0, r.max_sample_rate().0)
+                    }
+                })
+                .unwrap_or(default_rate)
+        };
+        let mut available: Vec<(cpal::SampleFormat, u16)> = Vec::new();
+        for range in &ranges {
+            let pair = (range.sample_format(), range.channels());
+            if !available.contains(&pair) {
+                available.push(pair);
             }
         }
-        // Меньше каналов — лучше: стерео на виртуальном 7.1-устройстве звучит
-        // как обычные динамики, а восьмиканальный поток та же виртуализация
-        // размазывает по комнате, и речь превращается в кашу. На многоканальном
-        // выходе ставим i32 впереди f32: у таких виртуальных карт f32 — как раз
-        // тот формат, который они портят.
-        let format_order = |format: cpal::SampleFormat, channels: u16| -> u8 {
-            if channels > 2 {
-                match format {
-                    cpal::SampleFormat::I32 => 0,
-                    cpal::SampleFormat::F32 => 1,
-                    cpal::SampleFormat::I16 => 2,
-                    _ => 3,
-                }
-            } else {
-                match format {
-                    cpal::SampleFormat::F32 => 0,
-                    cpal::SampleFormat::I16 => 1,
-                    cpal::SampleFormat::I32 => 2,
-                    _ => 3,
-                }
-            }
-        };
-        candidates.sort_by_key(|(format, _, channels)| {
-            (*channels, format_order(*format, *channels))
-        });
+        let mut candidates: Vec<(cpal::SampleFormat, u32, u16)> =
+            plan_output_candidates(&device_name, &available, forced_format)
+                .into_iter()
+                .map(|(format, channels)| (format, rate_for(format, channels), channels))
+                .collect();
 
         // Последний шанс — формат устройства по умолчанию, на какой бы частоте
         // он ни был: ресэмплер ниже приведёт звук к нему.
@@ -352,6 +439,13 @@ impl UniversalAudioCapture {
                     mixer.clone(),
                     diag.clone(),
                 ),
+                cpal::SampleFormat::U8 => Self::build_playback::<u8>(
+                    &output_device,
+                    &config,
+                    rx.clone(),
+                    mixer.clone(),
+                    diag.clone(),
+                ),
                 cpal::SampleFormat::I16 => Self::build_playback::<i16>(
                     &output_device,
                     &config,
@@ -363,12 +457,19 @@ impl UniversalAudioCapture {
             };
             match built {
                 Ok(stream) => {
+                    // Почему выбран именно этот формат — важно для разбора на
+                    // другой машине: у виртуального 7.1 f32 звучит перекошенно,
+                    // и в журнале должно быть видно, что мы ушли в i32.
+                    let reason = if forced_format.is_some() {
+                        "выбран вручную"
+                    } else if risky_output_device(&device_name) {
+                        "виртуальный 7.1: i32 надёжнее"
+                    } else {
+                        "авто"
+                    };
                     println!(
-                        "[АУДИО] Открыты динамики: '{}', частота: {} Гц, каналов: {}, формат: {:?}",
-                        output_device.name().unwrap_or_default(),
-                        rate,
-                        channels,
-                        format
+                        "[АУДИО] Открыты динамики: '{}', частота: {} Гц, каналов: {}, формат: {:?} ({reason})",
+                        device_name, rate, channels, format
                     );
                     return Ok(stream);
                 }
@@ -378,7 +479,22 @@ impl UniversalAudioCapture {
                 ),
             }
         }
-        Err("ни один формат динамиков не открылся".into())
+        // Если ничего не открылось, в журнале должно быть видно, что вообще
+        // предлагало устройство: без этого «нет звука» на чужой машине
+        // диагностировать нечем.
+        let offered: Vec<String> = available
+            .iter()
+            .map(|(format, channels)| format!("{:?}/{}ch", format, channels))
+            .collect();
+        Err(format!(
+            "ни один формат динамиков не открылся; устройство предлагает: {}",
+            if offered.is_empty() {
+                "ни одного диапазона 44.1–48 кГц".to_string()
+            } else {
+                offered.join(", ")
+            }
+        )
+        .into())
     }
 
     /// Поток вывода в формате самой карты (f32 там, где он есть, иначе i16).
@@ -793,6 +909,87 @@ impl UniversalAudioCapture {
 
         stream.play()?;
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod output_plan_tests {
+    use super::*;
+    use cpal::SampleFormat;
+
+    #[test]
+    fn risky_virtual_names_are_detected() {
+        assert!(risky_output_device("Динамики (Razer 7.1 Surround Sound)"));
+        assert!(risky_output_device("7.1 Surround Sound"));
+        assert!(risky_output_device("Virtual Desktop Audio"));
+        assert!(!risky_output_device("1-2 (QUAD-CAPTURE)"));
+        assert!(!risky_output_device("Speakers (Realtek High Definition Audio)"));
+    }
+
+    #[test]
+    fn virtual_71_puts_i32_before_f32_even_with_stereo_range() {
+        // Ключевой случай: у виртуального 7.1 есть и стерео-f32, и i32.
+        // Старое правило «сначала меньше каналов» выбрало бы f32 и получило
+        // перекошенный звук — формат обязан быть важнее каналов.
+        let ranges = [
+            (SampleFormat::F32, 2),
+            (SampleFormat::F32, 8),
+            (SampleFormat::I32, 8),
+            (SampleFormat::I16, 2),
+        ];
+        let plan = plan_output_candidates("Razer 7.1 Surround Sound", &ranges, None);
+        assert_eq!(plan[0].0, SampleFormat::I32, "сначала i32, а не f32");
+        let f32_at = plan
+            .iter()
+            .position(|(f, _)| *f == SampleFormat::F32)
+            .expect("f32 остаётся запасным вариантом");
+        assert!(f32_at >= 2, "f32 — только после i32 и i16: {plan:?}");
+    }
+
+    #[test]
+    fn stereo_device_prefers_f32() {
+        let ranges = [(SampleFormat::F32, 2), (SampleFormat::I16, 2), (SampleFormat::I32, 2)];
+        let plan = plan_output_candidates("1-2 (QUAD-CAPTURE)", &ranges, None);
+        assert_eq!(plan[0], (SampleFormat::F32, 2), "обычное стерео — f32");
+    }
+
+    #[test]
+    fn multichannel_device_prefers_i32() {
+        let ranges = [(SampleFormat::F32, 8), (SampleFormat::I32, 8)];
+        let plan = plan_output_candidates("Динамики (7.1 Surround Sound)", &ranges, None);
+        // Имя уже «рисковое», но и по правилу многоканальных i32 первый.
+        assert_eq!(plan[0].0, SampleFormat::I32);
+    }
+
+    #[test]
+    fn forced_format_wins_when_available() {
+        let ranges = [(SampleFormat::F32, 2), (SampleFormat::I32, 2)];
+        let plan = plan_output_candidates("Speakers", &ranges, Some(SampleFormat::I32));
+        assert_eq!(plan, vec![(SampleFormat::I32, 2)], "только выбранный формат");
+    }
+
+    #[test]
+    fn missing_forced_format_falls_back_to_auto() {
+        // Устройство не умеет i32 — не оставляем человека без звука.
+        let ranges = [(SampleFormat::F32, 2), (SampleFormat::I16, 2)];
+        let plan = plan_output_candidates("Speakers", &ranges, Some(SampleFormat::I32));
+        assert!(!plan.is_empty(), "план не должен опустеть");
+        assert_eq!(plan[0], (SampleFormat::F32, 2));
+    }
+
+    #[test]
+    fn format_names_are_parsed() {
+        assert_eq!(
+            UniversalAudioCapture::parse_output_format("i32"),
+            Some(SampleFormat::I32)
+        );
+        assert_eq!(
+            UniversalAudioCapture::parse_output_format(" F32 "),
+            Some(SampleFormat::F32)
+        );
+        assert_eq!(UniversalAudioCapture::parse_output_format("auto"), None);
+        assert_eq!(UniversalAudioCapture::parse_output_format(""), None);
+        assert_eq!(UniversalAudioCapture::parse_output_format("чушь"), None);
     }
 }
 

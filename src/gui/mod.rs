@@ -491,6 +491,9 @@ impl eframe::App for RadioApp {
                     device_name.clone(),
                     self.mixer.clone(),
                     self.diagnostics.clone(),
+                    crate::audio::UniversalAudioCapture::parse_output_format(
+                        self.config.output_format.as_deref().unwrap_or("auto"),
+                    ),
                 ) {
                     self.show_toast(&format!("Динамики не переключились: {e}"));
                 }

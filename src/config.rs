@@ -53,6 +53,10 @@ pub struct AppConfig {
     /// Закрытие окна сворачивает приложение в трей, а не завершает его.
     /// Ключа нет в старых файлах — считается включённым.
     pub close_to_tray: Option<bool>,
+    /// Формат вывода звука: `auto` (по умолчанию), `f32`, `i32` или `i16`.
+    /// Ручной выбор нужен из-за виртуальных 7.1-устройств: их драйвер портит
+    /// f32, и только i32 звучит чисто (RustAudio/cpal#892).
+    pub output_format: Option<String>,
     pub peer_volumes: HashMap<u64, u32>,
 }
 
@@ -152,6 +156,7 @@ impl AppConfig {
                 // Битрейт — только из допустимого набора: промежуточное значение
                 // просто округлится при загрузке в микшер, но хранить мусор незачем.
                 "close_to_tray" => cfg.close_to_tray = value.parse().ok(),
+            "output_format" => cfg.output_format = Some(value.to_string()),
                 "opus_bitrate" => cfg.opus_bitrate = value.parse().ok().filter(|v| {
                     crate::mixer::OPUS_BITRATES.contains(v)
                 }),
@@ -227,6 +232,9 @@ impl AppConfig {
         }
         if let Some(value) = self.tx_limiter {
             out.push_str(&format!("tx_limiter={}\n", value));
+        }
+        if let Some(value) = &self.output_format {
+            out.push_str(&format!("output_format={value}\n"));
         }
         if let Some(value) = self.close_to_tray {
             out.push_str(&format!("close_to_tray={}\n", value));

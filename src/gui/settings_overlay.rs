@@ -89,6 +89,8 @@ impl RadioApp {
                                     &self.selected_output,
                                     &self.mixer,
                                     &mut self.ptt_bind,
+                                    &mut self.config.output_format,
+                                    &mut self.pending_save,
                                 );
 
                                 ui.add_space(14.0);
