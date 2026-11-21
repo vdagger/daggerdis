@@ -431,10 +431,20 @@ impl RadioApp {
                                             .as_ref()
                                             .map(|(hwnd, _)| *hwnd == w.hwnd)
                                             .unwrap_or(false);
+                                        // Размер — в списке: иначе легко выбрать
+                                        // маленькое окно (картинка-в-картинке,
+                                        // 384x216) и потом удивляться, что поток
+                                        // растянут в окне просмотра.
+                                        let text = format!(
+                                            "{} ({}×{})",
+                                            short_title(&w.title),
+                                            w.width,
+                                            w.height
+                                        );
                                         if ui
                                             .selectable_label(
                                                 selected,
-                                                egui::RichText::new(short_title(&w.title)).size(9.0),
+                                                egui::RichText::new(text).size(9.0),
                                             )
                                             .clicked()
                                         {
