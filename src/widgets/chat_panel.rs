@@ -37,7 +37,13 @@ fn truncate_to_bytes(s: String, max: usize) -> String {
     s[..end].to_string()
 }
 
-fn send_chat(p2p: &Arc<IrohP2pManager>, target: &str, my_id: u64, text: String) {
+fn send_chat(
+    p2p: &Arc<IrohP2pManager>,
+    target: &str,
+    my_id: u64,
+    text: String,
+    error_slot: Arc<std::sync::Mutex<Option<String>>>,
+) {
     let text = truncate_to_bytes(text, 1024);
     let msg = crate::network::NetworkMessage::ChatMessage {
         sender_id: my_id,
@@ -50,7 +56,13 @@ fn send_chat(p2p: &Arc<IrohP2pManager>, target: &str, my_id: u64, text: String) 
         // send_bytes сам подключается, если соединения нет: раньше здесь
         // вдобавок шёл connect_to_peer, и при перезапуске пира два соединения
         // гонялись наперегонки за одну запись в карту.
-        let _ = p2p.send_bytes(&target, &bytes).await;
+        // Ошибку не глотаем: сообщение уже нарисовано в ленте, и человек
+        // уверен, что оно ушло, — тост говорит обратное.
+        if let Err(e) = p2p.send_bytes(&target, &bytes).await {
+            if let Ok(mut slot) = error_slot.lock() {
+                *slot = Some(format!("Сообщение не доставлено: {}", e));
+            }
+        }
     });
 }
 
@@ -149,8 +161,11 @@ pub fn draw_chat_panel(
     iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,
     close: &mut bool,
+    error_slot: &Arc<std::sync::Mutex<Option<String>>>,
+    presence: &Arc<crate::presence::PresenceTracker>,
 ) {
     let name = friend_name(friends, node_id);
+    let online = presence.is_online(node_id);
 
     // Шапка: друг и состояние
     ui.horizontal(|ui| {
@@ -159,7 +174,12 @@ pub fn draw_chat_panel(
             ui.label(RichText::new(name.as_str()).size(13.0).strong().color(t::TEXT));
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot.center(), 2.5, t::LIVE);
+                // Точка — настоящий онлайн-статус из presence, а не декоративная.
+                ui.painter().circle_filled(
+                    dot.center(),
+                    2.5,
+                    if online { t::LIVE } else { t::TEXT_MUTED },
+                );
                 ui.label(
                     RichText::new(short_node_id(node_id))
                         .monospace()
@@ -269,7 +289,7 @@ pub fn draw_chat_panel(
                         at: now_ms(),
                     },
                 );
-                send_chat(p2p, node_id, my_id, text);
+                send_chat(p2p, node_id, my_id, text, error_slot.clone());
             }
             input.clear();
         }

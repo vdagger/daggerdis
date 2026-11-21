@@ -20,6 +20,16 @@ static IS_LISTENING: AtomicBool = AtomicBool::new(false);
 static CONTINUOUS_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Экранная PTT-зона: суммируется с хоткеем, а не перетирает его
 static SCREEN_PTT: AtomicBool = AtomicBool::new(false);
+/// Глобальный мьют микрофона: Ctrl+M ловится тем же потоком, что и PTT.
+/// GUI забирает событие через `take_mute_toggle` — сам он в этом потоке
+/// не живёт, поэтому флаг, а не прямой вызов микшера.
+static MUTE_EDGE: AtomicBool = AtomicBool::new(false);
+static MUTE_LAST: AtomicBool = AtomicBool::new(false);
+
+/// Забирает накопившееся нажатие Ctrl+M (true — ровно одно нажатие).
+pub fn take_mute_toggle() -> bool {
+    MUTE_EDGE.swap(false, Ordering::Relaxed)
+}
 
 /// Вызывается из GUI: пользователь зажал/отпустил PTT-зону мышью
 pub fn set_screen_ptt(active: bool) {
@@ -65,6 +75,17 @@ fn ensure_global_listener_spawned(ptt_flag: Arc<AtomicBool>) {
                         } else {
                             println!("[ХОТКЕЙ] 🔇 ЭФИР ВЫКЛЮЧЕН");
                         }
+                    }
+
+                    // Ctrl+M — глобальный мьют микрофона, рядом с PTT и так же
+                    // из любого приложения. Реагируем на фронт, иначе удержание
+                    // дёргало бы тумблер каждые 10 мс.
+                    let ctrl_down = unsafe { (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0 };
+                    let m_down = unsafe { (GetAsyncKeyState(0x4D) as u16 & 0x8000) != 0 };
+                    let combo = ctrl_down && m_down;
+                    let was_combo = MUTE_LAST.swap(combo, Ordering::Relaxed);
+                    if combo && !was_combo {
+                        MUTE_EDGE.store(true, Ordering::Relaxed);
                     }
                 }
             }

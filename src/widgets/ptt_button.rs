@@ -13,9 +13,16 @@ pub fn draw_ptt_button(
     bind: Option<crate::keybind::PttBind>,
 ) {
     let transmitting = ptt_flag.load(Ordering::Relaxed);
+    let muted = mixer.is_mic_muted();
     let _level = mixer.input1_peak().max(mixer.input2_peak()).clamp(0.0, 1.0);
 
-    let (fill, border, title) = if *continuous_mode {
+    let (fill, border, title) = if muted {
+        (
+            t::with_alpha(t::REC, 0.07),
+            t::with_alpha(t::REC, 0.50),
+            "МИКРОФОН ВЫКЛЮЧЕН",
+        )
+    } else if *continuous_mode {
         (t::with_alpha(t::LIVE, 0.08), t::with_alpha(t::LIVE, 0.55), "ЭФИР ОТКРЫТ")
     } else if transmitting {
         (t::with_alpha(t::REC, 0.10), t::with_alpha(t::REC, 0.75), "ПЕРЕДАЧА")
@@ -51,7 +58,9 @@ pub fn draw_ptt_button(
 
         // Кружок с микрофоном слева
         let mic_center = egui::pos2(rect.left() + 30.0, rect.center().y - 2.0);
-        let accent = if *continuous_mode {
+        let accent = if muted {
+            t::REC
+        } else if *continuous_mode {
             t::LIVE
         } else if transmitting {
             t::REC
@@ -73,7 +82,9 @@ pub fn draw_ptt_button(
             Stroke::new(1.4_f32, accent),
         );
 
-        let text_color = if *continuous_mode {
+        let text_color = if muted {
+            t::REC
+        } else if *continuous_mode {
             t::LIVE
         } else if transmitting {
             egui::Color32::WHITE
@@ -200,5 +211,88 @@ pub fn draw_continuous_toggle(
     if toggle {
         *continuous_mode = !*continuous_mode;
         ptt_flag.store(*continuous_mode, Ordering::Relaxed);
+    }
+}
+
+/// Тумблер мьюта микрофона для нижней строки консоли.
+///
+/// Раньше это умел только недостижимый консольный `/mute` (`menu.rs`): флаг
+/// в микшере был, а кнопки не было. Ctrl+M обрабатывается в `keybind.rs` и
+/// ведёт к тому же флагу — состояние всегда одно.
+pub fn draw_mic_mute_toggle(ui: &mut egui::Ui, mixer: &crate::mixer::AudioMixer) {
+    let muted = mixer.is_mic_muted();
+    let mut toggle = false;
+
+    ui.horizontal(|ui| {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let painter = ui.painter_at(rect);
+        let rounding = egui::Rounding::same(4.0);
+        painter.rect_filled(
+            rect,
+            rounding,
+            if muted {
+                t::with_alpha(t::REC, 0.18)
+            } else {
+                t::with_alpha(egui::Color32::WHITE, 0.04)
+            },
+        );
+        painter.rect_stroke(
+            rect,
+            rounding,
+            egui::Stroke::new(
+                1.0_f32,
+                if muted {
+                    t::with_alpha(t::REC, 0.70)
+                } else {
+                    t::STROKE
+                },
+            ),
+        );
+
+        // Капсула микрофона со стойкой; при мьюте — перечёркнута.
+        let c = rect.center();
+        let ink = egui::Stroke::new(1.3_f32, if muted { t::REC } else { t::TEXT_MUTED });
+        painter.rect_stroke(
+            egui::Rect::from_center_size(c + egui::vec2(0.0, -1.5), egui::vec2(4.0, 6.0)),
+            egui::Rounding::same(2.0),
+            ink,
+        );
+        painter.line_segment(
+            [egui::pos2(c.x, c.y + 1.5), egui::pos2(c.x, c.y + 4.0)],
+            ink,
+        );
+        if muted {
+            painter.line_segment(
+                [egui::pos2(c.x - 5.0, c.y + 5.0), egui::pos2(c.x + 5.0, c.y - 5.0)],
+                egui::Stroke::new(1.4_f32, t::REC),
+            );
+        }
+
+        if resp.clicked() {
+            toggle = true;
+        }
+
+        ui.add_space(4.0);
+        let label = ui.add(
+            egui::Label::new(
+                egui::RichText::new("Микрофон")
+                    .size(10.0)
+                    .color(if muted { t::REC } else { t::TEXT_MUTED }),
+            )
+            .sense(egui::Sense::click()),
+        );
+        if label
+            .on_hover_text("Ctrl+M — мьют из любого приложения")
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            toggle = true;
+        }
+    });
+
+    if toggle {
+        mixer.set_mic_muted(!muted);
     }
 }

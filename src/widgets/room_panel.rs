@@ -50,6 +50,7 @@ pub fn draw_participants(
     is_host: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_transmitting: bool,
     nick: &str,
+    friends: &std::sync::Arc<crate::friends::FriendsManager>,
 ) {
     let now = now_ms();
     let peers = room.get_all_peers();
@@ -112,6 +113,10 @@ pub fn draw_participants(
     });
     ui.add_space(2.0);
 
+    // Имена друзей известны локально (friends.json) — показываем их вместо
+    // «Гость 3f2a». Ключ — NodeID участника, а не FNV-хеш `peer.id`.
+    let known_friends = friends.friends();
+
     for (idx, peer) in peers.into_iter().enumerate() {
         let alive = now.saturating_sub(peer.last_heartbeat) < 3000;
         let speaking = mixer.is_peer_speaking(peer.id);
@@ -129,7 +134,11 @@ pub fn draw_participants(
             ui.add_space(6.0);
             let id_str = peer.id.to_string();
             let short_id = &id_str[..4.min(id_str.len())];
-            let name = format!("Гость {}", short_id);
+            let name = known_friends
+                .iter()
+                .find(|f| f.node_id == peer.address)
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| format!("Гость {}", short_id));
             t::avatar(ui, &name, 32.0, speaking);
             ui.add_space(8.0);
 
@@ -355,7 +364,7 @@ pub fn draw_my_nodeid(ui: &mut egui::Ui, my_node_id: &str) -> bool {
     copied
 }
 
-fn join_room(
+pub(crate) fn join_room(
     connect_ip: &mut String,
     iroh: Option<Arc<IrohP2pManager>>,
     my_id: u64,

@@ -54,15 +54,20 @@ pub fn restart_audio_stream(
     Ok(())
 }
 
-/// Перезапускает аудиопоток воспроизведения
+/// Перезапускает аудиопоток воспроизведения.
+///
+/// Порядок как у входа: сначала собираем новый поток и только после успеха
+/// отпускаем старый. Раньше старый обнулялся до сборки, и ошибка (устройство
+/// занято, выдернуто, формат не принят) оставляла приложение совсем без звука
+/// до перезапуска. На время сборки старый поток ставится на паузу, чтобы два
+/// потока не растаскивали пакеты из одного приёмника.
 pub fn restart_playback_stream(
     playback_stream: &std::sync::Arc<std::sync::Mutex<Option<cpal::Stream>>>,
     rx: std::sync::Arc<std::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, u32, Vec<u8>)>>>,
     device_name: String,
     mixer: std::sync::Arc<crate::mixer::AudioMixer>,
-) {
-    let mut stream_lock = playback_stream.lock().unwrap();
-    *stream_lock = None; // Останавливаем старый поток
+) -> Result<(), String> {
+    use cpal::traits::StreamTrait;
 
     let host = cpal::default_host();
     let device = host.output_devices().ok().and_then(|mut devs| {
@@ -75,11 +80,31 @@ pub fn restart_playback_stream(
             device_name
         );
     }
+
+    // Замок держим на всё время сборки: иначе новый поток начнёт забирать
+    // пакеты из общего приёмника, пока старый ещё играет.
+    let mut stream_lock = match playback_stream.lock() {
+        Ok(l) => l,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(old) = stream_lock.as_ref() {
+        let _ = old.pause();
+    }
+
     match crate::audio::UniversalAudioCapture::create_playback_stream(device, rx, mixer) {
         Ok(new_stream) => {
             *stream_lock = Some(new_stream);
             println!("[GUI] Поток воспроизведения переключен на: {}", device_name);
+            Ok(())
         }
-        Err(e) => eprintln!("[ОШИБКА] Не удалось переключить динамики: {}", e),
+        Err(e) => {
+            // Новый не собрался — возвращаем к жизни прежний поток.
+            if let Some(old) = stream_lock.as_ref() {
+                let _ = old.play();
+            }
+            let msg = format!("динамики «{}» не открылись: {}", device_name, e);
+            eprintln!("[ОШИБКА] {}", msg);
+            Err(msg)
+        }
     }
 }

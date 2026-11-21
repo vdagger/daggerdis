@@ -63,6 +63,9 @@ pub struct RadioApp {
     /// чистит черновик, а не переносит его в чужую переписку.
     chat_target: Option<String>,
     chat_input: String,
+    /// Ошибка отправки в чат из фоновой задачи: `update` забирает её тостом.
+    /// Сообщение уже нарисовано в ленте, поэтому молчать об ошибке нельзя.
+    chat_error: Arc<std::sync::Mutex<Option<String>>>,
     /// Счётчики непрочитанного на прошлом кадре: рост = новое сообщение,
     /// о нём сообщаем тостом, потому что бейдж легко пропустить.
     seen_unread: std::collections::HashMap<String, usize>,
@@ -175,6 +178,7 @@ impl RadioApp {
             active_chat: None,
             chat_target: None,
             chat_input: String::new(),
+            chat_error: Arc::new(std::sync::Mutex::new(None)),
             seen_unread: std::collections::HashMap::new(),
             call_attention: false,
             my_node_id,
@@ -449,6 +453,18 @@ impl eframe::App for RadioApp {
             self.show_toast(&note);
         }
 
+        // Ctrl+M — глобальный мьют: флаг тот же, что у тумблера в подвале,
+        // поэтому состояние на экране не разъезжается с реальным.
+        if crate::keybind::take_mute_toggle() {
+            let muted = self.mixer.is_mic_muted();
+            self.mixer.set_mic_muted(!muted);
+            self.show_toast(if muted {
+                "Микрофон включён"
+            } else {
+                "Микрофон выключен"
+            });
+        }
+
         // Смена собеседника не должна притаскивать в поле ввода чужой черновик
         if self.active_chat != self.chat_target {
             self.chat_target = self.active_chat.clone();
@@ -466,6 +482,19 @@ impl eframe::App for RadioApp {
                 self.show_toast(&format!("Новое сообщение · {}", friend.name));
             }
             self.seen_unread.insert(friend.node_id.clone(), unread);
+        }
+
+        // Ошибка отправки в чат: сообщение уже в ленте, поэтому «тихо» здесь
+        // означает «человек уверен, что доставлено».
+        let chat_error = {
+            let mut slot = match self.chat_error.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            slot.take()
+        };
+        if let Some(text) = chat_error {
+            self.show_toast(&text);
         }
 
         // Входящий звонок: подсветить приложение в панели задач, если оно
@@ -614,12 +643,16 @@ impl eframe::App for RadioApp {
             .load(std::sync::atomic::Ordering::Relaxed);
         if current_output_index != prev_output_index {
             if let Some(device_name) = self.output_devices.get(current_output_index as usize).cloned() {
-                stream_control::restart_playback_stream(
+                // Ошибку показываем, а не только пишем в консоль: иначе
+                // «выбрал другие динамики» выглядит как «звук пропал».
+                if let Err(e) = stream_control::restart_playback_stream(
                     &self.playback_stream,
                     self.playback_rx.clone(),
                     device_name.clone(),
                     self.mixer.clone(),
-                );
+                ) {
+                    self.show_toast(&format!("Динамики не переключились: {e}"));
+                }
                 self.config.output_device = Some(device_name);
                 self.pending_save = true;
             }
@@ -889,6 +922,8 @@ impl RadioApp {
                             &self.ptt_flag,
                             &mut self.continuous_mode,
                         );
+                        ui.add_space(10.0);
+                        crate::widgets::ptt_button::draw_mic_mute_toggle(ui, &self.mixer);
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(
                                 egui::RichText::new(format!(
@@ -1259,6 +1294,7 @@ impl RadioApp {
                                 self.is_host.clone(),
                                 self.ptt_flag.load(std::sync::atomic::Ordering::Relaxed),
                                 &self.nick,
+                                &self.friends,
                             );
                         });
                         rail_divider(ui);
@@ -1279,6 +1315,8 @@ impl RadioApp {
                                 &self.calls,
                                 &self.presence,
                                 &mut offline_toast,
+                                &self.room,
+                                &self.is_host,
                             );
                         });
                         if let Some(text) = offline_toast {
@@ -1633,6 +1671,8 @@ impl RadioApp {
                             self.iroh.clone(),
                             self.my_id,
                             &mut close,
+                            &self.chat_error,
+                            &self.presence,
                         );
                     });
             });
@@ -2028,6 +2068,27 @@ impl RadioApp {
                                     self.video_fullscreen,
                                 ));
                             }
+                        } else {
+                            // Чёрное окно без объяснения — худший вариант: ошибку
+                            // декодера/подписки показываем прямо здесь.
+                            let error = self
+                                .remote
+                                .as_ref()
+                                .and_then(|r| r.last_error().cloned())
+                                .or_else(|| {
+                                    self.video.as_ref().and_then(|v| v.last_error().cloned())
+                                })
+                                .or_else(|| self.video_error.clone());
+                            let text = error
+                                .map(|e| format!("Видео недоступно: {e}"))
+                                .unwrap_or_else(|| "Ожидание кадра…".to_string());
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new(text)
+                                        .size(11.0)
+                                        .color(t::TEXT_MUTED),
+                                );
+                            });
                         }
                     });
 

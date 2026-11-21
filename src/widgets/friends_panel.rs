@@ -1,4 +1,4 @@
-﻿//! Список друзей, входящие заявки и добавление нового друга
+//! Список друзей, входящие заявки и добавление нового друга
 
 use crate::chat::ChatLog;
 use crate::friends::FriendsManager;
@@ -81,6 +81,8 @@ pub fn draw_friends_panel(
     calls: &Arc<crate::calls::CallManager>,
     presence: &Arc<crate::presence::PresenceTracker>,
     offline_toast: &mut Option<String>,
+    room: &Arc<crate::room::RoomManager>,
+    is_host: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     let row_width = ui.available_width();
     let p2p = iroh;
@@ -173,6 +175,7 @@ pub fn draw_friends_panel(
     }
 
     // Список друзей — плоские строки с волосяными линиями, как в макете
+    let room_peers = room.get_all_peers();
     for (idx, friend) in friend_list.iter().enumerate() {
         if idx > 0 {
             ui.add_space(2.0);
@@ -184,6 +187,9 @@ pub fn draw_friends_panel(
         }
 
         let online = presence.is_online(&friend.node_id);
+        // Друг уже в комнате: это видно по адресу участника (NodeID), и это
+        // единственный способ позвать его без вставки NodeID руками.
+        let in_room = room_peers.iter().any(|p| p.address == friend.node_id);
         ui.horizontal(|ui| {
             t::avatar(ui, &friend.name, 32.0, false);
             ui.add_space(8.0);
@@ -195,6 +201,14 @@ pub fn draw_friends_panel(
                             .strong()
                             .color(t::TEXT),
                     );
+                    if in_room {
+                        ui.label(
+                            egui::RichText::new("В ЭФИРЕ")
+                                .size(7.5)
+                                .strong()
+                                .color(t::LIVE),
+                        );
+                    }
                     let unread = chat_log.unread(&friend.node_id);
                     if unread > 0 {
                         ui.label(
@@ -236,6 +250,22 @@ pub fn draw_friends_panel(
                     egui::popup::PopupCloseBehavior::CloseOnClick,
                     |ui| {
                         ui.set_min_width(130.0);
+                        // «Войти в комнату» — иначе к другу можно попасть
+                        // только вставкой его 64-символьного NodeID в рейл.
+                        if ui
+                            .button(egui::RichText::new("Войти в комнату").size(10.5))
+                            .clicked()
+                        {
+                            let mut target = friend.node_id.clone();
+                            crate::widgets::room_panel::join_room(
+                                &mut target,
+                                p2p.clone(),
+                                my_id,
+                                is_host.clone(),
+                                room.clone(),
+                                calls,
+                            );
+                        }
                         if ui
                             .button(egui::RichText::new("Удалить из друзей").size(10.5))
                             .clicked()
