@@ -18,8 +18,19 @@
 
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('start', 'stop', 'shot', 'click', 'keys', 'focus', 'resize', 'info')]
+    [ValidateSet('start', 'stop', 'shot', 'click', 'keys', 'focus', 'resize', 'info', 'windows')]
     [string]$Action,
+
+    # Какому экземпляру адресовано действие. 0 — первый найденный (одиночный
+    # прогон). При нескольких узлах (group.ps1) без этого нельзя: Get-Process
+    # возвращает окна в произвольном порядке.
+    [int]$TargetPid = 0,
+
+    # Выбор окна по заголовку внутри экземпляра: у Albus это 'Albus Audio'
+    # (главное) и 'Albus — трансляция' (окно показа). MainWindowHandle после
+    # открытия видео указывает уже на окно трансляции, и без фильтра клик
+    # уходит не туда.
+    [string]$WindowTitle = '',
 
     [int]$X = 40,
     [int]$Y = 40,
@@ -29,6 +40,11 @@ param(
     [string]$Combo = '',
     [string]$Out = '',
     [switch]$Double,
+    # -Client: X,Y — координаты внутри клиентской области окна (0,0 — левый
+    # верхний угол содержимого), а не по экрану. Окно может уехать (eframe
+    # пересоздаёт/сдвигает его), а раскладка внутри не зависит от позиции —
+    # такие клики не промахиваются после resize.
+    [switch]$Client,
     [switch]$NoKill,
     [switch]$Visible
 )
@@ -50,6 +66,9 @@ using System.Runtime.InteropServices;
 public static class AlbusWin {
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X, Y; }
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
@@ -57,45 +76,124 @@ public static class AlbusWin {
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, UIntPtr extra);
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint attachFrom, uint attachTo, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+
+    // Перечисление окон процесса. Get-Process.MainWindowHandle отдаёт ровно
+    // одно окно, а у Albus их два: главное ('Albus Audio') и окно показа
+    // ('Albus — трансляция'). Без списка нельзя адресовать нужное.
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int n);
+
+    public static IntPtr[] WindowsOf(uint pid) {
+        var list = new System.Collections.Generic.List<IntPtr>();
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            if (!IsWindowVisible(h)) return true;
+            uint p;
+            GetWindowThreadProcessId(h, out p);
+            if (p != pid) return true;
+            var sb = new System.Text.StringBuilder(512);
+            GetWindowTextW(h, sb, 512);
+            if (sb.Length == 0) return true;
+            list.Add(h);
+            return true;
+        }, IntPtr.Zero);
+        return list.ToArray();
+    }
+
+    public static string TitleOf(IntPtr h) {
+        var sb = new System.Text.StringBuilder(512);
+        GetWindowTextW(h, sb, 512);
+        return sb.ToString();
+    }
+
+    // Активация чужого окна. Одного SetForegroundWindow мало: Windows отдаёт
+    // фокус только «своему» процессу (foreground lock), а при нескольких
+    // экземплярах Albus клик уходил не туда — окно получало его, но оставалось
+    // неактивным, и egui событие мыши не применял.
+    // Порядок: Alt (отдаёт нам право на смену фокуса) → TOPMOST → BringWindowToTop
+    // → SetForegroundWindow → проверка; если фокус всё ещё чужой —
+    // AttachThreadInput к потоку текущего фокуса и повтор.
+    public static bool Activate(IntPtr h) {
+        ShowWindow(h, 9);                                     // SW_RESTORE
+        keybd_event(0x12, 0, 0, UIntPtr.Zero);                // Alt down
+        keybd_event(0x12, 0, 2, UIntPtr.Zero);                // Alt up
+        System.Threading.Thread.Sleep(40);
+        SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002);  // HWND_TOPMOST
+        BringWindowToTop(h);
+        SetForegroundWindow(h);
+        bool ok = GetForegroundWindow() == h;
+        if (!ok) {
+            uint pid;
+            IntPtr fg = GetForegroundWindow();
+            uint fgThread = GetWindowThreadProcessId(fg, out pid);
+            uint myThread = GetCurrentThreadId();
+            if (AttachThreadInput(myThread, fgThread, true)) {
+                SetForegroundWindow(h);
+                BringWindowToTop(h);
+                AttachThreadInput(myThread, fgThread, false);
+                ok = GetForegroundWindow() == h;
+            }
+        }
+        SetWindowPos(h, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002);  // HWND_NOTOPMOST
+        return ok;
+    }
 }
 "@
 }
 
+function Get-AlbusWindows {
+    foreach ($pr in @(Get-Process albus -ErrorAction SilentlyContinue)) {
+        foreach ($h in [AlbusWin]::WindowsOf([uint32]$pr.Id)) {
+            [pscustomobject]@{ Hwnd = $h; Pid = $pr.Id; Title = [AlbusWin]::TitleOf($h) }
+        }
+    }
+}
+
 function Get-AlbusWindow {
-    Get-Process albus -ErrorAction SilentlyContinue |
-        Where-Object { $_.MainWindowHandle -ne 0 } |
-        Select-Object -First 1
+    $all = @(Get-AlbusWindows)
+    if ($TargetPid -ne 0) {
+        $all = @($all | Where-Object { $_.Pid -eq $TargetPid })
+        if (-not $all) { throw "Экземпляр с pid=$TargetPid не найден (окон Albus: всего $(@(Get-AlbusWindows).Count))" }
+    }
+    if ($WindowTitle) {
+        $hit = @($all | Where-Object { $_.Title -like "*$WindowTitle*" })
+        if ($hit) { return $hit | Select-Object -First 1 }
+        throw "Окно с заголовком '$WindowTitle' не найдено у pid=$TargetPid (есть: $($all.Title -join ', '))"
+    }
+    # По умолчанию — главное окно, а не окно трансляции.
+    $main = @($all | Where-Object { $_.Title -notlike '*трансляция*' })
+    if ($main) { return $main | Select-Object -First 1 }
+    return $all | Select-Object -First 1
 }
 
 function Restore-AlbusWindow {
     $p = Get-AlbusWindow
     if (-not $p) { throw 'Окно Albus не найдено — сначала -Action start' }
-    [AlbusWin]::ShowWindow($p.MainWindowHandle, 9) | Out-Null   # SW_RESTORE
-    # Windows не отдаёт foreground чужому процессу (foreground lock), поэтому
-    # на миг поднимаем окно в TOPMOST: этого хватает, чтобы клик/скриншот
-    # попали в Albus, а не в окно поверх него.
-    [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040) | Out-Null
-    [AlbusWin]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
-    Start-Sleep -Milliseconds 120
-    [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-2), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null
-    Start-Sleep -Milliseconds 60
+    $script:LastFocused = [AlbusWin]::Activate($p.Hwnd)
+    Start-Sleep -Milliseconds 150
     return $p
 }
 
 function Test-AlbusShot {
     $p = Get-AlbusWindow
     if (-not $p) { throw 'Окно Albus не найдено — сначала -Action start' }
-    [AlbusWin]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
+    [void][AlbusWin]::Activate($p.Hwnd)
     # Оставляем TOPMOST на время съёмки и снимаем после неё: иначе окно DSH
     # успевает вернуться наверх между подъёмом и захватом экрана.
-    [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040) | Out-Null
+    [AlbusWin]::SetWindowPos($p.Hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040) | Out-Null
     Start-Sleep -Milliseconds 150
     return $p
 }
 
 function Undo-AlbusShot($p) {
     if ($p) {
-        [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-2), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null
+        [AlbusWin]::SetWindowPos($p.Hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null
     }
 }
 
@@ -145,10 +243,11 @@ switch ($Action) {
             -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
             -WindowStyle $styles -PassThru
         $deadline = [DateTime]::Now.AddSeconds(25)
+        $TargetPid = $p.Id     # дальше ищем окно именно этого процесса
         $win = $null
         while ([DateTime]::Now -lt $deadline) {
             Start-Sleep -Milliseconds 250
-            $win = Get-AlbusWindow
+            try { $win = Get-AlbusWindow } catch { $win = $null }
             if ($win) { break }
             if ($p.HasExited) { break }
         }
@@ -158,18 +257,18 @@ switch ($Action) {
             # повтором, а не одним вызовом.
             $want = $false
             for ($i = 0; $i -lt 12; $i++) {
-                [AlbusWin]::SetWindowPos($win.MainWindowHandle, [IntPtr]::Zero, $X, $Y, $Width, $Height, 0x0040) | Out-Null
+                [AlbusWin]::SetWindowPos($win.Hwnd, [IntPtr]::Zero, $X, $Y, $Width, $Height, 0x0040) | Out-Null
                 Start-Sleep -Milliseconds 120
                 $r = New-Object AlbusWin+RECT
-                [AlbusWin]::GetWindowRect($win.MainWindowHandle, [ref]$r) | Out-Null
+                [AlbusWin]::GetWindowRect($win.Hwnd, [ref]$r) | Out-Null
                 if ($r.Left -eq $X -and $r.Top -eq $Y -and ($r.Right - $r.Left) -eq $Width -and ($r.Bottom - $r.Top) -eq $Height) {
                     $want = $true
                     break
                 }
             }
-            [AlbusWin]::SetForegroundWindow($win.MainWindowHandle) | Out-Null
+            [AlbusWin]::SetForegroundWindow($win.Hwnd) | Out-Null
             Start-Sleep -Milliseconds 200
-            "started pid=$($win.Id) window='$($win.MainWindowTitle)' ready_ms=$($sw.ElapsedMilliseconds) placed=$want"
+            "started pid=$($win.Pid) window='$($win.Title)' ready_ms=$($sw.ElapsedMilliseconds) placed=$want"
         } else {
             "started pid=$($p.Id) но окно не появилось за 25 с; хвост лога:"
             if (Test-Path $outLog) { Get-Content $outLog -Tail 15 }
@@ -184,12 +283,12 @@ switch ($Action) {
     }
     'focus' {
         $w = Restore-AlbusWindow
-        "focused pid=$($w.Id)"
+        "focused pid=$($w.Pid) hwnd=$($w.Hwnd) title='$($w.Title)'"
     }
     'resize' {
         $w = Restore-AlbusWindow
-        [AlbusWin]::SetWindowPos($w.MainWindowHandle, [IntPtr]::Zero, $X, $Y, $Width, $Height, 0x0040) | Out-Null
-        "resized pid=$($w.Id) -> $X,$Y ${Width}x${Height}"
+        [AlbusWin]::SetWindowPos($w.Hwnd, [IntPtr]::Zero, $X, $Y, $Width, $Height, 0x0040) | Out-Null
+        "resized pid=$($w.Pid) -> $X,$Y ${Width}x${Height}"
     }
     'shot' {
         $w = Test-AlbusShot
@@ -197,13 +296,26 @@ switch ($Action) {
         $path = Join-Path $Out ("shot-{0:HHmmss}.png" -f (Get-Date))
         Save-Shot $path
         $r = New-Object AlbusWin+RECT
-        [AlbusWin]::GetWindowRect($w.MainWindowHandle, [ref]$r) | Out-Null
+        [AlbusWin]::GetWindowRect($w.Hwnd, [ref]$r) | Out-Null
         Undo-AlbusShot $w
-        "shot=$path window=$($r.Left),$($r.Top),$($r.Right),$($r.Bottom) pid=$($w.Id)"
+        "shot=$path window=$($r.Left),$($r.Top),$($r.Right),$($r.Bottom) pid=$($w.Pid) title='$($w.Title)'"
     }
     'click' {
-        Restore-AlbusWindow | Out-Null
-        [AlbusWin]::SetCursorPos($X, $Y) | Out-Null
+        $w = Restore-AlbusWindow
+        # Свежий handle после активации: eframe может пересоздать окно, и
+        # старый hwnd тогда указывает в никуда.
+        $w = Get-AlbusWindow
+        $r = New-Object AlbusWin+RECT
+        [AlbusWin]::GetWindowRect($w.Hwnd, [ref]$r) | Out-Null
+        $sx = $X; $sy = $Y
+        if ($Client) {
+            # Точка отсчёта — левый верхний угол клиентской области (без рамки
+            # и заголовка), а не окна: раскладка egui считается от неё.
+            $origin = New-Object AlbusWin+POINT
+            [AlbusWin]::ClientToScreen($w.Hwnd, [ref]$origin) | Out-Null
+            $sx = $origin.X + $X; $sy = $origin.Y + $Y
+        }
+        [AlbusWin]::SetCursorPos($sx, $sy) | Out-Null
         Start-Sleep -Milliseconds 80
         [AlbusWin]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)   # LEFTDOWN
         Start-Sleep -Milliseconds 60
@@ -214,7 +326,7 @@ switch ($Action) {
             Start-Sleep -Milliseconds 60
             [AlbusWin]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
         }
-        "clicked $X,$Y double=$Double"
+        "clicked screen=$sx,$sy client=$($Client.IsPresent) focused=$($script:LastFocused) rect=$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)"
     }
     'keys' {
         Restore-AlbusWindow | Out-Null
@@ -229,11 +341,18 @@ switch ($Action) {
             "typed=$($Text.Length) chars"
         }
     }
+    'windows' {
+        foreach ($w in Get-AlbusWindows) {
+            $r = New-Object AlbusWin+RECT
+            [AlbusWin]::GetWindowRect($w.Hwnd, [ref]$r) | Out-Null
+            "pid=$($w.Pid) hwnd=$($w.Hwnd) title='$($w.Title)' rect=$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)"
+        }
+    }
     'info' {
         $w = Get-AlbusWindow
         if (-not $w) { 'albus не запущен'; exit 1 }
         $r = New-Object AlbusWin+RECT
-        [AlbusWin]::GetWindowRect($w.MainWindowHandle, [ref]$r) | Out-Null
-        "pid=$($w.Id) title='$($w.MainWindowTitle)' rect=$($r.Left),$($r.Top),$($r.Right),$($r.Bottom) responding=$($w.Responding)"
+        [AlbusWin]::GetWindowRect($w.Hwnd, [ref]$r) | Out-Null
+        "pid=$($w.Pid) title='$($w.Title)' rect=$($r.Left),$($r.Top),$($r.Right),$($r.Bottom)"
     }
 }
