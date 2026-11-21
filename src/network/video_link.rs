@@ -2163,6 +2163,89 @@ mod tests {
     }
 
     #[test]
+    fn queue_releases_frames_only_after_the_buffer() {
+        let mut queue = RemoteQueue::new();
+        let now = Instant::now();
+        assert!(queue.push(frame("n", true, 1, now), Duration::from_secs(2)));
+        assert!(queue.push(frame("n", false, 2, now), Duration::from_secs(2)));
+        // Буфер ещё не истёк — показывать нечего.
+        assert!(queue.pop_due(Duration::from_secs(2), now).is_none());
+        assert!(queue.pop_due(Duration::from_secs(2), now + Duration::from_millis(1900)).is_none());
+        // Истёк — кадры идут в порядке прихода.
+        let first = queue
+            .pop_due(Duration::from_secs(2), now + Duration::from_millis(2100))
+            .expect("первый кадр должен быть готов");
+        assert_eq!(first.unit.pts_100ns, 1);
+        let second = queue
+            .pop_due(Duration::from_secs(2), now + Duration::from_millis(2100))
+            .expect("второй кадр должен быть готов");
+        assert_eq!(second.unit.pts_100ns, 2);
+        assert!(queue.pop_due(Duration::from_secs(2), now + Duration::from_millis(2100)).is_none());
+    }
+
+    #[test]
+    fn queue_waits_for_keyframe_after_reset() {
+        let mut queue = RemoteQueue::new();
+        let now = Instant::now();
+        assert!(queue.push(frame("n", true, 1, now), Duration::ZERO));
+        assert!(queue.push(frame("n", false, 2, now), Duration::ZERO));
+        // Поток прервался: всё от этого узла выбрасываем и ждём IDR.
+        queue.reset_from("n");
+        assert_eq!(queue.frames.len(), 0);
+        assert!(!queue.push(frame("n", false, 3, now), Duration::ZERO), "P-кадр без опоры не нужен");
+        assert!(queue.push(frame("n", true, 4, now), Duration::ZERO), "ключевой принимаем");
+        assert_eq!(queue.frames.len(), 1);
+    }
+
+    #[test]
+    fn queue_overflow_drops_and_waits_for_keyframe() {
+        let mut queue = RemoteQueue::new();
+        let now = Instant::now();
+        let buffer = Duration::from_secs(2);
+        // При 60 fps и буфере 2 с предел очереди — 270 кадров.
+        let mut accepted = 0;
+        for i in 0..270 {
+            if queue.push(frame("n", i == 0, i as i64, now), buffer) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 270);
+        // Следующий кадр переполняет очередь: она чистится, и P-кадр
+        // выбрасывается — показывать его не с чем.
+        assert!(!queue.push(frame("n", false, 1000, now), buffer));
+        assert_eq!(queue.frames.len(), 0);
+        // Ключевой после сброса снова принимается.
+        assert!(queue.push(frame("n", true, 1001, now), buffer));
+    }
+
+    #[test]
+    fn ring_handoff_starts_from_last_keyframe() {
+        let info = info();
+        let mut recent = Recent::new();
+        let key1 = recent.push(true, encode_frame(&unit(true, 1, 4), &info));
+        let _p2 = recent.push(false, encode_frame(&unit(false, 2, 4), &info));
+        // Второй IDR: хвост должен начинаться с него, а не с первого.
+        let key2 = recent.push(true, encode_frame(&unit(true, 3, 4), &info));
+        let p4 = recent.push(false, encode_frame(&unit(false, 4, 4), &info));
+        let (tail, last) = recent.handoff();
+        let seqs: Vec<u32> = tail.iter().map(|f| f.seq).collect();
+        assert_eq!(seqs, vec![key2.seq, p4.seq], "хвост — от последнего IDR");
+        assert_eq!(last, p4.seq);
+        assert_ne!(key1.seq, key2.seq);
+    }
+
+    #[test]
+    fn ring_without_keyframe_hands_off_empty_tail() {
+        let info = info();
+        let mut recent = Recent::new();
+        recent.push(false, encode_frame(&unit(false, 1, 4), &info));
+        recent.push(false, encode_frame(&unit(false, 2, 4), &info));
+        let (tail, last) = recent.handoff();
+        assert!(tail.is_empty(), "P-кадры без IDR новому зрителю не отдаём");
+        assert_eq!(last, recent.next_seq);
+    }
+
+    #[test]
     fn frame_roundtrip_keeps_wire_format() {
         let unit = unit(true, 42, 9);
         let info = info();
