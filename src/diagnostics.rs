@@ -21,6 +21,11 @@ pub struct RxStats {
     fec: AtomicU64,
     restarts: AtomicU64,
     drops: AtomicU64,
+    /// Кадры, которых не было вовсе: дырка в `seq` больше, чем стоит
+    /// восстанавливать FEC/PLC (или очередь переупорядочивания переполнилась).
+    lost: AtomicU64,
+    /// Кадры, дошедшие до декодера: вместе с `lost` даёт процент потерь.
+    delivered: AtomicU64,
 }
 
 /// Значения счётчиков приёма на один момент.
@@ -32,6 +37,8 @@ pub struct RxSnapshot {
     pub fec: u64,
     pub restarts: u64,
     pub drops: u64,
+    pub lost: u64,
+    pub delivered: u64,
 }
 
 impl RxSnapshot {
@@ -48,6 +55,8 @@ impl RxSnapshot {
             fec: later.fec.saturating_sub(self.fec),
             restarts: later.restarts.saturating_sub(self.restarts),
             drops: later.drops.saturating_sub(self.drops),
+            lost: later.lost.saturating_sub(self.lost),
+            delivered: later.delivered.saturating_sub(self.delivered),
         }
     }
 }
@@ -73,6 +82,16 @@ impl RxStats {
         self.drops.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Пропущено `n` кадров подряд: восстанавливать их нечем.
+    pub fn lost(&self, n: u64) {
+        self.lost.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Кадр дошёл до декодера.
+    pub fn delivered(&self) {
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> RxSnapshot {
         RxSnapshot {
             underruns: self.underruns.load(Ordering::Relaxed),
@@ -80,8 +99,40 @@ impl RxStats {
             fec: self.fec.load(Ordering::Relaxed),
             restarts: self.restarts.load(Ordering::Relaxed),
             drops: self.drops.load(Ordering::Relaxed),
+            lost: self.lost.load(Ordering::Relaxed),
+            delivered: self.delivered.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Процент потерянных кадров голоса от всех ожидаемых.
+///
+/// `lost` — кадры, которых не было вовсе (дырка в `seq` больше, чем стоит
+/// восстанавливать), `delivered` — дошедшие до декодера. Маскированные кадры
+/// (FEC/PLC) не считаются потерянными: звук на их месте есть.
+pub fn voice_loss_percent(delivered: u64, lost: u64) -> u32 {
+    let total = delivered.saturating_add(lost);
+    if total == 0 {
+        return 0;
+    }
+    ((lost as u128 * 100 + total as u128 / 2) / total as u128) as u32
+}
+
+/// Одна строка про приём голоса — её показывают и панель, и отчёт, чтобы
+/// числа на экране и в скопированном тексте не расходились.
+pub fn rx_line(rx: &RxSnapshot) -> String {
+    let total = rx.delivered.saturating_add(rx.lost);
+    format!(
+        "провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {} · потеряно {} из {} ({} %)",
+        rx.underruns,
+        rx.concealed,
+        rx.fec,
+        rx.restarts,
+        rx.drops,
+        rx.lost,
+        total,
+        voice_loss_percent(rx.delivered, rx.lost)
+    )
 }
 
 /// Общая точка диагностики: создаётся в `main` и раздаётся тем, кто пишет
@@ -272,22 +323,11 @@ pub fn render(input: &ReportInput) -> String {
         input.mic_level,
         if input.mic_muted { "да" } else { "нет" }
     ));
+    out.push_str(&format!("Приём голоса (всего): {}\n", rx_line(&input.rx_total)));
     out.push_str(&format!(
-        "Приём голоса (всего): провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}\n",
-        input.rx_total.underruns,
-        input.rx_total.concealed,
-        input.rx_total.fec,
-        input.rx_total.restarts,
-        input.rx_total.drops
-    ));
-    out.push_str(&format!(
-        "Приём голоса (за {:.0} с): провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}\n",
+        "Приём голоса (за {:.0} с): {}\n",
         input.rx_window_secs,
-        input.rx_window.underruns,
-        input.rx_window.concealed,
-        input.rx_window.fec,
-        input.rx_window.restarts,
-        input.rx_window.drops
+        rx_line(&input.rx_window)
     ));
 
     match &input.own_video {
@@ -361,6 +401,8 @@ mod tests {
             fec: 1,
             restarts: 0,
             drops: 3,
+            lost: 0,
+            delivered: 0,
         };
         let later = RxSnapshot {
             underruns: 4,
@@ -368,6 +410,8 @@ mod tests {
             fec: 3,
             restarts: 1,
             drops: 3,
+            lost: 0,
+            delivered: 0,
         };
         let d = before.delta(&later);
         assert_eq!(d.underruns, 3);
@@ -384,6 +428,8 @@ mod tests {
             fec: 0,
             restarts: 3,
             drops: 4,
+            lost: 0,
+            delivered: 0,
         };
         assert_eq!(s.events(), 10);
         assert_eq!(RxSnapshot::default().events(), 0);
@@ -396,6 +442,32 @@ mod tests {
         assert_eq!(loss_percent(100, 2), 2);
         assert_eq!(loss_percent(1000, 12), 1, "округление вниз до целых");
         assert_eq!(loss_percent(50, 80), 100, "потерь больше, чем отправлено");
+    }
+
+    #[test]
+    fn voice_loss_percent_rounds_to_nearest() {
+        assert_eq!(voice_loss_percent(0, 0), 0, "приёма ещё не было");
+        assert_eq!(voice_loss_percent(1000, 0), 0);
+        assert_eq!(voice_loss_percent(999, 1), 0, "0.1 % — это ноль процентов");
+        assert_eq!(voice_loss_percent(900, 100), 10);
+        assert_eq!(voice_loss_percent(0, 5), 100, "всё потеряно");
+        assert_eq!(voice_loss_percent(3, 1), 25);
+    }
+
+    #[test]
+    fn rx_line_shows_lost_frames_and_percent() {
+        let rx = RxSnapshot {
+            underruns: 1,
+            concealed: 2,
+            fec: 1,
+            restarts: 0,
+            drops: 0,
+            lost: 50,
+            delivered: 950,
+        };
+        let line = rx_line(&rx);
+        assert!(line.contains("потеряно 50 из 1000 (5 %)"), "строка: {line}");
+        assert!(line.contains("маскировано 2 (FEC 1)"));
     }
 
     #[test]
@@ -421,6 +493,8 @@ mod tests {
                 fec: 7,
                 restarts: 1,
                 drops: 0,
+                lost: 4,
+                delivered: 996,
             },
             rx_window: RxSnapshot {
                 concealed: 2,

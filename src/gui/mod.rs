@@ -783,11 +783,16 @@ fn diag_row(ui: &mut egui::Ui, label: &str, value: &str) {
                     .color(t::TEXT_MUTED),
             ),
         );
-        ui.label(
-            egui::RichText::new(value)
-                .size(10.5)
-                .monospace()
-                .color(t::TEXT),
+        // Длинные строки (счётчики приёма) переносим, а не обрезаем краем
+        // панели: обрезанное «потеряно 0 из …» читается как ошибка.
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(value)
+                    .size(10.5)
+                    .monospace()
+                    .color(t::TEXT),
+            )
+            .wrap(),
         );
     });
 }
@@ -872,18 +877,16 @@ fn draw_diagnostics_body(ui: &mut egui::Ui, input: &crate::diagnostics::ReportIn
     diag_row(
         ui,
         "Приём, всего",
-        &format!(
-            "провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}",
-            all.underruns, all.concealed, all.fec, all.restarts, all.drops
-        ),
+        &crate::diagnostics::rx_line(all),
     );
     let win = &input.rx_window;
     diag_row(
         ui,
         "Приём, окно",
         &format!(
-            "за {:.0} с: провалов {} · маскировано {} (FEC {}) · перезапусков {} · выброшено {}",
-            input.rx_window_secs, win.underruns, win.concealed, win.fec, win.restarts, win.drops
+            "за {:.0} с: {}",
+            input.rx_window_secs,
+            crate::diagnostics::rx_line(win)
         ),
     );
 

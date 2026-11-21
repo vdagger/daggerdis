@@ -527,6 +527,18 @@ impl UniversalAudioCapture {
                         if !peer.queue.contains_key(&peer.next) && peer.queue.len() >= 3 {
                             if let Some(&lowest) = peer.queue.keys().next() {
                                 let missing = lowest.wrapping_sub(peer.next) as usize;
+                                // Сколько дырок реально закрыто: FEC/PLC умеют
+                                // до трёх кадров и только когда есть чем
+                                // продолжать. Остальное — потерянные кадры,
+                                // и их видно в отчёте процентом.
+                                let recoverable = if !peer.last_pcm.is_empty() {
+                                    missing.min(3)
+                                } else {
+                                    0
+                                };
+                                if missing > recoverable {
+                                    diag.rx.lost((missing - recoverable) as u64);
+                                }
                                 if missing <= 3 && !peer.last_pcm.is_empty() {
                                     for r in 0..missing {
                                         let mut restored = [0.0f32; 960];
@@ -592,6 +604,7 @@ impl UniversalAudioCapture {
                             else {
                                 continue;
                             };
+                            diag.rx.delivered();
                             mixer.process_output(sender_id, &mut mono_decoded[..len]);
 
                             // Если звуковая карта работает не на 48 кГц (например 44.1 или 96 кГц),
