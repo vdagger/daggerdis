@@ -71,9 +71,32 @@ function Restore-AlbusWindow {
     $p = Get-AlbusWindow
     if (-not $p) { throw 'Окно Albus не найдено — сначала -Action start' }
     [AlbusWin]::ShowWindow($p.MainWindowHandle, 9) | Out-Null   # SW_RESTORE
+    # Windows не отдаёт foreground чужому процессу (foreground lock), поэтому
+    # на миг поднимаем окно в TOPMOST: этого хватает, чтобы клик/скриншот
+    # попали в Albus, а не в окно поверх него.
+    [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040) | Out-Null
     [AlbusWin]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
     Start-Sleep -Milliseconds 120
+    [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-2), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null
+    Start-Sleep -Milliseconds 60
     return $p
+}
+
+function Test-AlbusShot {
+    $p = Get-AlbusWindow
+    if (-not $p) { throw 'Окно Albus не найдено — сначала -Action start' }
+    [AlbusWin]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
+    # Оставляем TOPMOST на время съёмки и снимаем после неё: иначе окно DSH
+    # успевает вернуться наверх между подъёмом и захватом экрана.
+    [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040) | Out-Null
+    Start-Sleep -Milliseconds 150
+    return $p
+}
+
+function Undo-AlbusShot($p) {
+    if ($p) {
+        [AlbusWin]::SetWindowPos($p.MainWindowHandle, [IntPtr](-2), 0, 0, 0, 0, 0x0001 -bor 0x0002) | Out-Null
+    }
 }
 
 function Send-Combo([string]$spec) {
@@ -169,12 +192,13 @@ switch ($Action) {
         "resized pid=$($w.Id) -> $X,$Y ${Width}x${Height}"
     }
     'shot' {
-        $w = Restore-AlbusWindow
-        Start-Sleep -Milliseconds 250
+        $w = Test-AlbusShot
+        Start-Sleep -Milliseconds 200
         $path = Join-Path $Out ("shot-{0:HHmmss}.png" -f (Get-Date))
         Save-Shot $path
         $r = New-Object AlbusWin+RECT
         [AlbusWin]::GetWindowRect($w.MainWindowHandle, [ref]$r) | Out-Null
+        Undo-AlbusShot $w
         "shot=$path window=$($r.Left),$($r.Top),$($r.Right),$($r.Bottom) pid=$($w.Id)"
     }
     'click' {
