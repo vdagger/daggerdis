@@ -540,6 +540,68 @@ impl RadioApp {
         self.diag_window = self.diag_prev.0.delta(&current);
         self.diag_window_secs = elapsed.as_secs_f32();
         self.diag_prev = (current, Instant::now());
+        self.tune_voice();
+    }
+
+    /// Подстраивает передачу голоса под сеть раз в секунду.
+    ///
+    /// Два числа, которые видит только транспорт: доля потерянных пакетов на
+    /// наших путях и оценка полосы. По ним Opus получает ожидаемые потери
+    /// (чем больше, тем плотнее защита — in-band FEC и т.п.), а если полосы
+    /// явно не хватает на всех собеседников, потолок битрейта опускается на
+    /// ступень. Настройку пользователя не трогаем: она остаётся верхней
+    /// границей, адаптация живёт отдельным потолком и снимается, когда сеть
+    /// наладилась.
+    fn tune_voice(&mut self) {
+        let Some(p2p) = self.iroh.clone() else {
+            return;
+        };
+        let links = p2p.link_stats();
+        if links.is_empty() {
+            return;
+        }
+        let mut sent = 0u64;
+        let mut lost = 0u64;
+        let mut min_bw = u64::MAX;
+        for link in &links {
+            sent += link.sent_packets;
+            lost += link.lost_packets;
+            if let Some(bps) = link.bandwidth_bps {
+                min_bw = min_bw.min(bps);
+            }
+        }
+
+        let pct = crate::diagnostics::loss_percent(sent, lost).min(30) as i64;
+        let current = self.mixer.packet_loss_perc() as i64;
+        // Сглаживание: один процент туда-обратно — шум измерения, а не сигнал.
+        if (pct - current).abs() >= 4 {
+            self.mixer.set_packet_loss_perc(pct as u32);
+            eprintln!(
+                "[АУДИО] Потери на путях {}% → защита Opus {}%",
+                pct,
+                self.mixer.packet_loss_perc()
+            );
+        }
+
+        let needed = self.mixer.opus_bitrate() as u64 * links.len().max(1) as u64;
+        let cap = if min_bw != u64::MAX && min_bw < needed * 13 / 10 {
+            crate::mixer::next_voice_bitrate_below(self.mixer.opus_bitrate())
+                .unwrap_or(self.mixer.opus_bitrate())
+        } else {
+            u32::MAX
+        };
+        if cap != self.mixer.voice_bitrate_cap() {
+            self.mixer.set_voice_bitrate_cap(cap);
+            if cap == u32::MAX {
+                println!("[АУДИО] Полосы хватает — битрейт передачи вернулся к настройке");
+            } else {
+                println!(
+                    "[АУДИО] Полосы мало на {} путей → битрейт передачи {} кбит/с",
+                    links.len(),
+                    cap / 1000
+                );
+            }
+        }
     }
 
     /// Всё, что попадает в отчёт и в панель: собирается в одном месте, чтобы
@@ -2104,6 +2166,7 @@ impl RadioApp {
             && matches!(view, crate::calls::CallView::Incoming { .. })
             && ctx.input(|i| i.key_pressed(egui::Key::Enter))
         {
+            println!("[КОМНАТА] ENTER — входим по приглашению");
             accept = true;
         }
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -2962,6 +3025,8 @@ fn mixer_row(ui: &mut egui::Ui, label: &str, value: &mut u32, level: f32) {
         *value = (f * 100.0).round() as u32;
     }
 }
+
+
 
 
 

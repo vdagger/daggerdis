@@ -36,7 +36,24 @@ impl MigrationManager {
         loop {
             interval.tick().await;
 
-            let my_is_host = is_host.load(Ordering::Relaxed);
+            // Хост комнаты — наименьший id среди соседей и себя, раз в секунду.
+            // Правило детерминированное, поэтому все узлы сходятся к одному
+            // хосту без сообщений; `is_host` в пакетах не используется.
+            // Зачем это важно для видео: хост не подписывается на чужие потоки,
+            // и когда хостом считал себя каждый, трансляцию не смотрел никто.
+            let host_id = self.room.host_id_with_me(self.my_id);
+            let i_am_host = host_id == self.my_id;
+            if i_am_host != is_host.load(Ordering::Relaxed) {
+                println!(
+                    "[МИГРАЦИЯ] Хост комнаты — узел ID={} ({}), я {}",
+                    host_id,
+                    if i_am_host { "это я" } else { "сосед" },
+                    if i_am_host { "хост" } else { "гость" }
+                );
+                is_host.store(i_am_host, Ordering::SeqCst);
+            }
+            self.room.set_host(host_id);
+            let my_is_host = i_am_host;
             // Рассылаем IrohSync через Iroh P2P для Full-Mesh связности и анонса хоста
             if let Some(ref p2p) = self.iroh {
                 let sync_msg = NetworkMessage::IrohSync {
@@ -163,3 +180,5 @@ impl MigrationManager {
         }
     }
 }
+
+

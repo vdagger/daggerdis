@@ -422,6 +422,14 @@ impl UniversalAudioCapture {
             /// Когда пришёл последний кадр: по нему отличаем провал буфера
             /// посреди реплики от нормального конца (PTT отпущен).
             last_fill: std::time::Instant,
+            /// Предбуфер этого собеседника в сэмплах. Растёт, если его звук
+            /// рвётся (разовые провалы на плохом Wi-Fi), и плавно возвращается
+            /// к базовым 60 мс, когда канал успокоился: задержка не должна
+            /// оставаться высокой из-за старого сбоя.
+            prebuffer: usize,
+            /// Когда был последний провал — по нему решаем, пора ли снижать
+            /// предбуфер обратно.
+            last_underrun: Option<std::time::Instant>,
         }
 
         let mut mono_decoded = [0.0f32; 960];
@@ -480,6 +488,8 @@ impl UniversalAudioCapture {
                                     pcm: Vec::new(),
                                     started: false,
                                     last_fill: std::time::Instant::now(),
+                                    prebuffer: (sample_rate as usize * 6) / 100,
+                                    last_underrun: None,
                                 },
                             );
                         }
@@ -630,7 +640,8 @@ impl UniversalAudioCapture {
                 out_scratch.clear();
                 out_scratch.resize(num_frames, 0.0);
 
-                let min_prebuffer = (sample_rate as usize * 6) / 100; // 60 мс
+                let base_prebuffer = (sample_rate as usize * 6) / 100; // 60 мс
+                let max_prebuffer = (sample_rate as usize * 15) / 100; // 150 мс
                 let max_buffer = (sample_rate as usize * 20) / 100; // 200 мс
                 let keep_buffer = (sample_rate as usize * 8) / 100; // 80 мс
 
@@ -640,8 +651,23 @@ impl UniversalAudioCapture {
                         peer.pcm.drain(..excess);
                         diag.rx.drop();
                     }
+                    // Канал успокоился — возвращаемся к базовой задержке.
+                    // Понижаем ступенью, а не сразу: резкое уменьшение буфера
+                    // само по себе даёт провал.
+                    if peer.prebuffer > base_prebuffer {
+                        let calm = peer
+                            .last_underrun
+                            .map(|at| at.elapsed() >= std::time::Duration::from_secs(20))
+                            .unwrap_or(true);
+                        if calm {
+                            peer.prebuffer = peer
+                                .prebuffer
+                                .saturating_sub(sample_rate as usize / 100)
+                                .max(base_prebuffer);
+                        }
+                    }
                     if !peer.started {
-                        if peer.pcm.len() >= min_prebuffer {
+                        if peer.pcm.len() >= peer.prebuffer {
                             peer.started = true;
                         } else {
                             continue;
@@ -653,6 +679,15 @@ impl UniversalAudioCapture {
                         // так же оставляет буфер пустым, но это норма.
                         if peer.last_fill.elapsed() < std::time::Duration::from_millis(300) {
                             diag.rx.underrun();
+                            peer.last_underrun = Some(std::time::Instant::now());
+                            if peer.prebuffer < max_prebuffer {
+                                peer.prebuffer = (peer.prebuffer + sample_rate as usize / 50)
+                                    .min(max_prebuffer);
+                                eprintln!(
+                                    "[АУДИО] Провал на приёме — предбуфер поднят до {} мс",
+                                    peer.prebuffer * 1000 / sample_rate as usize
+                                );
+                            }
                         }
                         continue;
                     }
@@ -765,4 +800,5 @@ mod tests {
         assert!(!channel_usable(0, 0));
     }
 }
+
 

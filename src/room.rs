@@ -66,6 +66,33 @@ impl RoomManager {
         peers.iter().map(|peer| peer.address.clone()).collect()
     }
 
+    /// Хост комнаты: наименьший id среди соседей и себя.
+    ///
+    /// Правило детерминированное — каждый узел считает его по одному и тому же
+    /// списку, поэтому все сходятся к одному хосту без обмена сообщениями.
+    /// Флаг `is_host` в пакетах для этого не нужен: он у каждого свой и в момент
+    /// входа выставлен у всех.
+    pub fn host_id_with_me(&self, my_id: u64) -> u64 {
+        let peers = self.peers.lock().unwrap();
+        peers
+            .iter()
+            .map(|p| p.id)
+            .chain(std::iter::once(my_id))
+            .min()
+            .unwrap_or(my_id)
+    }
+
+    /// id хоста комнаты: наименьший среди помеченных `is_host`.
+    ///
+    /// По этому правилу сходятся все узлы: `is_host=true` у каждого по умолчанию,
+    /// поэтому «хост» — не флаг, а наименьший id. Видео на это опирается: хост не
+    /// подписывается на чужие потоки, и если хостом себя считает каждый, то
+    /// трансляцию не смотрит никто.
+    pub fn host_id(&self) -> Option<u64> {
+        let peers = self.peers.lock().unwrap();
+        peers.iter().filter(|p| p.is_host).map(|p| p.id).min()
+    }
+
     /// Хост комнаты среди соседей: наименьший id из помеченных `is_host` —
     /// тот же порядок, по которому выбирает миграция. Своего узла в `peers`
     /// нет, поэтому `None` значит «хостом считаю себя или хоста ещё нет».
@@ -124,4 +151,28 @@ mod tests {
         assert!(select_host(&[peer(3, false)]).is_none());
         assert!(select_host(&[]).is_none());
     }
+
+    #[test]
+    fn host_is_lowest_id_including_me() {
+        let room = RoomManager::new(8);
+        room.update_peer(peer(1, true));
+        room.update_peer(peer(9, false));
+        assert_eq!(room.host_id_with_me(8), 1, "хост — меньший id комнаты");
+        let room2 = RoomManager::new(3);
+        room2.update_peer(peer(5, true));
+        assert_eq!(room2.host_id_with_me(3), 3, "я сам могу быть хостом");
+        let empty = RoomManager::new(42);
+        assert_eq!(empty.host_id_with_me(42), 42, "один в комнате — хост");
+    }
+
+    #[test]
+    fn host_id_is_lowest_among_claimants() {
+        let room = RoomManager::new(7);
+        room.update_peer(peer(9, true));
+        room.update_peer(peer(4, true));
+        room.update_peer(peer(3, false));
+        assert_eq!(room.host_id(), Some(4), "хост — меньший id среди is_host");
+    }
 }
+
+

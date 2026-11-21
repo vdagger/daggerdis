@@ -251,6 +251,7 @@ impl IrohP2pManager {
                     node_id: node_id.clone(),
                     relay: path.is_relay(),
                     rtt_ms: stats.rtt.as_millis() as u64,
+                    sent_packets: stats.sent_packets,
                     lost_packets: stats.lost_packets,
                     cwnd: stats.cwnd,
                     bandwidth_bps: stats.bandwidth_estimate,
@@ -341,3 +342,4 @@ impl IrohP2pManager {
         &self.endpoint
     }
 }
+

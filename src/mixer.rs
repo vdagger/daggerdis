@@ -247,11 +247,29 @@ pub struct AudioMixer {
     rx_limiter_enabled: AtomicBool,
     /// Битрейт Opus на передачу: 64 кбит/с хватает речи, инструменту мало.
     opus_bitrate: AtomicU32,
+    /// Ожидаемые потери канала в процентах: энкодер держит запас устойчивости
+    /// (in-band FEC и более плотная защита). Не настройка, а адаптация к сети:
+    /// GUI подкручивает по реальным потерям QUIC.
+    packet_loss_perc: AtomicU32,
+    /// Потолок битрейта от адаптации к полосе канала (`u32::MAX` — без
+    /// ограничения). Настройка пользователя при этом не меняется: она остаётся
+    /// верхней границей, а этот потолок — временной поправкой на плохую сеть.
+    voice_bitrate_cap: AtomicU32,
 }
 
 /// Допустимые битрейты передачи. Значение вне набора не даёт ничего, кроме
 /// непредсказуемого качества, поэтому и в конфиге, и в UI — только эти три.
 pub const OPUS_BITRATES: [u32; 3] = [64_000, 96_000, 128_000];
+
+/// Следующая ступень ниже `bps` из допустимых. `None` — ниже 64 кбит/с
+/// опускаться некуда: речь на меньшем битрейте уже не спасти.
+pub fn next_voice_bitrate_below(bps: u32) -> Option<u32> {
+    OPUS_BITRATES
+        .iter()
+        .copied()
+        .filter(|rate| *rate < bps)
+        .max()
+}
 
 impl AudioMixer {
     /// Создает новый аудио-микшер с дефолтными значениями
@@ -282,12 +300,42 @@ impl AudioMixer {
             tx_limiter_enabled: AtomicBool::new(false),
             rx_limiter_enabled: AtomicBool::new(false),
             opus_bitrate: AtomicU32::new(64_000),
+            packet_loss_perc: AtomicU32::new(8),
+            voice_bitrate_cap: AtomicU32::new(u32::MAX),
         }
     }
 
     /// Битрейт Opus на передачу (бит/с)
     pub fn opus_bitrate(&self) -> u32 {
         self.opus_bitrate.load(Ordering::Relaxed)
+    }
+
+    /// Ожидаемые потери канала в процентах (0..=30).
+    ///
+    /// Верхняя граница 30: выше энкодер начинает тратить биты на защиту в
+    /// ущерб речи, и на слух это хуже, чем редкие щелчки. По умолчанию 8 % —
+    /// разумный запас для домашнего Wi-Fi.
+    pub fn packet_loss_perc(&self) -> u32 {
+        self.packet_loss_perc.load(Ordering::Relaxed)
+    }
+
+    pub fn set_packet_loss_perc(&self, perc: u32) {
+        self.packet_loss_perc
+            .store(perc.min(30), Ordering::Relaxed);
+    }
+
+    /// Битрейт, который реально уходит в энкодер: настройка, урезанная
+    /// адаптацией к полосе (если сеть не тянет всех собеседников).
+    pub fn voice_bitrate(&self) -> u32 {
+        self.opus_bitrate().min(self.voice_bitrate_cap())
+    }
+
+    pub fn voice_bitrate_cap(&self) -> u32 {
+        self.voice_bitrate_cap.load(Ordering::Relaxed)
+    }
+
+    pub fn set_voice_bitrate_cap(&self, cap: u32) {
+        self.voice_bitrate_cap.store(cap, Ordering::Relaxed);
     }
 
     /// Ближайший допустимый битрейт: значение из настроек может быть старым
@@ -710,6 +758,35 @@ mod tests {
     }
 
     #[test]
+    fn voice_bitrate_is_capped_without_touching_setting() {
+        let m = AudioMixer::new();
+        m.set_opus_bitrate(128_000);
+        assert_eq!(m.voice_bitrate(), 128_000);
+        m.set_voice_bitrate_cap(64_000);
+        assert_eq!(m.voice_bitrate(), 64_000, "потолок адаптации режет передачу");
+        assert_eq!(m.opus_bitrate(), 128_000, "настройка пользователя цела");
+        m.set_voice_bitrate_cap(u32::MAX);
+        assert_eq!(m.voice_bitrate(), 128_000, "сеть наладилась — вернулись");
+    }
+
+    #[test]
+    fn next_bitrate_steps_down_to_floor() {
+        assert_eq!(next_voice_bitrate_below(128_000), Some(96_000));
+        assert_eq!(next_voice_bitrate_below(96_000), Some(64_000));
+        assert_eq!(next_voice_bitrate_below(64_000), None, "ниже пола некуда");
+    }
+
+    #[test]
+    fn packet_loss_perc_is_clamped() {
+        let m = AudioMixer::new();
+        assert_eq!(m.packet_loss_perc(), 8, "запас по умолчанию");
+        m.set_packet_loss_perc(15);
+        assert_eq!(m.packet_loss_perc(), 15);
+        m.set_packet_loss_perc(90);
+        assert_eq!(m.packet_loss_perc(), 30, "выше 30 % защита съедает речь");
+    }
+
+    #[test]
     fn opus_bitrate_default_and_snap() {
         let m = AudioMixer::new();
         assert_eq!(m.opus_bitrate(), 64_000);
@@ -774,3 +851,6 @@ mod tests {
         assert_eq!(SlotProfile::from_u32(2), SlotProfile::Custom);
     }
 }
+
+
+

@@ -337,6 +337,7 @@ impl CallManager {
         // Согласие получено — входим в эфир, снимаем блок и подтверждаем приём.
         // Мы гости: хост — пригласивший (выборы по меньшему id всё равно
         // переиграют это внутри комнаты).
+        println!("[КОМНАТА] Входим по приглашению {} (комната {})", short(&from), room_id);
         self.room.join();
         self.is_host.store(false, Ordering::SeqCst);
         self.unblock(&from);
@@ -1360,6 +1361,7 @@ mod tests {
         assert_ne!(new_room_id(1), new_room_id(2));
     }
 }
+
 
 
 

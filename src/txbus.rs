@@ -268,6 +268,8 @@ pub(crate) struct TxWorker {
     gates: [f32; 2],
     /// Текущий битрейт энкодера — чтобы не переписывать его каждый кадр.
     bitrate: u32,
+    /// Текущий ожидаемый процент потерь — тоже только при смене.
+    loss_perc: u32,
     held: [f32; 2],
     have_held: [bool; 2],
     slot_buf: Vec<f32>,
@@ -297,6 +299,7 @@ impl TxWorker {
             agcs: [TransmitAgc::new(), TransmitAgc::new()],
             gates: [0.0, 0.0],
             bitrate: 64_000,
+            loss_perc: 8,
             held: [0.0, 0.0],
             have_held: [false, false],
             slot_buf: Vec::with_capacity(FRAME),
@@ -429,10 +432,17 @@ impl TxWorker {
         // Битрейт читается на каждом кадре, а пишется в энкодер только при
         // смене: переключение в настройках действует без перезапуска потока.
         // 1276 — максимум одного кадра Opus при любом битрейте.
-        let bitrate = mixer.opus_bitrate();
+        let bitrate = mixer.voice_bitrate();
         if bitrate != self.bitrate {
             self.encoder.bitrate_bps = bitrate as i32;
             self.bitrate = bitrate;
+        }
+        // Ожидаемые потери тоже меняются на ходу: GUI подкручивает их по
+        // реальным потерям QUIC, энкодер перестраивает защиту без перезапуска.
+        let loss = mixer.packet_loss_perc();
+        if loss != self.loss_perc {
+            self.encoder.packet_loss_perc = loss as i32;
+            self.loss_perc = loss;
         }
         self.packet_buf.clear();
         self.packet_buf.resize(1276, 0);
@@ -901,3 +911,5 @@ mod tests {
         assert_eq!(bus.slots[0].lock().unwrap().ring.len(), FRAME);
     }
 }
+
+

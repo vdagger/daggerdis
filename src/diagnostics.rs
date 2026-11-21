@@ -121,6 +121,8 @@ pub struct LinkLine {
     pub node_id: String,
     pub relay: bool,
     pub rtt_ms: u64,
+    /// Сколько пакетов отправлено по этому пути: без него потери не в процентах.
+    pub sent_packets: u64,
     pub lost_packets: u64,
     pub cwnd: u64,
     /// Оценка полосы контроллером перегрузки, бит/с.
@@ -177,6 +179,15 @@ pub struct ReportInput {
     pub remote_video: Option<RemoteVideo>,
     pub errors: Vec<String>,
     pub uptime: Duration,
+}
+
+/// Потери в процентах от отправленного. Ноль отправленных — ноль потерь:
+/// соединение только поднялось, считать ещё нечего.
+pub fn loss_percent(sent: u64, lost: u64) -> u32 {
+    if sent == 0 {
+        return 0;
+    }
+    ((lost.min(sent) * 100) / sent) as u32
 }
 
 /// Короткий NodeID для строки отчёта: первые 8 символов, как в интерфейсе.
@@ -237,11 +248,13 @@ pub fn render(input: &ReportInput) -> String {
                 Some(bps) => format!(" · оценка {:.1} Мбит/с", bps as f64 / 1_000_000.0),
                 None => String::new(),
             };
+            let lost_pct = loss_percent(link.sent_packets, link.lost_packets);
             out.push_str(&format!(
-                "  {} {path} · RTT {} мс · потерь {} · окно {} КиБ{bw}\n",
+                "  {} {path} · RTT {} мс · потерь {} ({}%) · окно {} КиБ{bw}\n",
                 short_id(&link.node_id),
                 link.rtt_ms,
                 link.lost_packets,
+                lost_pct,
                 link.cwnd / 1024
             ));
         }
@@ -323,6 +336,7 @@ mod tests {
                 node_id: "cf8ab51aeb18a16c433bc425240293b9f67c77ce80545cac38ad676030fbc4ed".into(),
                 relay: false,
                 rtt_ms: 8,
+                sent_packets: 100,
                 lost_packets: 2,
                 cwnd: 12_288,
                 bandwidth_bps: Some(9_400_000),
@@ -331,6 +345,7 @@ mod tests {
                 node_id: "40e6933834977766dc7478e8f40d1f2bbc3d28fb28016d194de81db914659ed1".into(),
                 relay: true,
                 rtt_ms: 74,
+                sent_packets: 0,
                 lost_packets: 0,
                 cwnd: 4_096,
                 bandwidth_bps: None,
@@ -372,6 +387,15 @@ mod tests {
         };
         assert_eq!(s.events(), 10);
         assert_eq!(RxSnapshot::default().events(), 0);
+    }
+
+    #[test]
+    fn loss_percent_handles_no_traffic_and_full_loss() {
+        assert_eq!(loss_percent(0, 0), 0, "ещё ничего не отправлено");
+        assert_eq!(loss_percent(0, 5), 0, "без отправки процент не считается");
+        assert_eq!(loss_percent(100, 2), 2);
+        assert_eq!(loss_percent(1000, 12), 1, "округление вниз до целых");
+        assert_eq!(loss_percent(50, 80), 100, "потерь больше, чем отправлено");
     }
 
     #[test]
@@ -439,7 +463,7 @@ mod tests {
             "участников в комнате 2",
             "Друзья: 1 из 3",
             "Соединения: 2",
-            "напрямую · RTT 8 мс",
+            "напрямую · RTT 8 мс · потерь 2 (2%)",
             "через релей · RTT 74 мс",
             "оценка 9.4 Мбит/с",
             "Звук: микрофон «1-2 (QUAD-CAPTURE)»",
@@ -475,6 +499,7 @@ mod tests {
         assert!(render(&input).contains("микрофон выключен: да"));
     }
 }
+
 
 
 
